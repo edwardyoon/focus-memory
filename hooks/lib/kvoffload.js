@@ -41,6 +41,52 @@ const HOME = process.env.HOME || process.env.USERPROFILE || '.';
 const KV_DIR = path.join(HOME, '.qwen', 'tmp', 'focus-memory', 'kv-offload');
 fs.mkdirSync(KV_DIR, { recursive: true });
 
+// 치환 매핑 테이블 (원본 태그 : 치환될 문자열)
+const TAG_REPLACEMENTS = {
+  // Reasoning / Thinking 태그
+  "<think>": "[past_think]",
+  "</think>": "[past_end_think]",
+
+  // Tool Call & Tool Response 태그
+  "<tool_call>": "[past_tool_call]",
+  "</tool_call>": "[past_end_tool_call]",
+  "<function=": "[past_function=",
+  "</function>": "[past_end_function]",
+  "<parameter=": "[past_parameter=",
+  "</parameter>": "[past_end_parameter]",
+  "<tool_response>": "[past_tool_response]",
+  "</tool_response>": "[past_end_tool_response]",
+
+  // ChatML & 특수 제어 태그
+  "<|im_start|>": "[past_im_start]",
+  "<|im_end|>": "[past_im_end]",
+  "<|endoftext|>": "[past_endoftext]",
+
+  // Focus 태그 재귀 트리거 방지
+  "<focus ": "[past_focus "
+};
+
+// 정규식 특수문자 이스케이프 함수
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// 매핑 키들을 모아서 단일 정규식 패턴 생성 (예: /<think>|<\/think>|<tool_call>|.../g)
+const tagPattern = new RegExp(
+  Object.keys(TAG_REPLACEMENTS).map(escapeRegExp).join('|'),
+  'g'
+);
+
+/**
+ * 텍스트 내부의 LLM 제어 태그들을 안전하게 단일 패스로 치환합니다.
+ * @param {string} text 
+ * @returns {string}
+ */
+function sanitizeRefillText(text) {
+  if (!text) return text;
+  return text.replace(tagPattern, (matched) => TAG_REPLACEMENTS[matched]);
+}
+
 /**
  * Feature gate — true only when FOCUSMEMORY_KVOFFLOAD is exactly "on".
  * @returns {boolean}
@@ -183,7 +229,7 @@ function putChunk(sessionId, key, text, tokens) {
       d.session_id = String(sessionId || '');
       d.updated_at = new Date().toISOString();
       d.chunks[k] = {
-        text,
+        text: sanitizeRefillText(text),
         tokens: Number.isFinite(tokens) ? Number(tokens) : undefined,
         ts: new Date().toISOString(),
       };
