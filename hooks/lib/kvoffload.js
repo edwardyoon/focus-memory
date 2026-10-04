@@ -62,6 +62,16 @@ const TAG_REPLACEMENTS = {
   "<|im_end|>": "[past_im_end]",
   "<|endoftext|>": "[past_endoftext]",
 
+  "<qwen:user-prompt-submit-context>": "[past_user_prompt_submit_context]",
+  "</qwen:user-prompt-submit-context>": "[past_end_user_prompt_submit_context]",
+  "<qwen:tool-result>": "[past_tool_result]",
+  "</qwen:tool-result>": "[past_end_tool_result]",
+  "<system-reminder>": "[past_system_reminder]",
+  "</system-reminder>": "[past_end_system_reminder]",
+
+  "<function_results>": "[past_function_results]",
+  "</function_results>": "[past_end_function_results]",
+  
   // Focus 태그 재귀 트리거 방지
   "<focus ": "[past_focus "
 };
