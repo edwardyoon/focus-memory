@@ -73,7 +73,10 @@ const TAG_REPLACEMENTS = {
   "</function_results>": "[past_end_function_results]",
   
   // Focus 태그 재귀 트리거 방지
-  "<focus ": "[past_focus "
+  "<focus>": "[past_focus]",
+  "</focus>": "[past_end_focus]",
+  "<global>": "[past_global]",
+  "</global>": "[past_end_global]"
 };
 
 // 정규식 특수문자 이스케이프 함수
