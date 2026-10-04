@@ -76,7 +76,9 @@ const TAG_REPLACEMENTS = {
   "<focus>": "[past_focus]",
   "</focus>": "[past_end_focus]",
   "<global>": "[past_global]",
-  "</global>": "[past_end_global]"
+  "</global>": "[past_end_global]",
+  "<invoke>": "[past_invoke]",
+  "</invoke>": "[past_end_invoke]"
 };
 
 // 정규식 특수문자 이스케이프 함수
