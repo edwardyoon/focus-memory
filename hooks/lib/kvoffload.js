@@ -231,9 +231,10 @@ function extractUserInstructions(text) {
  * @param {string} key - stable segment key (the engine's content hash)
  * @param {string} text - the segment's raw text (re-prefilled verbatim on GET)
  * @param {number} [tokens] - approximate token count (metadata, optional)
+ * @param {string} [hint] - one-line description of the segment (engine-provided at evict time; reused by the Σ recall pointer and the post-compaction orphan note). Absent for chunks PUT before the field existed (fail-open).
  * @returns {{ok: boolean, bytes?: number, reason?: string}}
  */
-function putChunk(sessionId, key, text, tokens) {
+function putChunk(sessionId, key, text, tokens, hint) {
   if (!kvOffloadEnabled()) return { ok: false, reason: 'disabled' };
   if (typeof text !== 'string' || text.length === 0) return { ok: false, reason: 'empty text' };
   const k = String(key);
@@ -247,6 +248,7 @@ function putChunk(sessionId, key, text, tokens) {
         text: sanitizeRefillText(text),
         tokens: Number.isFinite(tokens) ? Number(tokens) : undefined,
         ts: new Date().toISOString(),
+        hint: hint || undefined,
       };
       if (instructions.length) {
         if (!Array.isArray(d.instructions)) d.instructions = [];
@@ -361,7 +363,7 @@ function getChunk(sessionId, key) {
 /**
  * List the chunks a session has offloaded (metadata only, no text).
  * @param {string} sessionId
- * @returns {Array<{chunk_id: number, tokens?: number, ts: string, bytes: number}>}
+ * @returns {Array<{key: string, tokens?: number, ts: string, bytes: number, hint?: string}>}
  */
 function listChunks(sessionId) {
   const doc = loadDoc(sessionId);
@@ -371,6 +373,7 @@ function listChunks(sessionId) {
       tokens: e.tokens,
       ts: e.ts,
       bytes: Buffer.byteLength(e.text || '', 'utf8'),
+      hint: e.hint,
     }))
     .sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
 }

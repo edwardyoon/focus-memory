@@ -99,6 +99,18 @@ async function runWorker(event) {
     return;
   }
 
+  // Recall pointers: the offloaded (evicted) segments the model can re-load via
+  // <focus> after compaction. Sourced from the kv-offload store (the recall
+  // source of truth), NOT the LLM. A snapshot (KEY_RULES 'replace').
+  try {
+    const chunks = kv.listChunks(sessionId);
+    if (chunks.length) {
+      patch.recall_pointers = chunks.slice(-10).map((c) => ({
+        key: c.key, ts: c.ts, tokens: c.tokens, hint: c.hint,
+      }));
+    }
+  } catch { /* fail-open — anchor just omits the recall line */ }
+
   // Merge inside one locked read-modify-write: the base Σ was loaded before
   // the LLM call, so a concurrent Stop hook may have updated bookkeeping
   // keys (last_input_tokens, last_checkpoint_tokens, last_extraction_log

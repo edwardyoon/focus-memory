@@ -130,6 +130,34 @@ function mutateSigma(sessionId, mutate) {
 }
 
 /**
+ * Bump Σ.compact_count (locked read-modify-write) with a 30s dedup window so a
+ * single compaction firing both PostCompact and SessionStart counts once, while
+ * distinct compactions (minutes apart) each count. Stores last bump ts for the
+ * dedup. Returns the new count, or null when the write was skipped (dedup / no Σ).
+ * @param {string} sessionId
+ * @returns {number|null}
+ */
+function bumpCompactCount(sessionId) {
+  const DEDUP_MS = 30000;
+  let newCount = null;
+  try {
+    mutateSigma(sessionId, (sigma) => {
+      if (!sigma || Object.keys(sigma).length === 0) return null; // no Σ — fail-open
+      const now = Date.now();
+      const last = Number(sigma.last_compact_bump_ts) || 0;
+      if (now - last < DEDUP_MS) return null; // dedup — same compaction already counted
+      sigma.compact_count = (Number.isFinite(sigma.compact_count) ? sigma.compact_count : 0) + 1;
+      sigma.last_compact_bump_ts = now;
+      newCount = sigma.compact_count;
+      return sigma;
+    });
+  } catch {
+    // fail-open — the window simply stays closed this round
+  }
+  return newCount;
+}
+
+/**
  * Delete SIGMA_DIR files older than maxAgeMs (mtime), optionally restricted
  * to names starting with `prefix`. Best-effort; returns removed count.
  * @param {number} maxAgeMs - 0 means "delete regardless of age" (within prefix)
@@ -293,6 +321,12 @@ function renderAnchor(sigma, opts = {}) {
   if (Array.isArray(sigma.files_touched) && sigma.files_touched.length) {
     parts.push(`files: ${sigma.files_touched.slice(-5).join(', ')}`);
   }
+  if (Array.isArray(sigma.recall_pointers) && sigma.recall_pointers.length) {
+    const n = sigma.recall_pointers.length;
+    const last = sigma.recall_pointers[n - 1];
+    const hint = last && last.hint ? ` (most recent: ${last.hint})` : '';
+    parts.push(`recall: ${n} offloaded segment(s) from before compaction are re-loadable via <focus> (see the offloaded-chunks note)${hint}`);
+  }
   if (sigma.tests_status && typeof sigma.tests_status === 'object' && !Array.isArray(sigma.tests_status)) {
     const failing = Object.entries(sigma.tests_status)
       .filter(([, v]) => v === 'fail')
@@ -310,6 +344,11 @@ const KEY_RULES = {
   task_summary: 'replace',
   current_step: 'replace',
   pending_checks: 'replace',
+  // Snapshot of the offloaded (evicted) segments the model can re-load via
+  // <focus> after compaction. Sourced mechanically from the kv-offload store
+  // (NOT the LLM) by precompact-extract-state.js — a current-view snapshot, so
+  // it replaces rather than accumulates.
+  recall_pointers: 'replace',
   files_touched: 'union',
   decisions: 'union',
   tests_status: 'merge',
@@ -797,6 +836,7 @@ module.exports = {
   loadSigma,
   saveSigma,
   mutateSigma,
+  bumpCompactCount,
   sweepSigma,
   mergeSigma,
   filterGhostRefs,

@@ -2158,7 +2158,7 @@ httpApp.put("/v1/kv-offload/chunk", async (c) => {
   if (!sessionId || !key || !text) {
     return c.json({ error: "session_id, key (non-empty), text (non-empty) required" }, 400);
   }
-  const res = kvOffload.putChunk(sessionId, key, text, body.tokens);
+  const res = kvOffload.putChunk(sessionId, key, text, body.tokens, body.hint);
   if (!res.ok) return c.json({ error: res.reason || "put failed" }, 500);
   log(`[kv-offload] PUT session=${sessionId} key=${key} bytes=${res.bytes}`);
   return c.json({ ok: true, session_id: sessionId, key, bytes: res.bytes });
@@ -2177,6 +2177,21 @@ httpApp.get("/v1/kv-offload/chunk", async (c) => {
   if (!res.ok) return c.json({ error: res.reason || "not found" }, 404);
   log(`[kv-offload] GET session=${sessionId} key=${key} bytes=${Buffer.byteLength(res.text, "utf8")}`);
   return c.json({ ok: true, session_id: sessionId, key, text: res.text, tokens: res.tokens, ts: res.ts });
+});
+
+// List a session's offloaded chunks (metadata incl. hint, most recent K) for
+// the engine's post-compaction orphan re-exposure. listChunks is ts-ascending,
+// so slice(-limit) = the K most recent.
+httpApp.get("/v1/kv-offload/chunks", async (c) => {
+  const denied = kvAuth(c);
+  if (denied) return denied;
+  if (!kvOffload.kvOffloadEnabled()) return c.json({ error: "kv-offload disabled" }, 404);
+  const sessionId = c.req.query("session_id") || "";
+  const limit = Math.max(1, Math.min(64, parseInt(c.req.query("limit") || "10", 10) || 10));
+  if (!sessionId) return c.json({ error: "session_id required" }, 400);
+  const chunks = kvOffload.listChunks(sessionId).slice(-limit); // most recent K
+  log(`[kv-offload] LIST session=${sessionId} n=${chunks.length} limit=${limit}`);
+  return c.json({ ok: true, session_id: sessionId, chunks });
 });
 
 // Session-level pin-released flag (B4): the engine queries it at each

@@ -150,6 +150,18 @@
             "timeout": 5000
           }
         ]
+      },
+      {
+        "description": "SKILL.state — bump Σ.compact_count on every real compaction so the post-compaction anchor window (userprompt-inject-state.js) opens on the first turn after compaction. The SessionStart(source=compact) hook remains a deduped fallback (30s window in bumpCompactCount). Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${extensionPath}${/}hooks${/}postcompact-bump-compact.js",
+            "name": "postcompact-bump-compact",
+            "timeout": 5000
+          }
+        ]
       }
     ],
     "SessionStart": [
