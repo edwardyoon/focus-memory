@@ -4,6 +4,35 @@
 
 **Minimize round trips.** Each tool call costs tokens and latency. Choose the single tool that answers your question. Only chain tools when the first result explicitly points to what's missing.
 
+## Declarative Attention & Chunk Focus Rules
+
+### 1. Strict Syntax
+You must use ONLY the `<focus>` tag with valid `magic_chunks` attributes.
+- ALWAYS enclose attribute values in double quotes (`"`).
+- ALWAYS close the tag with `/>` or `</focus>`. Never leave tags open or truncated.
+
+### 2. Chunk Range Specification Rules
+When specifying multiple chunks in `magic_chunks`, follow these strict format guidelines:
+- **Comma-Separated Single Chunks ONLY:** Use comma separation for individual chunk IDs (e.g., `magic_chunks="7,8,9"`).
+- **NO Hyphen Ranges:** Range syntax like `7-8` or `7~8` is STRICTLY FORBIDDEN. Always expand ranges into explicit comma-separated lists.
+- **Single Chunk:** `magic_chunks="7"`
+
+### 3. Valid vs Invalid Examples
+
+#### CORRECT (Always do this):
+- `<focus magic_chunks="7,8" />`
+- `<focus magic_chunks="1,2,3,4" />`
+
+#### INCORRECT (NEVER do this):
+- `<focus magic_chunks="7-8"`         -> [ERR] Unclosed quote and tag
+- `<focus magic_chunks="7-8" />`       -> [ERR] Hyphen range used
+- `<focus magic_chunks=7,8>`           -> [ERR] Missing quotes
+- `<focus magic_chunks="7 ~ 8" />`     -> [ERR] Tilde/space range used
+
+### 4. Output Safety
+- NEVER output partial tags during Chain-of-Thought reasoning.
+- Output the tag as a single, uninterrupted token block at the very end or designated control line.
+
 ## Decision Tree
 
 ```
