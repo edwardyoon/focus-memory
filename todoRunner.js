@@ -35,7 +35,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, ".env") });
 const WORKSPACE = path.resolve(__dirname, "..");
 const TODOS_DIR = path.join(WORKSPACE, "todos");
-const LOG_DIR = path.join(WORKSPACE, "logs");
+const LOG_DIR = "/tmp/focus-memory";
 const QWEN_BIN = "/opt/homebrew/bin/qwen";
 const FOCUSMEMORY_DIR = __dirname;
 const CATCHUP_LOOKBACK_DAYS = 3; // scan this many past days for leftover items

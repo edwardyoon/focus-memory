@@ -42,7 +42,7 @@ const TODOS_DIR = process.env.TODOS_DIR || path.join(process.cwd(), "..", "todos
 const GC_ARCHIVE_DIR =
   process.env.GC_ARCHIVE_DIR || path.join(path.dirname(TODOS_DIR), "todos_archive");
 const QDRANT_URL = process.env.QDRANT_URL || "http://127.0.0.1:6333";
-const GC_LOG_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "logs", "gc.log");
+const GC_LOG_FILE = "/tmp/focus-memory/gc.log";
 
 // Phase C — per-session artifact dirs (see header). Only files matching
 // SESSION_FILE_RE in these exact dirs are ever age-deleted.
