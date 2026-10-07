@@ -1,22 +1,21 @@
-
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FocusMemory — memory-based agent workflow management</title>
-<meta name="description" content="Memory-based agent workflow management. Source code structure, work history, and task memory as a single shared context — eliminating grep, cold boot, and re-derivation.">
+<title>FocusMemory — memory + execution-state layer for AI coding agents</title>
+<meta name="description" content="Memory + execution-state layer for AI coding agents — and the KV store behind focus-llama. Durable project knowledge, structured execution state, and a verbatim KV store for evicted context, behind a single MCP server.">
 
 <!-- Open Graph -->
-<meta property="og:title" content="FocusMemory — memory-based agent workflow management">
-<meta property="og:description" content="Memory-based agent workflow management. Source code structure, work history, and task memory as a single shared context.">
+<meta property="og:title" content="FocusMemory — memory + execution-state layer for AI coding agents">
+<meta property="og:description" content="The close partner of focus-llama: durable project knowledge, structured execution state, and a verbatim KV store for evicted context.">
 <meta property="og:image" content="https://cdn.udanax.org/logos/focus-memory-qwen-extension.png">
 <meta property="og:type" content="website">
 
 <!-- Twitter Card -->
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="FocusMemory — memory-based agent workflow management">
-<meta name="twitter:description" content="Source code, work history, and task memory as a single shared context. Eliminates grep, cold boot, and re-derivation.">
+<meta name="twitter:title" content="FocusMemory — memory + execution-state layer for AI coding agents">
+<meta name="twitter:description" content="focus-llama decides what leaves and what comes back. FocusMemory remembers what was there.">
 <meta name="twitter:image" content="https://cdn.udanax.org/logos/focus-memory-qwen-extension.png">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -51,6 +50,7 @@
 
   a{color:inherit;text-decoration:none}
   a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}
+  code{font-family:'JetBrains Mono',monospace;font-size:.85em;color:var(--text-2);background:rgba(255,255,255,.04);padding:1px 6px;border-radius:4px}
 
   .wrap{max-width:1100px;margin:0 auto;padding:0 40px;position:relative;z-index:1}
 
@@ -73,7 +73,7 @@
   /* ---------- noise overlay ---------- */
   body::before{
     content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.035;
-    background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' fill='url(%23n)'/%3E%3C/svg%3E");
     background-size:180px;
   }
 
@@ -102,7 +102,7 @@
   .badge-dot{width:6px;height:6px;border-radius:50%;background:#22c55e;box-shadow:0 0 8px rgba(34,197,94,.4)}
 
   h1.title{font-size:clamp(2.8rem,7vw,5.2rem);max-width:14ch;margin:0 auto 20px;background:linear-gradient(to bottom,var(--text) 40%,var(--text-3));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-  .subtitle{font-size:clamp(1rem,2vw,1.25rem);color:var(--text-2);max-width:600px;margin:0 auto 48px;line-height:1.6}
+  .subtitle{font-size:clamp(1rem,2vw,1.25rem);color:var(--text-2);max-width:640px;margin:0 auto 48px;line-height:1.6}
 
   .hero-actions{display:flex;justify-content:center;gap:14px;flex-wrap:wrap;margin-bottom:80px}
   .btn-primary{background:var(--accent);color:#09090b;font-weight:500;padding:13px 28px;border-radius:99px;font-size:.9rem;display:inline-flex;align-items:center;gap:8px;transition:transform .18s,box-shadow .18s}
@@ -135,25 +135,29 @@
   section{padding:100px 0}
   .section-label{font-size:.75rem;color:var(--accent);letter-spacing:.14em;text-transform:uppercase;margin-bottom:16px;font-weight:500}
   .section-head h2{font-size:clamp(1.8rem,3.6vw,2.6rem);margin-bottom:16px;max-width:700px}
-  .section-quote{color:var(--text-2);font-size:1.05rem;max-width:560px;line-height:1.65;margin-bottom:48px}
+  .section-quote{color:var(--text-2);font-size:1.05rem;max-width:600px;line-height:1.65;margin-bottom:48px}
 
-  /* ---------- problem cards ---------- */
+  /* ---------- cards ---------- */
   .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  .grid-2{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
   .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:32px 28px;transition:border-color .25s,transform .25s,box-shadow .25s}
   .card:hover{border-color:var(--border-hi);transform:translateY(-4px);box-shadow:0 16px 48px rgba(0,0,0,.3)}
   .card-icon{width:40px;height:40px;border-radius:var(--radius-sm);background:rgba(255,255,255,.04);display:flex;align-items:center;justify-content:center;margin-bottom:20px;font-size:1.1rem}
   .card h3{font-size:1.05rem;margin-bottom:10px;color:var(--text)}
   .card p{font-size:.9rem;color:var(--text-2);line-height:1.65}
+  a.card{display:block}
+  .card-num{font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--accent);letter-spacing:.08em;margin-bottom:14px}
 
-  /* ---------- solution rows ---------- */
-  .sol-row{display:grid;grid-template-columns:auto 1fr auto 1fr;align-items:center;gap:28px;padding:32px 0;border-bottom:1px solid var(--border)}
-  .sol-row:first-child{padding-top:0}
-  .sol-num{font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--accent);width:32px;text-align:center;padding-top:4px}
-  .sol-from{text-align:right;font-family:'JetBrains Mono',monospace;font-size:.82rem;color:var(--text-3)}
-  .sol-arrow{color:var(--border-hi);font-size:1.1rem}
-  .sol-to h3{font-size:1.05rem;margin-bottom:6px;display:flex;align-items:center;gap:8px}
-  .sol-tag{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:.62rem;background:var(--accent);color:#09090b;padding:3px 8px;border-radius:4px;letter-spacing:.05em;text-transform:uppercase}
-  .sol-to p{font-size:.88rem;color:var(--text-2)}
+  /* ---------- responsibility split table ---------- */
+  .table-wrap{overflow-x:auto}
+  table.split{width:100%;min-width:640px;border-collapse:collapse;font-size:.9rem}
+  table.split th{font-size:.72rem;color:var(--accent);letter-spacing:.1em;text-transform:uppercase;font-weight:500;text-align:left;padding:14px 16px;border-bottom:1px solid var(--border-hi)}
+  table.split td{padding:16px;border-bottom:1px solid var(--border);color:var(--text-2);vertical-align:top;line-height:1.6}
+  table.split td:first-child{color:var(--text);font-weight:500;width:20%}
+
+  /* ---------- code box ---------- */
+  .codebox{margin-top:40px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px 28px;font-family:'JetBrains Mono',monospace;font-size:.82rem;color:var(--text-3);line-height:1.9;overflow-x:auto}
+  .codebox .hl{color:var(--accent)}
 
   /* ---------- closing ---------- */
   .closing{text-align:center;padding:120px 0}
@@ -171,10 +175,9 @@
   @media(max-width:768px){
     .wrap{padding:0 20px}
     .grid-3{grid-template-columns:1fr;gap:12px}
+    .grid-2{grid-template-columns:1fr}
     .hero{padding:80px 0 48px}
     .diagram-card{padding:24px 16px}
-    .sol-row{grid-template-columns:1fr;text-align:left;gap:6px}
-    .sol-from,.sol-arrow{display:none}
     .nav-links{display:none}
     section{padding:72px 0}
   }
@@ -193,9 +196,10 @@
     <div class="brand"><span class="brand-dot"></span>FocusMemory</div>
     <div class="nav-links">
       <a href="#problem">Problem</a>
-      <a href="#solution">Solution</a>
-      <a href="#work-memory">Work Memory</a>
-      <a href="#extension">Qwen Code Extension</a>
+      <a href="#pairing">Pairing</a>
+      <a href="#pillars">Four Pillars</a>
+      <a href="#memory">Memory</a>
+      <a href="#kv-offload">KV Store</a>
       <a href="https://github.com/edwardyoon/FocusMemory" class="nav-cta">GitHub ↗</a>
     </div>
   </div>
@@ -203,18 +207,18 @@
 
 <header class="hero">
   <div class="wrap reveal">
-    <div class="badge"><span class="badge-dot"></span>Open-source · Self-hosted</div>
+    <div class="badge"><span class="badge-dot"></span>Open-source · Self-hosted · Optimized for Qwen Code</div>
     <h1 class="title">Memory for your AI agents.</h1>
-    <p class="subtitle">Source code, work history, and upcoming tasks — managed as one shared memory. No more cold boots, no more re-derivation.</p>
+    <p class="subtitle">Memory + execution-state layer for AI coding agents — and the KV store behind <a href="https://github.com/edwardyoon/focus-llama" style="color:var(--accent)">focus-llama</a>. The engine decides what leaves and what comes back; FocusMemory remembers what was there.</p>
 
     <div class="hero-actions">
       <a href="https://github.com/edwardyoon/FocusMemory" class="btn-primary">Get Started →</a>
-      <a href="#problem" class="btn-secondary">Learn more</a>
+      <a href="#pairing" class="btn-secondary">The pairing</a>
     </div>
 
 <div class="diagram-card reveal visible">
-  <div class="diagram-label">Memory Architecture — Retrieval Pipeline · Autonomous TODO Loop · SKILL.state</div>
-  <svg class="schematic" viewBox="0 0 1000 706" role="img" aria-label="Architecture diagram: Agent Query → Route → Retrieve → Prune → Inject → Agent/Model, plus autonomous TODO loop (PM2 scheduler → TODO file → spawn agent → execute → auto-ingest), plus SKILL.state compaction band (PreCompact → Σ extract → Σ merge → SessionStart → agent resume)">
+  <div class="diagram-label">Memory Architecture — Retrieval Pipeline · Autonomous TODO Loop · SKILL.state · Declarative Attention</div>
+  <svg class="schematic" viewBox="0 0 1000 880" role="img" aria-label="Architecture diagram: Agent Query → Route → Retrieve → Prune → Inject → Agent/Model, plus autonomous TODO loop (PM2 scheduler → TODO file → spawn agent → execute → auto-ingest), plus SKILL.state compaction band (PreCompact → Σ extract → Σ merge → SessionStart → agent resume), plus declarative-attention / KV-offload lossless-recall band (evict → KV store → DA markers → focus → re-prefill)">
     <defs>
       <marker id="ahdr" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
         <path d="M0,0 L8,3 L0,6 Z" fill="#71717a" />
@@ -431,6 +435,46 @@
     <text class="band-sub" x="880" y="655" text-anchor="middle">reconstructed history</text>
 
     <text class="band-note" x="500" y="684" text-anchor="middle">OFF = native compaction only (hooks no-op, fail-open)</text>
+
+    <!-- ── declarative attention · KV-offload: lossless recall ────────── -->
+    <rect class="band-bg" x="20" y="724" width="960" height="132" rx="12" />
+    <text class="band-title" x="44" y="748">DECLARATIVE ATTENTION · KV-OFFLOAD — LOSSLESS RECALL</text>
+    <text class="band-tag" x="956" y="748" text-anchor="end">GATED · DA=ON · KVOFFLOAD=ON</text>
+
+    <rect class="node-bg" x="35" y="762" width="170" height="72" rx="8" />
+    <text class="band-lbl" x="120" y="786" text-anchor="middle">EVICT</text>
+    <text class="band-sub" x="120" y="804" text-anchor="middle">engine over threshold</text>
+    <text class="band-sub" x="120" y="819" text-anchor="middle">oldest messages → PUT</text>
+
+    <line class="arrow-line" x1="206" y1="798" x2="223" y2="798" />
+
+    <rect class="node-bg" x="225" y="762" width="170" height="72" rx="8" />
+    <text class="band-lbl" x="310" y="786" text-anchor="middle">KV STORE</text>
+    <text class="band-sub" x="310" y="804" text-anchor="middle">/v1/kv-offload/chunk</text>
+    <text class="band-sub" x="310" y="819" text-anchor="middle">verbatim · no embedding</text>
+
+    <line class="arrow-line" x1="396" y1="798" x2="413" y2="798" />
+
+    <rect class="node-bg" x="415" y="762" width="170" height="72" rx="8" />
+    <text class="band-lbl" x="500" y="786" text-anchor="middle">DA MARKERS</text>
+    <text class="band-sub" x="500" y="804" text-anchor="middle">[[da:N]] + layout sig</text>
+    <text class="band-sub" x="500" y="819" text-anchor="middle">search results wrapped</text>
+
+    <line class="arrow-line" x1="586" y1="798" x2="603" y2="798" />
+
+    <rect class="node-bg" x="605" y="762" width="170" height="72" rx="8" />
+    <text class="band-lbl" x="690" y="786" text-anchor="middle">FOCUS</text>
+    <text class="band-sub" x="690" y="804" text-anchor="middle">&lt;focus magic_chunks="N"&gt;</text>
+    <text class="band-sub" x="690" y="819" text-anchor="middle">model names the chunk</text>
+
+    <line class="arrow-line" x1="776" y1="798" x2="793" y2="798" />
+
+    <rect class="node-accent" x="795" y="762" width="170" height="72" rx="8" />
+    <text class="band-lbl-orange" x="880" y="786" text-anchor="middle">RE-PREFILL</text>
+    <text class="band-sub" x="880" y="804" text-anchor="middle">GET original text</text>
+    <text class="band-sub" x="880" y="819" text-anchor="middle">KV restored at tail</text>
+
+    <text class="band-note" x="500" y="848" text-anchor="middle">~1–2 s lossless recall vs ~5.3 min lossy auto-compact · production-verified (qwen3.8-27B)</text>
   </svg>
 
   <div style="margin-top:36px;padding-top:28px;border-top:1px solid var(--border)">
@@ -442,9 +486,9 @@
         <span class="section-label">Qwen Code Extension</span>
         <h3 style="font-size:clamp(1.1rem,2vw,1.4rem);margin-bottom:8px;max-width:600px">Memory infrastructure — zero modifications.</h3>
         <p style="color:var(--text-2);font-size:.9rem;line-height:1.65;margin-bottom:16px;max-width:560px">
-          Plug FocusMemory into qwen-code with a single manifest file. Eight MCP tools, an auto-recall HTTP hook, and Hard Gate search rules — all loaded automatically on startup. No fork, no patch.
+          Plug FocusMemory into qwen-code with a single manifest file. Nine MCP tools, an auto-recall HTTP hook, and Hard Gate search rules — all loaded automatically on startup. No fork, no patch.
         </p>
-        
+
         <a href="#extension" class="btn-secondary" style="display:inline-flex;padding:8px 20px;font-size:.82rem">Learn more →</a>
       </div>
     </div>
@@ -486,51 +530,170 @@
   </div>
 </section>
 
-<section id="solution">
+<section id="pairing">
   <div class="wrap reveal">
-    <span class="section-label">The Solution</span>
+    <span class="section-label">The Pairing</span>
     <div class="section-head">
-      <h2>Three problems. Three matched fixes.</h2>
+      <h2>One decides what leaves. The other remembers what was there.</h2>
+    </div>
+    <p class="section-quote">
+      <a href="https://github.com/edwardyoon/focus-llama" style="color:var(--accent)">focus-llama</a> is a llama.cpp fork that owns the inference side — KV eviction, re-prefill, attention control. FocusMemory is its durable memory backend: project knowledge, structured execution state, and a verbatim store for evicted context.
+    </p>
+
+    <div class="table-wrap">
+      <table class="split">
+        <thead>
+          <tr><th>Concern</th><th>focus-llama · inference engine</th><th>FocusMemory · memory layer</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>KV cache</td>
+            <td>Decides which messages to evict, cuts their KV, re-prefills on focus</td>
+            <td>Dumb store — returns evicted text verbatim; no chunking, embedding, or search</td>
+          </tr>
+          <tr>
+            <td>Declarative attention</td>
+            <td><code>--da-prompt-scan</code> recovers the layout; re-prefills the recalled chunks</td>
+            <td>Emits <code>[[da:N]]</code> magic-chunk markers + the <code>focus</code> retrieval tool</td>
+          </tr>
+          <tr>
+            <td>Execution state (Σ)</td>
+            <td>— stays in the engine's context</td>
+            <td>Extracts a structured state patch pre-compaction, re-injects it post-compaction</td>
+          </tr>
+          <tr>
+            <td>Project knowledge</td>
+            <td>—</td>
+            <td>Qdrant + Meilisearch + tree-sitter AST graph — durable, context-window-independent</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
 
-    <div class="sol-row">
-      <span class="sol-num">01</span>
-      <div class="sol-from">stateless search</div>
-      <div class="sol-arrow">→</div>
-      <div class="sol-to">
-        <h3><span class="sol-tag">A</span> Routing precision</h3>
-        <p>Structural queries hit the graph index, semantic queries hit the vector index — one call, not five.</p>
+    <div class="codebox">
+      launch the engine against it — <span class="hl">--fm-offload</span> <span class="hl">--kv-offload-holes</span> <span class="hl">--focus-memory-host</span> http://&lt;host&gt;:3900
+    </div>
+  </div>
+</section>
+
+<section id="pillars">
+  <div class="wrap reveal">
+    <span class="section-label">Four Pillars</span>
+    <div class="section-head">
+      <h2>Everything the engine needs to remember.</h2>
+    </div>
+    <p class="section-quote">Not "just a search RAG" — four pillars cover the full memory contract between the inference engine and the agent.</p>
+
+    <div class="grid-2">
+      <a class="card" href="#declarative-attention">
+        <div class="card-num">PILLAR 01</div>
+        <h3>Declarative attention</h3>
+        <p>Numbered magic-chunk markers let the model name exactly which recalled chunks it wants in context — lossless recall by name, not re-derivation.</p>
+      </a>
+      <a class="card" href="#skillstate">
+        <div class="card-num">PILLAR 02</div>
+        <h3>skill.state (Σ)</h3>
+        <p>Structured execution state extracted pre-compaction, re-injected post-compaction — the agent resumes from explicit state, not a lossy prose summary.</p>
+      </a>
+      <a class="card" href="#memory">
+        <div class="card-num">PILLAR 03</div>
+        <h3>Memory management</h3>
+        <p>Durable project knowledge — semantic search, causal decision chains, code graph, task memory. Independent of the context window.</p>
+      </a>
+      <a class="card" href="#kv-offload">
+        <div class="card-num">PILLAR 04</div>
+        <h3>KV store</h3>
+        <p>A dumb per-session verbatim store for evicted context — the lossless-recall backend behind focus-llama's <code>--fm-offload</code>.</p>
+      </a>
+    </div>
+  </div>
+</section>
+
+<section id="declarative-attention">
+  <div class="wrap reveal">
+    <span class="section-label">Pillar 1 · Declarative Attention</span>
+    <div class="section-head">
+      <h2>The model names the chunk. The engine brings it back.</h2>
+    </div>
+    <p class="section-quote">
+      The bridge between the memory and KV-store pillars: a lossless-recall mechanism that lets the model pull back specific evicted chunks by name instead of re-deriving them.
+    </p>
+
+    <div class="grid-3">
+      <div class="card">
+        <div class="card-icon">✦</div>
+        <h3>Server side — FocusMemory</h3>
+        <p>Gated by <code>FOCUSMEMORY_DA=on</code>: search results wrapped in numbered <code>[[da:N]]</code> magic-chunk markers (per-session monotonic), a <code>[[da:filler]]</code> placeholder, a <code>[[da:layout:N]]</code> footer, and a versioned signature. Cap: 5 chunks × 300 chars.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">⚙</div>
+        <h3>Engine side — focus-llama</h3>
+        <p>Launched with <code>--da-prompt-scan</code>, which recovers the layout from the rendered prompt. The model then emits <code>&lt;focus magic_chunks="N"&gt;</code> to restrict attention to, or recall, specific chunks.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">⌕</div>
+        <h3>The focus tool</h3>
+        <p>The retrieval-side DA primitive. Two-stage: a cheap index scan, then fetch the full original chunk by <code>point_id</code> UUID or <code>file_path</code> + <code>entity_name</code>.</p>
       </div>
     </div>
-    <div class="sol-row">
-      <span class="sol-num">02</span>
-      <div class="sol-from">silent drift</div>
-      <div class="sol-arrow">→</div>
-      <div class="sol-to">
-        <h3><span class="sol-tag">B</span> Schema snapshots</h3>
-        <p>Real DB state is indexed alongside code, with drift detection surfaced automatically.</p>
-      </div>
-    </div>
-    <div class="sol-row">
-      <span class="sol-num">03</span>
-      <div class="sol-from">vanishing decisions</div>
-      <div class="sol-arrow">→</div>
-      <div class="sol-to">
-        <h3><span class="sol-tag">C</span> Causal decision chains</h3>
-        <p>Every decision is stored as a linked node with supersedes/superseded_by relationships. Ask "why was this built this way?" — get back the full causal history: original rationale, every replacement with reasoning, and what's active now.</p>
+
+    <div style="margin-top:40px;padding:28px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)">
+      <span class="section-label" style="display:block;margin-bottom:12px">Emit rules</span>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:.78rem;color:var(--text-3);line-height:1.8">
+        &lt;focus magic_chunks="N"&gt; — comma-separated <span style="color:var(--accent)">single</span> chunk numbers only · no hyphen/tilde ranges · double quotes · closed tag · no partial tags in chain-of-thought
       </div>
     </div>
   </div>
 </section>
 
-<section id="work-memory">
+<section id="skillstate">
   <div class="wrap reveal">
-    <span class="section-label">Work Memory</span>
+    <span class="section-label">Pillar 2 · skill.state (Σ)</span>
     <div class="section-head">
-      <h2>Not a disconnected session. A shared world.</h2>
+      <h2>Explicit state, not reconstructed history.</h2>
     </div>
     <p class="section-quote">
-      Each work session is not a blank slate. FocusMemory manages source code, work history, and upcoming tasks as a single shared memory — eliminating grep/glob, excessive re-derivation, and cold boot.
+      Long sessions get compacted into a lossy prose summary. SKILL.state extracts a structured state patch (Σ) from the pre-compaction transcript and re-injects it after compaction — the agent resumes from explicit state.
+    </p>
+
+    <div class="grid-3">
+      <div class="card">
+        <div class="card-icon">⏹</div>
+        <h3>Stop — every turn</h3>
+        <p>Records context size and spawns a <em>detached</em> extraction worker on either trigger: a state change (a mutating tool call since the last extraction — mechanical, no LLM in the hook) or context growth (50k+ tokens past the last extraction, for prose-only drift).</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">⧉</div>
+        <h3>PreCompact — final pass</h3>
+        <p>Spawns the same worker as a final pass and exits in milliseconds — native compaction is never blocked. The worker calls the extraction LLM, merges (<code>Σₜ₊₁ = Σₜ ⊕ Δ</code>; null deletes a key), and dual-writes a <code>work_memory</code> checkpoint.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">⚓</div>
+        <h3>PromptSubmit / SessionStart</h3>
+        <p>Injects a one-line state anchor (<code>task | step | pending | files | failing checks</code>) once context passes the threshold — no LLM call, millisecond-scale. After compaction, Σ is loaded as <code>additionalContext</code>.</p>
+      </div>
+    </div>
+
+    <div style="margin-top:40px;padding:28px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)">
+      <span class="section-label" style="display:block;margin-bottom:12px">Σ schema · fail-open</span>
+      <p style="color:var(--text-2);font-size:.92rem;line-height:1.7;max-width:680px;margin-bottom:14px">
+        task_summary · current_step · pending_checks — replace &nbsp;|&nbsp; files_touched · decisions — union (capped 50) &nbsp;|&nbsp; tests_status — merge
+      </p>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:.78rem;color:var(--text-3);line-height:1.8">
+        gated by FOCUSMEMORY_SKILLSTATE=on · ~9.8k input tokens per extraction, detached, parallel with native compaction · any failure leaves native compaction exactly as-is
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="memory">
+  <div class="wrap reveal">
+    <span class="section-label">Pillar 3 · Memory Management</span>
+    <div class="section-head">
+      <h2>Durable project knowledge — independent of the context window.</h2>
+    </div>
+    <p class="section-quote">
+      Qdrant collections + Meilisearch full-text + a tree-sitter AST graph. Source code structure, work history, and task memory as a single shared memory — eliminating grep/glob, cold boot, and re-derivation.
     </p>
 
     <div class="grid-3">
@@ -552,9 +715,22 @@
     </div>
 
     <div style="margin-top:48px;padding:32px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)">
+      <span class="section-label" style="display:block;margin-bottom:12px">Retrieval lifecycle</span>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:.8rem;color:var(--text-2);line-height:1.8;margin-bottom:14px">
+        Ingest → Route → Recall → Prune → Commit → Supersede → Trace
+      </div>
+      <p style="color:var(--text-2);font-size:.92rem;line-height:1.7;max-width:680px">
+        Each query is decomposed into signals and scored across all backends (<code>0.5·similarity + 0.4·feature_fit + 0.1·recency</code>); a local LLM compresses the raw hits into core facts before they reach the prompt. New decisions auto-supersede old ones on the same topic key (similarity ≥ 0.8).
+      </p>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:.78rem;color:var(--text-3);line-height:1.8;margin-top:14px">
+        measured: tool calls/query 3.5 → 1.8 · response 25 s → 8 s &nbsp;|&nbsp; Hard Gate: PreToolUse denies grep/glob until search_memory runs — fails open
+      </div>
+    </div>
+
+    <div style="margin-top:48px;padding:32px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)">
       <span class="section-label" style="display:block;margin-bottom:12px">Autonomous execution</span>
       <p style="color:var(--text-2);font-size:.92rem;line-height:1.7;margin-bottom:16px;max-width:640px">
-        <code style="font-family:'JetBrains Mono',monospace;font-size:.82rem;color:var(--accent)">todoRunner.js</code> (PM2-managed) schedules the daily backlog run at 06:00. It reads the most recent <code style="font-family:'JetBrains Mono',monospace;font-size:.82rem">todos/{date}.md</code> with pending items (the next day's work plan), spawns the agent with operational instructions, and triggers index refresh on completion.
+        <code>todoRunner.js</code> (PM2-managed) schedules the daily backlog run at 06:00. It reads the most recent <code>todos/{date}.md</code> with pending items (the next day's work plan), spawns the agent with operational instructions, and triggers index refresh on completion.
       </p>
       <div style="font-family:'JetBrains Mono',monospace;font-size:.78rem;color:var(--text-3);line-height:1.8">
         [ ] → [~] in progress → [x] done &nbsp;|&nbsp; [!] interrupted (resumable)
@@ -565,15 +741,15 @@
 
 <section id="kv-offload">
   <div class="wrap reveal">
-    <span class="section-label">Lossless context</span>
+    <span class="section-label">Pillar 4 · KV Store</span>
     <div class="section-head">
-      <h2>Long sessions that never amnesia-compact.</h2>
+      <h2>A dumb store behind a lossless engine.</h2>
     </div>
     <p class="section-quote">
       A long agent run normally hits its context window and loses detail to a lossy auto-compact summary. With
       <a href="https://github.com/edwardyoon/focus-llama" style="color:var(--accent)">focus-llama</a>'s
-      <code style="font-family:'JetBrains Mono',monospace;font-size:.85em;color:var(--accent)">--fm-offload</code>
-      engine, the oldest conversation is evicted to FocusMemory verbatim and pulled back on demand — lossless.
+      <code>--fm-offload</code>
+      engine, the oldest conversation is evicted to FocusMemory verbatim and pulled back on demand — lossless. The engine owns all eviction/recall logic; FocusMemory just stores and returns the text.
     </p>
 
     <div class="grid-3">
@@ -585,7 +761,7 @@
       <div class="card">
         <div class="card-icon">⤓</div>
         <h3>Focus to recall</h3>
-        <p>Evicted segments become virtual chunks (M+1…M+K). When the model emits <code style="font-family:'JetBrains Mono',monospace;font-size:.82em">&lt;focus magic_chunks="N"&gt;</code> for one, the engine GETs its original text back and re-prefills it at the tail.</p>
+        <p>Evicted segments become virtual chunks (M+1…M+K). When the model emits <code>&lt;focus magic_chunks="N"&gt;</code> for one, the engine GETs its original text back and re-prefills it at the tail.</p>
       </div>
       <div class="card">
         <div class="card-icon">⛨</div>
@@ -602,7 +778,10 @@
         to bring one back; FocusMemory is just the external memory behind it.
       </p>
       <div style="font-family:'JetBrains Mono',monospace;font-size:.78rem;color:var(--text-3);line-height:1.8;margin-top:14px">
-        PUT /v1/kv-offload/chunk &nbsp;·&nbsp; GET /v1/kv-offload/chunk &nbsp;·&nbsp; DELETE /v1/kv-offload/session &nbsp;|&nbsp; gated by FOCUSMEMORY_KVOFFLOAD=on
+        PUT /v1/kv-offload/chunk · GET /v1/kv-offload/chunk · DELETE /v1/kv-offload/session &nbsp;|&nbsp; gated by FOCUSMEMORY_KVOFFLOAD=on
+      </div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:.78rem;color:var(--text-3);line-height:1.8;margin-top:6px">
+        ~1–2 s lossless recall vs ~5.3 min lossy auto-compact · production-verified (qwen3.8-27B) &nbsp;|&nbsp; client must send X-Session-Id
       </div>
     </div>
   </div>
@@ -618,15 +797,16 @@
         <span class="section-label">Extension</span>
         <h2 style="font-size:clamp(1.5rem,3vw,2.2rem);margin-bottom:12px;max-width:600px">qwen-code extension — zero modifications.</h2>
         <p style="color:var(--text-2);font-size:.98rem;line-height:1.65;margin-bottom:24px;max-width:560px">
-          Plug FocusMemory into qwen-code with a single manifest file. Eight MCP tools, an auto-recall HTTP hook, and Hard Gate search rules — all loaded automatically on startup. No fork, no patch.
+          Plug FocusMemory into qwen-code with a single manifest file. Nine MCP tools, an auto-recall HTTP hook, and Hard Gate search rules — all loaded automatically on startup. No fork, no patch.
         </p>
         <div style="display:flex;gap:28px;flex-wrap:wrap;margin-bottom:24px">
           <div>
             <div style="font-size:.75rem;color:var(--accent);letter-spacing:.1em;text-transform:uppercase;margin-bottom:6px;font-weight:500">MCP Tools</div>
             <div style="color:var(--text-2);font-size:.88rem;line-height:1.7">
-              search_memory · trace_decision_chain<br>
-              remember_decision · query_graph<br>
-              search_code · search_web
+              search_memory · search_work_memory<br>
+              trace_decision_chain · remember_decision<br>
+              search_project_facts · search_code<br>
+              query_graph · focus · search_web
             </div>
           </div>
           <div>
@@ -654,7 +834,7 @@
 
 <footer>
   <div class="wrap">
-    <span>FocusMemory — memory-based agent workflow management · MIT License</span>
+    <span>FocusMemory — memory + execution-state layer for AI coding agents · MIT License</span>
   </div>
 </footer>
 
@@ -675,7 +855,7 @@
   "@type": "SoftwareApplication",
   "name": "FocusMemory",
   "url": "https://focusmemory.org",
-  "description": "Memory-based agent workflow management. FocusMemory pre-indexes source code structure, work history, and task memory into a single shared context, exposing them through intelligent scoring-based routing via a single MCP server. Eliminates grep/glob, excessive re-derivation, and cold boot — giving the agent the same world understanding as the user.",
+  "description": "Memory + execution-state layer for AI coding agents — and the KV store behind focus-llama. Pre-indexes source code structure, work history, and task memory into a single shared context via a single MCP server, manages structured execution state (Σ) across context compaction, and provides a verbatim KV store for the focus-llama engine's lossless long-horizon mode.",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "macOS, Linux",
   "programmingLanguage": ["JavaScript", "TypeScript"],
@@ -687,7 +867,10 @@
   "license": "https://opensource.org/licenses/MIT",
   "softwareVersion": "1.0.0",
   "featureList": [
-    "Memory-based agent workflow management — source code, work history, and task memory as a single shared context",
+    "Memory + execution-state layer for AI coding agents — source code, work history, and task memory as a single shared context",
+    "Declarative attention — numbered magic-chunk markers ([[da:N]]) let the model name exactly which evicted chunks to recall; focus-llama --da-prompt-scan re-prefills them losslessly",
+    "KV store for focus-llama — dumb per-session verbatim store behind --fm-offload; lossless recall in ~1-2 s vs ~5.3 min lossy auto-compact",
+    "skill.state (Σ) — structured execution state extracted pre-compaction and re-injected post-compaction; fail-open hooks, no user-facing latency",
     "Autonomous TODO execution — PM2-managed daily runner with progress tracking and auto-ingest",
     "Causal decision chains — trace the full history of architectural choices, from original rationale through every replacement",
     "Work history and session memory — decisions, bug fixes, and resolved issues persist across agent sessions",
@@ -704,7 +887,8 @@
     "url": "https://github.com/edwardyoon"
   },
   "sameAs": [
-    "https://github.com/edwardyoon/FocusMemory"
+    "https://github.com/edwardyoon/FocusMemory",
+    "https://github.com/edwardyoon/focus-llama"
   ],
   "aggregateRating": {
     "@type": "AggregateRating",
@@ -722,7 +906,7 @@
   "@type": "WebSite",
   "name": "FocusMemory",
   "url": "https://focusmemory.org",
-  "description": "Memory-based agent workflow management — source code, work history, and task memory as a single shared context."
+  "description": "Memory + execution-state layer for AI coding agents — and the KV store behind focus-llama."
 }
 </script>
 

@@ -44,18 +44,91 @@ It is also the durable backend for **lossless long-horizon context**: the kv-off
 * **PreCompact** — checkpoint state before the context is compacted.
 * **MCP knowledge base** — durable project knowledge that doesn't depend on the current context window at all.
 
-### Four pillars
+## Pairing with focus-llama
 
-| Pillar | What it manages | Backend |
-|--------|----------------|---------|
-| **Source code structure & semantic search** | Function graph, code chunks, natural-language code queries | Qdrant `code_chunks` + tree-sitter AST graph |
-| **Work history memory** | Decisions, bug fixes, session outcomes, causal chains | Qdrant `work_memory` + `decision_chains` |
-| **Task memory** | TODO items, daily execution plans, progress tracking | `todos/` folder + Meilisearch full-text |
-| **Context state across compaction** | Structured execution state (Σ) — extracted pre-compaction, re-injected post-compaction | SKILL.state hooks + `work_memory` checkpoints |
+[focus-llama](https://github.com/edwardyoon/focus-llama) is a llama.cpp fork that owns the inference side — KV eviction, re-prefill, attention control. FocusMemory is its durable memory backend: project knowledge, structured execution state, and a verbatim store for evicted context. One decides what leaves; the other remembers what was there.
+
+| Concern | focus-llama · inference engine | FocusMemory · memory layer |
+|---------|-------------------------------|---------------------------|
+| **KV cache** | Decides which messages to evict, cuts their KV, re-prefills on focus | Dumb store — returns evicted text verbatim; no chunking, embedding, or search |
+| **Declarative attention** | `--da-prompt-scan` recovers the layout; re-prefills the recalled chunks | Emits `[[da:N]]` magic-chunk markers + the `focus` retrieval tool |
+| **Execution state (Σ)** | — stays in the engine's context | Extracts a structured state patch pre-compaction, re-injects it post-compaction |
+| **Project knowledge** | — | Qdrant + Meilisearch + tree-sitter AST graph — durable, context-window-independent |
+
+Launch the engine against it:
+
+```
+--fm-offload --kv-offload-holes --focus-memory-host http://<host>:3900
+```
+
+## Four pillars
+
+Everything the engine needs to remember — four pillars cover the full memory contract between the inference engine and the agent (not "just a search RAG"):
+
+| # | Pillar | What it manages | Backend |
+|---|--------|-----------------|---------|
+| **01** | **Declarative attention** | Numbered `[[da:N]]` magic-chunk markers let the model name exactly which recalled chunks it wants in context — lossless recall by name, not re-derivation. | `[[da:N]]` markers + `focus` tool (server) · `--da-prompt-scan` (engine) |
+| **02** | **skill.state (Σ)** | Structured execution state extracted pre-compaction, re-injected post-compaction — the agent resumes from explicit state, not a lossy prose summary. | SKILL.state hooks + `work_memory` checkpoints |
+| **03** | **Memory management** | Durable project knowledge — semantic search, causal decision chains, code graph, task memory. Independent of the context window. | Qdrant + Meilisearch + tree-sitter AST graph |
+| **04** | **KV store** | A dumb per-session verbatim store for evicted context — the lossless-recall backend behind focus-llama's `--fm-offload`. | Per-session JSON store (`~/.qwen/tmp/focus-memory/kv-offload/`) |
+
+Pillar 03's durable knowledge spans three backends:
+
+| Backend | What it holds |
+|---------|---------------|
+| **Source code structure & semantic search** | Function graph, code chunks, natural-language code queries — Qdrant `code_chunks` + tree-sitter AST graph |
+| **Work history memory** | Decisions, bug fixes, session outcomes, causal chains — Qdrant `work_memory` + `decision_chains` |
+| **Task memory** | TODO items, daily execution plans, progress tracking — `todos/` folder + Meilisearch full-text |
 
 Each session shares source code, work history, upcoming tasks, and live execution state as a single memory — the same world-understanding the user has. That cuts the biggest token sinks: repeated grep/glob discovery, re-derived architectural rationale, cold-boot sessions with no context, and compaction amnesia.
 
 > Without enforcement, even an agent with memory available repeats grep → read → reason → retry, because prompt-level instructions are optional, not physical constraints. FocusMemory closes that gap with a `PreToolUse` hard gate.
+
+<br>
+
+---
+
+## Declarative Attention
+
+**The model names the chunk. The engine brings it back.** The bridge between the memory and KV-store pillars: a lossless-recall mechanism that lets the model pull back specific evicted chunks by name instead of re-deriving them.
+
+**Enable (server side — FocusMemory):**
+
+```bash
+# FocusMemory/.env
+FOCUSMEMORY_DA=on
+```
+
+Off by default — with the flag unset, search results are returned as plain text.
+
+**Server side — FocusMemory** wraps search results in numbered magic-chunk markers:
+
+| Marker | Role |
+|--------|------|
+| `[[da:N]]` | Numbered chunk marker (per-session monotonic) — one per recalled result block |
+| `[[da:filler]]` | Placeholder for a result not materialized as a chunk |
+| `[[da:layout:N]]` | Footer carrying the versioned layout signature the engine verifies against the rendered prompt |
+
+Cap: **5 chunks × 300 chars** per query.
+
+**Engine side — focus-llama** is launched with `--da-prompt-scan`: it recovers the layout from the rendered prompt (validating the versioned signature) and re-prefills the KV of whichever chunks the model focuses on. The model names them with a `<focus>` control tag:
+
+```
+<focus magic_chunks="N" />
+```
+
+**The `focus` tool (retrieval side)** closes the loop in two stages:
+
+1. **Cheap index scan** — a `search_code`-style lookup that returns chunk metadata only, no full text.
+2. **Fetch by name** — `focus` fetches the full original by `point_id` UUID or `file_path` + `entity_name`, returning just the chunk, not the whole file.
+
+**Emit rules** — violations break layout recovery:
+
+- Comma-separated single chunk numbers only (`magic_chunks="7,8,9"`)
+- No hyphen/tilde ranges — `7-8` and `7~8` are invalid; expand to explicit `7,8`
+- Attribute values always in double quotes
+- Tags always closed (`/>` or `</focus>`)
+- No partial tags in chain-of-thought
 
 <br>
 
@@ -408,7 +481,7 @@ The highest-scoring backend wins; if the top two are within ε=0.15, a parallel 
 
 ```
 FocusMemory/
-├── index.js                # MCP stdio + Hono HTTP — 8 tools, /v1/context/search
+├── index.js                # MCP stdio + Hono HTTP — 9 tools, /v1/context/search
 ├── init.js                 # Workspace initializer
 ├── autoIngest.js           # Incremental doc/plan/todo ingest + code chunk reindex
 ├── garbageCollect.js       # Time-based retention (todos archive + state_checkpoint prune)
