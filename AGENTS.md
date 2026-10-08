@@ -6,6 +6,8 @@
 
 ## Declarative Attention & Chunk Focus Rules
 
+`<focus magic_chunks="..."/>` is NOT a tool call. It is a plain-text marker written directly in your response body. Never wrap it in a tool_call. There is no tool named "focus".
+
 ### 1. Strict Syntax
 You must use ONLY the `<focus>` tag with valid `magic_chunks` attributes.
 - ALWAYS enclose attribute values in double quotes (`"`).
@@ -17,17 +19,15 @@ When specifying multiple chunks in `magic_chunks`, follow these strict format gu
 - **NO Hyphen Ranges:** Range syntax like `7-8` or `7~8` is STRICTLY FORBIDDEN. Always expand ranges into explicit comma-separated lists.
 - **Single Chunk:** `magic_chunks="7"`
 
-### 3. Valid vs Invalid Examples
+### 3. Examples
 
-#### CORRECT (Always do this):
+CORRECT:
 - `<focus magic_chunks="7,8" />`
 - `<focus magic_chunks="1,2,3,4" />`
 
-#### INCORRECT (NEVER do this):
-- `<focus magic_chunks="7-8"`         -> [ERR] Unclosed quote and tag
-- `<focus magic_chunks="7-8" />`       -> [ERR] Hyphen range used
-- `<focus magic_chunks=7,8>`           -> [ERR] Missing quotes
-- `<focus magic_chunks="7 ~ 8" />`     -> [ERR] Tilde/space range used
+INCORRECT:
+- `<focus magic_chunks="7-8" />`   (hyphen range)
+- `<focus magic_chunks=7,8>`       (missing quotes)
 
 ### 4. Output Safety
 - NEVER output partial tags during Chain-of-Thought reasoning.
