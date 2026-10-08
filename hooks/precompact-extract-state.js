@@ -58,8 +58,8 @@ async function runWorker(event) {
   // Stale-worker guard: the transcript only grows after a Stop when the user
   // starts the next turn. If it grew during the LLM call, a fresher worker
   // will run on that next turn's Stop — merging this one-turn-old patch
-  // (task_summary / current_step / anchor_revoked) would clobber the newer
-  // state, so skip the merge.
+  // (confirmed / next / anchor_revoked) would clobber the newer state, so
+  // skip the merge.
   const sizeAtRead = (() => {
     try { return fs.statSync(event.transcript_path).size; } catch { return 0; }
   })();
@@ -122,12 +122,12 @@ async function runWorker(event) {
     next.updated_at = new Date().toISOString();
     // One-shot context-switch marker (2026-10-03): the first extraction
     // that flips a sticky anchor flag from unset to true marks the
-    // current-view keys (task_summary / current_step / pending_checks) as
-    // the finished task's. The UserPromptSubmit hook consumes the marker
-    // on the NEXT user message — exactly one Σ reset per completion, so
-    // the new task's re-populated keys (merge rule: replace) survive all
-    // later turns. The sticky flags themselves never re-transition, which
-    // is what makes the marker a reliable one-shot without a turn counter.
+    // current-view keys (confirmed / hypothesis / next) as the finished
+    // task's. The UserPromptSubmit hook consumes the marker on the NEXT
+    // user message — exactly one Σ reset per completion, so the new task's
+    // re-populated keys (merge rule: replace) survive all later turns. The
+    // sticky flags themselves never re-transition, which is what makes the
+    // marker a reliable one-shot without a turn counter.
     const wasDone = current.anchor_revoked === true || current.anchor_completed === true;
     const isDone = next.anchor_revoked === true || next.anchor_completed === true;
     if (isDone && !wasDone) next.anchor_reset_pending = true;

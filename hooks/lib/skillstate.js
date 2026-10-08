@@ -307,11 +307,26 @@ function renderAnchor(sigma, opts = {}) {
   if (!sigma || typeof sigma !== 'object') return '';
   const record = !!opts.record;
   const parts = [];
+  if (sigma.anchor_revoked === true) parts.push('original-task-anchor: REVOKED by user');
+  if (sigma.anchor_completed === true) parts.push('original-task-anchor: COMPLETED');
+
+  // 2026-10-09 three-section schema: confirmed (verified, file:line) /
+  // hypothesis (unverified) / next (outstanding steps). next first — it is
+  // what the next turn acts on; confirmed second — the verified ground the
+  // action relies on; hypothesis last — the least trustworthy.
+  const strList = (k) => (Array.isArray(sigma[k]) ? sigma[k].filter((x) => typeof x === 'string' && x.trim()) : []);
+  const next = strList('next');
+  const confirmed = strList('confirmed');
+  const hypothesis = strList('hypothesis');
+  if (next.length) parts.push(`next: ${next.slice(0, 5).join('; ')}`);
+  if (confirmed.length) parts.push(`confirmed: ${confirmed.slice(0, 10).join('; ')}`);
+  if (hypothesis.length) parts.push(`hypothesis (UNVERIFIED — re-check before acting): ${hypothesis.slice(0, 5).join('; ')}`);
+
+  // Legacy fallback — pre-2026-10-09 Σ files still carry the flat keys;
+  // render them until the next extraction overwrites them with sections.
   if (sigma.task_summary) parts.push(record
     ? `previous-turn task (record — NOT the current task): ${sigma.task_summary}`
     : `task: ${sigma.task_summary}`);
-  if (sigma.anchor_revoked === true) parts.push('original-task-anchor: REVOKED by user');
-  if (sigma.anchor_completed === true) parts.push('original-task-anchor: COMPLETED');
   if (sigma.current_step) parts.push(record
     ? `previous-turn step (record — NOT a directive): ${sigma.current_step}`
     : `step: ${sigma.current_step}`);
@@ -321,37 +336,39 @@ function renderAnchor(sigma, opts = {}) {
   if (Array.isArray(sigma.files_touched) && sigma.files_touched.length) {
     parts.push(`files: ${sigma.files_touched.slice(-5).join(', ')}`);
   }
-  if (Array.isArray(sigma.recall_pointers) && sigma.recall_pointers.length) {
-    const n = sigma.recall_pointers.length;
-    const last = sigma.recall_pointers[n - 1];
-    const hint = last && last.hint ? ` (most recent: ${last.hint})` : '';
-    parts.push(`recall: ${n} offloaded segment(s) from before compaction are re-loadable via <focus> (see the offloaded-chunks note)${hint}`);
-  }
   if (sigma.tests_status && typeof sigma.tests_status === 'object' && !Array.isArray(sigma.tests_status)) {
     const failing = Object.entries(sigma.tests_status)
       .filter(([, v]) => v === 'fail')
       .map(([k]) => k);
     if (failing.length) parts.push(`failing: ${failing.join(', ')}`);
   }
+
+  if (Array.isArray(sigma.recall_pointers) && sigma.recall_pointers.length) {
+    const n = sigma.recall_pointers.length;
+    const last = sigma.recall_pointers[n - 1];
+    const hint = last && last.hint ? ` (most recent: ${last.hint})` : '';
+    parts.push(`recall: ${n} offloaded segment(s) from before compaction are re-loadable via <focus> (see the offloaded-chunks note)${hint}`);
+  }
   return parts.join(' | ');
 }
 
 // ─── Σ merge (paper: Σ_{t+1} = Σ_t ⊕ Δ, null deletes a key) ─────────────
 
-// Per-key merge semantics. Arrays of "facts" are cumulative (union);
-// arrays of "current view" are snapshots (replace); objects merge per key.
+// Per-key merge semantics. The content schema (2026-10-09) is three
+// epistemic sections, all "current view" snapshots (replace): the extractor
+// outputs the full current list or omits the key when unchanged.
+//   confirmed  — facts verified by a tool call; each item cites file:line
+//   hypothesis — beliefs not yet verified by a tool call
+//   next       — outstanding steps, in execution order
 const KEY_RULES = {
-  task_summary: 'replace',
-  current_step: 'replace',
-  pending_checks: 'replace',
+  confirmed: 'replace',
+  hypothesis: 'replace',
+  next: 'replace',
   // Snapshot of the offloaded (evicted) segments the model can re-load via
   // <focus> after compaction. Sourced mechanically from the kv-offload store
   // (NOT the LLM) by precompact-extract-state.js — a current-view snapshot, so
   // it replaces rather than accumulates.
   recall_pointers: 'replace',
-  files_touched: 'union',
-  decisions: 'union',
-  tests_status: 'merge',
   // Once the user revokes the original task anchor, it never un-revokes:
   // an LLM "false" (or omission) can leave the flag alone, never clear it.
   anchor_revoked: 'sticky_true',
@@ -362,6 +379,8 @@ const KEY_RULES = {
   // stale anchor (incident a39ee3d9).
   anchor_completed: 'sticky_true',
 };
+// Per-section item caps — keep Σ within the ~800-token injection budget.
+const SECTION_CAPS = { confirmed: 10, hypothesis: 5, next: 5 };
 const MAX_LIST_ITEMS = 50; // cap cumulative lists so Σ stays injection-sized
 
 /**
@@ -396,7 +415,13 @@ function mergeSigma(current, patch) {
     } else if (rule === 'sticky_true') {
       next[key] = next[key] === true || value === true;
     } else {
-      next[key] = value;
+      // Section snapshots: keep only non-empty strings, enforce the
+      // per-section item cap (the ~800-token Σ budget).
+      if (Array.isArray(value) && SECTION_CAPS[key] != null) {
+        next[key] = value.filter((x) => typeof x === 'string' && x.trim()).slice(0, SECTION_CAPS[key]);
+      } else {
+        next[key] = value;
+      }
     }
   }
   return next;
@@ -408,10 +433,10 @@ function mergeSigma(current, patch) {
 // — a file that never existed — produced a Σ pending item that re-injected
 // into later sessions). This mechanical pre-merge check drops NEW patch
 // items that cite a dated todos file absent from disk. Conservative scope:
-// dated todos citations only, string array items only (pending_checks /
-// decisions / files_touched), and patch items only — existing Σ content is
-// never rewritten here (the Stop hook's ghost-file gate handles the live
-// turn; this blocks propagation into the next session).
+// dated todos citations only, string array items only (confirmed /
+// hypothesis / next), and patch items only — existing Σ content is never
+// rewritten here (the Stop hook's ghost-file gate handles the live turn;
+// this blocks propagation into the next session).
 const GHOST_TODO_REF_RE = /((?:\/?[A-Za-z0-9._-]+\/)*todos\/\d{4}-\d{2}-\d{2}\.md)/g;
 
 /**
@@ -423,7 +448,7 @@ const GHOST_TODO_REF_RE = /((?:\/?[A-Za-z0-9._-]+\/)*todos\/\d{4}-\d{2}-\d{2}\.m
 function filterGhostRefs(patch, cwd) {
   const removed = [];
   if (!patch || typeof patch !== 'object' || !cwd) return { patch, removed };
-  for (const key of ['pending_checks', 'decisions', 'files_touched']) {
+  for (const key of ['confirmed', 'hypothesis', 'next']) {
     const arr = patch[key];
     if (!Array.isArray(arr)) continue;
     patch[key] = arr.filter((item) => {
@@ -562,7 +587,14 @@ function extractTranscriptTail(transcriptPath, budgetChars = 30000, opts = {}) {
  * @returns {string}
  */
 function buildExtractionPrompt(sigma, transcriptText) {
-  const current = Object.keys(sigma).length ? JSON.stringify(sigma, null, 2) : '{}';
+  // Show the model only the content-relevant keys (the three sections + the
+  // sticky anchor flags) — bookkeeping (token counts, offsets, kv_state) and
+  // the mechanical recall_pointers are noise for the extractor.
+  const view = {};
+  for (const k of ['confirmed', 'hypothesis', 'next', 'anchor_revoked', 'anchor_completed']) {
+    if (sigma[k] !== undefined) view[k] = sigma[k];
+  }
+  const current = Object.keys(view).length ? JSON.stringify(view, null, 2) : '{}';
   return `You are a state extractor for a coding-agent session that is about to be compacted.
 Extract ONLY the structured execution state needed to continue the work after compaction.
 Do NOT write prose. Do NOT summarize the conversation. Output a single JSON object only.
@@ -575,35 +607,34 @@ ${transcriptText}
 
 [Output Schema] — a state patch; omit keys that did not change, set a key to null to delete it:
 {
-  "task_summary": "one line: what this session is working on",
-  "files_touched": ["new files created or modified in this conversation segment"],
-  "tests_status": {"<check name>": "pass|fail|pending"},
-  "current_step": "what the agent is doing right now",
-  "pending_checks": ["verifications still outstanding — snapshot, replace the old list"],
-  "decisions": ["new decisions made in this segment — each: the decision, then its rationale in 1-3 sentences (why this approach, rejected alternatives, discovered constraints)"],
+  "confirmed": ["verified fact — file:line"],
+  "hypothesis": ["unverified belief or open question"],
+  "next": ["outstanding step, in execution order"],
   "anchor_revoked": "boolean — see the anchor_revoked rule",
   "anchor_completed": "boolean — see the anchor_completed rule"
 }
 
 [Rules]
-- files_touched / decisions / tests_status merge into the current state automatically — list only what is new or changed here.
-- decisions must be self-contained: the session's chain-of-thought is NOT preserved after compaction, so a future reader must understand the why from the item alone. Record only SETTLED decisions — never transcribe the reasoning process, dead ends, or speculation.
-- tests_status is a CURRENT-status map: if the current state lists a check as "fail" or "pending" and the recent conversation shows it now passing, you MUST report "<check name>": "pass" to clear the stale entry. A check must never stay "fail" after its fix is verified in the conversation — stale fails poison the next session's anchor.
-- pending_checks is a snapshot: list only what is still outstanding (omit the key if nothing is pending).
-- task_summary / current_step: give the current best value. If the recent conversation shows the task CHANGED — a new user request, a pivot, or the previous task COMPLETED — you MUST output the updated task_summary / current_step: a finished or superseded task that lingers in Σ gets re-injected as the next turn's anchor and the model resumes it instead of the user's new message. Omit only when you are confident the task is unchanged; when in doubt, output the updated value.
+- Three sections, each a SNAPSHOT of the current view: output the FULL current list (carry forward items from the current state that are still true, add new ones, drop ones that are stale or done), or omit the key entirely if unchanged. Never output only the new items.
+- confirmed: facts VERIFIED by a tool call in this segment or the current state (an edit/write that succeeded, a test run, a file read). EVERY item MUST end with a \`file:line\` citation of where the fact lives (for test/verification facts, the test or script file). If the conversation shows a previously confirmed fact is now stale (the code changed), drop or rewrite it.
+- hypothesis: beliefs NOT yet verified by a tool call — suspected causes, expected-but-untested outcomes, open questions. No speculation beyond what the conversation suggests.
+- next: steps still to be done, in execution order, each self-contained (a future reader must understand it without the chain-of-thought, which is NOT preserved after compaction). If the recent conversation shows the task CHANGED — a new user request, a pivot, or the previous task COMPLETED — you MUST output the updated next list: a finished or superseded task that lingers in Σ gets re-injected as the next turn's anchor and the model resumes it instead of the user's new message. Omit only when you are confident nothing changed; when in doubt, output the updated list.
+- BUDGET: the whole patch must fit in about 800 tokens. confirmed at most 10 items, hypothesis at most 5, next at most 5; each item at most 20 words. When over budget, keep the most actionable items.
 - anchor_revoked: set true ONLY when the user explicitly cancels, rejects, or supersedes the session's ORIGINAL first request in the recent conversation (e.g. "I never asked you to restore that — delete it again"). A follow-up, refinement, or new sub-task within the same task is NOT a revocation. It is sticky: if the current state is already true, keep it true. Omit it when unchanged.
 - anchor_completed: set true when the recent conversation shows the session's ORIGINAL first request is FULLY COMPLETED — the work the user originally asked for is done (the deliverable exists, the tests pass, or the user has visibly moved on). It does NOT require a new task to have started: once the original work is done, the first-user-message pin has served its purpose and is released. A task that is only PARTIALLY done or still being actively worked on is NOT anchor_completed. It is sticky: if the current state is already true, keep it true. Omit it when unchanged.
 - Use only facts present in the conversation. No speculation.
-- Grounding (anti-confabulation): an assistant message can CLAIM work it never did — citing files that no [call]/[result] line in this segment touched, or pending items "carried over from a previous session" with no tool-call evidence. State is what the tool calls show, not what the prose asserts. Omit any pending_checks / files_touched / decisions item whose only support is such an unsupported claim.
+- Grounding (anti-confabulation): an assistant message can CLAIM work it never did — citing files that no [call]/[result] line in this segment touched, or items "carried over from a previous session" with no tool-call evidence. A fact is confirmed only when a tool call in this segment (or the current state) shows it. Omit any confirmed / hypothesis / next item whose only support is such an unsupported claim.
 - Output JSON only. No markdown fences, no commentary.`;
 }
 
 /**
  * Call the extraction LLM (OpenAI-compatible /v1/chat/completions).
- * Model cascade: MAIN_LLM (shared server LLM, already used by
- * taskReceiver/nudge/ingest) first; the local SUMMARY_LLM is only a
- * portability fallback for machines without MAIN_LLM (it is too slow for
- * this workload).
+ * Model cascade: SUMMARY_LLM (the lightweight model) first — a small model
+ * that does NOT contend for slots on the main llama-server serving live
+ * sessions; then MAIN_LLM; then the local default. SUMMARY_LLM is also the
+ * shared lightweight model for the MCP-side topic-key / prune / relevance
+ * filters (lib/utils.js), so repointing it in .env moves extraction and
+ * those together.
  *
  * enable_thinking: true — the Qwen3 27B model intermittently ignores the
  * in-prompt /no_think token and leaks chain-of-thought into the JSON,
@@ -617,27 +648,26 @@ ${transcriptText}
  * @returns {Promise<string>} the JSON `content` ('' on any failure)
  */
 async function callSummaryLLM(prompt, timeoutMs = 120000) {
-  const completionsUrl = env('MAIN_LLM', env('SUMMARY_LLM_URL', 'http://127.0.0.1:8081/v1/completions'));
+  const completionsUrl = env('SUMMARY_LLM_URL', env('MAIN_LLM', 'http://127.0.0.1:8081/v1/completions'));
   const url = /\/chat\/completions$/.test(completionsUrl)
     ? completionsUrl
     : completionsUrl.replace(/\/completions$/, '/chat/completions');
-  const model = env('MAIN_LLM_MODEL', env('SUMMARY_LLM_MODEL', 'summary-27b'));
+  const model = env('SUMMARY_LLM_MODEL', env('MAIN_LLM_MODEL', 'summary-27b'));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // max_tokens 16384: thinking tokens share the budget with the JSON
-      // content on these servers; 2048 truncates the patch after a long
-      // think. It is an upper bound, not a target, so a large value does
-      // not slow short responses.
+      // max_tokens 4096: the patch content is capped at ~800 tokens by the
+      // prompt budget; 4096 leaves headroom for thinking tokens (which share
+      // the budget on these servers) without allowing a runaway patch.
       body: JSON.stringify({
         model,
         messages: [{ role: 'user', content: prompt }],
         enable_thinking: true,
         temperature: 0.1,
-        max_tokens: 16384,
+        max_tokens: 4096,
       }),
       signal: controller.signal,
     });
@@ -657,7 +687,7 @@ async function callSummaryLLM(prompt, timeoutMs = 120000) {
   }
 }
 
-const SCHEMA_KEYS = ['task_summary', 'files_touched', 'tests_status', 'current_step', 'pending_checks', 'decisions', 'anchor_revoked', 'anchor_completed'];
+const SCHEMA_KEYS = ['confirmed', 'hypothesis', 'next', 'anchor_revoked', 'anchor_completed'];
 
 /**
  * Unwrap a {"state_patch": {...}} envelope if present.
@@ -779,9 +809,33 @@ async function embedText(text) {
  * @param {string} [trigger]
  * @returns {Promise<boolean>} true when the point was upserted
  */
+// One-line human summary of a Σ for the work_memory checkpoint. Prefers the
+// first outstanding step (the actionable part); falls back to a confirmed
+// fact, then the legacy task_summary.
+function checkpointSummaryLine(sigma) {
+  const next = Array.isArray(sigma.next) ? sigma.next.find((x) => typeof x === 'string' && x.trim()) : null;
+  if (next) return next;
+  const confirmed = Array.isArray(sigma.confirmed) ? sigma.confirmed.find((x) => typeof x === 'string' && x.trim()) : null;
+  if (confirmed) return confirmed;
+  return sigma.task_summary || '(no state)';
+}
+
+// Distinct file paths cited in Σ — file:line refs from confirmed items first
+// (the new schema), legacy files_touched as fallback.
+function checkpointRelatedFiles(sigma) {
+  const out = [];
+  const push = (f) => { if (f && !out.includes(f)) out.push(f); };
+  const refRe = /([A-Za-z0-9._\-/]+\.\w+):(\d+)/g;
+  for (const item of Array.isArray(sigma.confirmed) ? sigma.confirmed : []) {
+    for (const m of String(item).matchAll(refRe)) push(m[1]);
+  }
+  for (const f of Array.isArray(sigma.files_touched) ? sigma.files_touched : []) push(f);
+  return out.slice(-MAX_LIST_ITEMS);
+}
+
 async function recordCheckpoint(sigma, cwd, trigger) {
   const qdrantUrl = env('QDRANT_URL', 'http://127.0.0.1:6333').replace(/\/$/, '');
-  const summary = `SKILL.state checkpoint [${trigger || 'compact'}]: ${sigma.task_summary || '(no task summary)'}`;
+  const summary = `SKILL.state checkpoint [${trigger || 'compact'}]: ${checkpointSummaryLine(sigma)}`;
   const vector = await embedText(summary);
   if (!vector) return false;
   const controller = new AbortController();
@@ -803,7 +857,7 @@ async function recordCheckpoint(sigma, cwd, trigger) {
               project: cwd ? path.basename(cwd) : '',
               summary_text: summary,
               detail: JSON.stringify(sigma),
-              related_files: Array.isArray(sigma.files_touched) ? sigma.files_touched.slice(-MAX_LIST_ITEMS) : [],
+              related_files: checkpointRelatedFiles(sigma),
               status: 'open',
               timestamp: new Date().toISOString(),
             },

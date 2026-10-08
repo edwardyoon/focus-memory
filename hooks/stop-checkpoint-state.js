@@ -77,14 +77,71 @@ function transcriptSize(transcriptPath) {
   }
 }
 
+// ─── Per-session KV state (focus-llama GET /kv_state) ────────────────────
+// The server exposes the session's KV accounting (logical/resident/offloaded/
+// evictions/buffer). We record it into Σ as HOOK-INTERNAL bookkeeping
+// (sigma.kv_state) — deliberately NOT a model-facing Σ schema field (it is not
+// in SCHEMA_KEYS, so the extraction worker's mergeSigma never touches it). It
+// feeds two later consumers: the injection block's `ctx:` line and the
+// "evictions increased" re-injection trigger.
+
+/**
+ * Base URL of the focus-llama server hosting GET /kv_state: derived from
+ * MAIN_LLM (strip the /v1/chat/completions or /v1/completions suffix) — the
+ * session is served by that same server, so its per-session KV state lives
+ * there. No separate config key.
+ * @returns {string} base URL (no trailing slash) or '' when MAIN_LLM is unset
+ */
+function kvStateBaseUrl() {
+  const main = (ss.env('MAIN_LLM', '') || '').trim();
+  if (!main) return '';
+  return main
+    .replace(/\/v1\/chat\/completions$/, '')
+    .replace(/\/v1\/completions$/, '')
+    .replace(/\/+$/, '');
+}
+
+/**
+ * Fetch the server's per-session KV state. Returns the numeric fields
+ * {logical, resident, offloaded, evictions, buffer} or null (fail-open): no
+ * server configured, network error, timeout, non-200 (e.g. 404 unknown
+ * session), or an unparseable / empty body. Never throws.
+ * @param {string} sessionId - the hook event's session_id (== server `session=`)
+ * @returns {Promise<Object<string,number>|null>}
+ */
+async function fetchKvState(sessionId) {
+  const base = kvStateBaseUrl();
+  if (!base) return null;
+  const url = `${base}/kv_state?session=${encodeURIComponent(sessionId)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1500);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null; // 404 (unknown session) or other — fail-open
+    const body = await res.json();
+    if (!body || typeof body !== 'object') return null;
+    const out = {};
+    for (const k of ['logical', 'resident', 'offloaded', 'evictions', 'buffer']) {
+      const v = Number(body[k]);
+      if (Number.isFinite(v)) out[k] = v;
+    }
+    return Object.keys(out).length ? out : null;
+  } catch {
+    return null; // network error / timeout — fail-open
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Stop hook entry — record last_input_tokens every turn; extract when a
  * state change was logged, the context grew INTERVAL past the last
  * extraction, or a real user message arrived since the last extraction.
- * Spawns the shared detached worker and returns immediately.
- * @returns {void}
+ * Also records the server's per-session KV state (sigma.kv_state). Spawns the
+ * shared detached worker and returns immediately.
+ * @returns {Promise<void>}
  */
-function main() {
+async function main() {
   if (!ss.skillStateEnabled()) return; // gate off → zero behavior change
 
   const raw = fs.readFileSync(0, 'utf8');
@@ -99,6 +156,10 @@ function main() {
   const inputTokens = Number(event.input_tokens);
   if (!sessionId || !Number.isFinite(inputTokens) || inputTokens <= 0) return;
 
+  // Per-session KV state from the focus-llama server (fail-open, 1.5s cap).
+  // Recorded into Σ below as hook-internal bookkeeping (sigma.kv_state).
+  const kvState = await fetchKvState(sessionId);
+
   // Token bookkeeping + trigger detection/consumption as ONE locked
   // read-modify-write: this hook and the other Stop hooks (ghost-gate,
   // turn-guard) run concurrently on the same event, and the old
@@ -111,6 +172,11 @@ function main() {
   ss.mutateSigma(sessionId, (sigma) => {
     // Always: persist the current context size (anchor threshold input).
     sigma.last_input_tokens = inputTokens;
+
+    // Hook-internal KV bookkeeping (separate from the model-facing Σ schema —
+    // not in SCHEMA_KEYS, so the extraction worker's merge never touches it).
+    // A failed/absent fetch leaves the previous snapshot untouched (fail-open).
+    if (kvState) sigma.kv_state = { ...kvState, ts: new Date().toISOString() };
 
     // Trigger 1 — mechanical state change since the last extraction.
     const lastOffset = Number(sigma.last_extraction_log_bytes) || 0;
@@ -181,4 +247,4 @@ function main() {
   });
 }
 
-main();
+main().catch(() => {}); // fail-open — a hook error must never break the session

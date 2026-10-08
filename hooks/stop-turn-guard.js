@@ -20,8 +20,9 @@
 //                        "어떤 작업을 도와드릴까요?"). Fires alone (no B).
 //   B. no-task claim   — the summary asserts there is no active task /
 //                        the session is waiting for instructions.
-//   C. active anchor   — Σ has task_summary / current_step / pending_checks,
-//                        OR today's groups todos/YYYY-MM-DD.md has [~] / [!] items.
+//   C. active anchor   — Σ has confirmed / next items (three-section schema;
+//                        legacy task_summary / current_step / pending_checks
+//                        also count), OR today's todos file has [~] / [!] items.
 //
 // On fire: emit decision "block" with a continuation reason that (1) declares
 // the just-written summary discarded, (2) re-injects the work anchor, (3)
@@ -236,6 +237,9 @@ function main() {
   // C — active work anchor.
   const sigma = ss.loadSigma(sessionId);
   const sigmaActive = !!(
+    (Array.isArray(sigma.confirmed) && sigma.confirmed.length > 0) ||
+    (Array.isArray(sigma.next) && sigma.next.length > 0) ||
+    // Legacy (pre-2026-10-09 Σ files with the flat keys)
     (typeof sigma.task_summary === 'string' && sigma.task_summary.trim()) ||
     (typeof sigma.current_step === 'string' && sigma.current_step.trim()) ||
     (Array.isArray(sigma.pending_checks) && sigma.pending_checks.length > 0)

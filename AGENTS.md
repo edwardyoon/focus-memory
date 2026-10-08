@@ -72,6 +72,19 @@ Question received
    → search_memory(query) — it auto-routes to the best backend
 ```
 
+## Session State Anchor (Σ) — Re-grounding Rule
+
+Long sessions get a "Session state anchor" block injected into the user message (FocusMemory Σ: `next` / `confirmed` / `hypothesis` sections + a one-line `ctx:` KV snapshot). It is a RECORD of where the previous turn ended — one turn behind by construction, not a task assignment.
+
+**Re-ground on the anchor when:**
+- The `ctx: ... evictions=N` line shows **evictions increased** since the anchor you saw last turn — part of your history has left the KV cache and is no longer attendable. The anchor is now your primary map of the session; do not rely on remembering evicted turns.
+- You are **about to conclude or modify** (final answer, code change, deletion, deploy): act from the anchor's `confirmed` and `next` sections, not from memory of the transcript.
+
+**How to re-ground:**
+- `confirmed` items cite `file:line` — use them for orientation, but re-verify against the current file before acting on any of them.
+- `hypothesis` items are UNVERIFIED — re-check them before acting.
+- When the anchor's `recall:` line or the DA scaffold's offloaded-chunks note lists offloaded segments and you need their original content, **re-fetch it with `<focus magic_chunks="N">`** targeting the listed chunk number — never reconstruct evicted content from memory.
+
 ## Tool Reference
 
 | Tool | One-line purpose | Use when... | Replaces |
