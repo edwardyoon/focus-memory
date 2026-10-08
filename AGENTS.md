@@ -76,15 +76,15 @@ Question received
 
 | Tool | One-line purpose | Use when... | Replaces |
 |------|-----------------|-------------|----------|
-| `search_memory` | Unified router → best backend + prune | You don't know which backend to hit | 2-3 separate calls |
+| `search_memory` | Semantic search source code and workspace files | You need to find code or files in the workspace by keyword/content | grep + glob |
 | `search_code` | Semantic search over code chunks | You need the actual code logic | grep + read (for "how does X work?") |
 | `query_graph` | Code structure lookup (Meilisearch) | You need file entities/imports | glob + grep for structure |
-| `search_file_structure` | File name/path/keyword → filepath | You need to locate a file | glob + grep |
+| `search_file_structure` | File name/path/keyword → filepath | You need to locate a file by name or path | glob + grep |
 | `get_context_bundle` | File + chunks + callers in one call | You're about to read_file + search separately | read_file + search_code + query_graph |
 | `trace_references` | Multi-hop caller/callee trace | You need dependency chains | Repeated query_graph calls |
-| `trace_decision_chain` | Full causal history of a decision | "Why was X built this way?" | search_memory + manual chain walk |
-| `search_work_memory` | Direct past-session search | Specific "what did we do last time?" | — |
-| `search_project_facts` | Direct docs/plans search | Specific "what's in the schema?" | — |
+| `trace_decision_chain` | Full causal history of a decision | "Why was X built this way?" | search_work_memory + manual chain walk |
+| `search_work_memory` | Search past-session memory | "What did we do last time?" | — |
+| `search_project_facts` | Search docs/plans | "What's in the schema?" | — |
 | `remember_decision` | Write a decision to memory | Task complete with tests passing | — |
 | `search_web` | Web search via local server | External knowledge needed | — |
 
