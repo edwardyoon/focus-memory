@@ -168,6 +168,15 @@ async function main() {
   let stateChanged = false;
   let intervalHit = false;
   let newUserMsg = false;
+  // Pre-consumption trigger offsets, handed to the worker so a failed or
+  // stale-skipped extraction can RE-ARM the trigger (the consume-before-
+  // spawn guard below made a lost trigger permanent — Σ froze for the rest
+  // of the session, observed 2026-10-09).
+  let prevLogBytes = 0;
+  let prevTranscriptBytes = 0;
+  let prevCheckpointTokens = 0;
+  let consumedLogBytes = 0;
+  let consumedTranscriptBytes = 0;
 
   ss.mutateSigma(sessionId, (sigma) => {
     // Always: persist the current context size (anchor threshold input).
@@ -178,8 +187,13 @@ async function main() {
     // A failed/absent fetch leaves the previous snapshot untouched (fail-open).
     if (kvState) sigma.kv_state = { ...kvState, ts: new Date().toISOString() };
 
+    // Pre-consumption offsets (for the worker's re-arm on failure).
+    prevLogBytes = Number(sigma.last_extraction_log_bytes) || 0;
+    prevTranscriptBytes = Number(sigma.last_extraction_transcript_bytes) || 0;
+    prevCheckpointTokens = Number(sigma.last_checkpoint_tokens) || 0;
+
     // Trigger 1 — mechanical state change since the last extraction.
-    const lastOffset = Number(sigma.last_extraction_log_bytes) || 0;
+    const lastOffset = prevLogBytes;
     stateChanged = ss.hasMutatingCallsSince(sessionId, lastOffset);
 
     // Trigger 2 — context growth fallback. Re-baseline when the context
@@ -191,17 +205,20 @@ async function main() {
 
     // Trigger 3 — a real user message arrived since the last extraction
     // (prose-only task changes / cancellations).
-    const lastTranscript = Number(sigma.last_extraction_transcript_bytes) || 0;
-    newUserMsg = ss.hasNewUserMessageSince(event.transcript_path, lastTranscript);
+    newUserMsg = ss.hasNewUserMessageSince(event.transcript_path, prevTranscriptBytes);
 
     if (stateChanged || intervalHit || newUserMsg) {
       // Consume the triggers before spawning (persist first) so a
       // re-entrant Stop cannot re-fire: growth is re-gated by
       // last_checkpoint_tokens, state change by the tool-log byte offset,
-      // user messages by the transcript byte offset.
+      // user messages by the transcript byte offset. The worker gets both
+      // the prev and consumed values so it can hand the trigger back if it
+      // fails or is stale-skipped (re-arm).
       sigma.last_checkpoint_tokens = inputTokens;
       sigma.last_extraction_log_bytes = toolLogSize(sessionId);
       sigma.last_extraction_transcript_bytes = transcriptSize(event.transcript_path);
+      consumedLogBytes = sigma.last_extraction_log_bytes;
+      consumedTranscriptBytes = sigma.last_extraction_transcript_bytes;
     }
     return sigma;
   });
@@ -228,6 +245,13 @@ async function main() {
           transcript_path: event.transcript_path,
           cwd: event.cwd,
           trigger: stateChanged ? 'stop-state-change' : 'stop-checkpoint',
+          // Delta extraction window + re-arm bookkeeping (see rearmTrigger
+          // in precompact-extract-state.js).
+          prev_log_bytes: prevLogBytes,
+          prev_transcript_bytes: prevTranscriptBytes,
+          prev_checkpoint_tokens: prevCheckpointTokens,
+          consumed_log_bytes: consumedLogBytes,
+          consumed_transcript_bytes: consumedTranscriptBytes,
         }),
       ],
       { detached: true, stdio: 'ignore', env: process.env },

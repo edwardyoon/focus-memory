@@ -567,6 +567,78 @@ function extractTranscriptTail(transcriptPath, budgetChars = 30000, opts = {}) {
   return rendered.join('\n');
 }
 
+/**
+ * Read the transcript DELTA — the entries appended after a previous
+ * extraction (fromBytes = the transcript size at that extraction, the
+ * `last_extraction_transcript_bytes` offset). The transcript JSONL is
+ * append-only (qwen only appends a `chat_compression` record on
+ * compaction), so the byte offset is a stable "since" marker and only the
+ * window [fromBytes, size) is read — no full-file scan.
+ *
+ * Why: the Stop-hook extraction sends the whole tail (up to TAIL_MAX_CHARS,
+ * ~90k chars ≈ 20k+ tokens) every time, and the 8089 extractor prefills at
+ * ~300 tok/s — a full turn's worth of tool calls meant 40-60s LLM calls,
+ * which collided with the user's next message and lost the trigger to the
+ * stale-worker guard. A delta is usually one turn (a few k tokens): seconds,
+ * not minutes. The current Σ is passed in the prompt, so the snapshot
+ * (replace) semantics do not need the older content.
+ *
+ * If the window exceeds maxChars (pathological: first extraction of a long
+ * session, or many stale-skipped turns accumulated), keep the TAIL of the
+ * window — same coverage bound as extractTranscriptTail's budget, and the
+ * dropped head is older than the last Σ snapshot anyway.
+ * @param {string} transcriptPath
+ * @param {number} fromBytes - byte offset to start after (0 = from beginning)
+ * @param {object} [opts]
+ * @param {number} [opts.maxChars=30000] - max window size (tail of window kept)
+ * @returns {string} rendered entries ('' when nothing new / unreadable)
+ */
+function extractTranscriptDelta(transcriptPath, fromBytes, opts = {}) {
+  if (!transcriptPath) return '';
+  const maxChars = Math.max(1000, Number(opts.maxChars) || 30000);
+  let fd;
+  try {
+    fd = fs.openSync(transcriptPath, 'r');
+  } catch {
+    return '';
+  }
+  try {
+    const size = fs.fstatSync(fd).size;
+    const from = Math.max(0, Math.min(Number(fromBytes) || 0, size));
+    let start = from;
+    let capped = false;
+    if (size - start > maxChars) {
+      start = size - maxChars;
+      capped = true;
+    }
+    const len = size - start;
+    if (len <= 0) return '';
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, start);
+    let text = buf.toString('utf8');
+    if (capped) {
+      // `start` lands mid-line; drop the partial first line.
+      const nl = text.indexOf('\n');
+      if (nl >= 0) text = text.slice(nl + 1);
+    }
+    const rendered = [];
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const t = entryToText(entry);
+      if (t) rendered.push(t);
+    }
+    return rendered.join('\n');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 // ─── SUMMARY_LLM extraction ───────────────────────────────────────────────
 
 /**
@@ -900,6 +972,7 @@ module.exports = {
   renderAnchor,
   checkpointId,
   extractTranscriptTail,
+  extractTranscriptDelta,
   buildExtractionPrompt,
   callSummaryLLM,
   extractJsonPatch,

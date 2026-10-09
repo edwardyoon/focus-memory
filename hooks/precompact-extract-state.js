@@ -39,32 +39,82 @@ const BUDGET_CHARS = Math.max(2000, parseInt(process.env.FOCUSMEMORY_SKILLSTATE_
 // User-message guarantee (a39ee3d9 fix): extend the tail past the budget, up
 // to this cap, until at least TAIL_MIN_USER user entries are present — a 30k
 // all-assistant tail held zero user messages, so anchor_completed could never
-// fire. Worst case stays in the ~1-2min range (3x budget).
-const TAIL_MAX_CHARS = Math.max(BUDGET_CHARS, parseInt(process.env.FOCUSMEMORY_SKILLSTATE_TAIL_MAX_CHARS || String(BUDGET_CHARS * 3), 10) || BUDGET_CHARS * 3);
+// fire. Cap is 2x budget (60k chars ≈ 19k tokens): the 8089 server runs a
+// 28k-token ctx, so the worst-case prompt (tail + schema + generation) must
+// stay under it.
+const TAIL_MAX_CHARS = Math.max(BUDGET_CHARS, parseInt(process.env.FOCUSMEMORY_SKILLSTATE_TAIL_MAX_CHARS || String(BUDGET_CHARS * 2), 10) || BUDGET_CHARS * 2);
 const TAIL_MIN_USER = Math.max(1, parseInt(process.env.FOCUSMEMORY_SKILLSTATE_TAIL_MIN_USER || '2', 10) || 2);
 
 /**
+ * Re-arm the Stop hook's extraction trigger after a failed or stale-skipped
+ * extraction. The Stop hook CONSUMES the trigger before spawning (the
+ * re-entrancy guard), so a worker that never merges would otherwise leave
+ * the trigger permanently consumed: Σ freezes until the next mutating call
+ * or user message — observed 2026-10-09, one successful extraction then
+ * silence for the rest of the session while stale skips kept eating the
+ * re-fired triggers.
+ *
+ * Restore the pre-spawn offsets ONLY if no newer Stop has re-consumed them
+ * since this spawn (otherwise that newer worker already covers the retry).
+ * PreCompact spawns carry no consumed offsets → no-op there.
+ * @param {string} sessionId
+ * @param {object} event - the spawn event (Stop spawns carry prev and consumed offset fields)
+ */
+function rearmTrigger(sessionId, event) {
+  if (event.consumed_log_bytes === undefined || event.consumed_transcript_bytes === undefined) return;
+  try {
+    ss.mutateSigma(sessionId, (cur) => {
+      if (!cur) return cur;
+      if (Number(cur.last_extraction_log_bytes) !== Number(event.consumed_log_bytes) ||
+          Number(cur.last_extraction_transcript_bytes) !== Number(event.consumed_transcript_bytes)) {
+        return cur; // a newer Stop already re-consumed — its worker covers the retry
+      }
+      cur.last_extraction_log_bytes = event.prev_log_bytes;
+      cur.last_extraction_transcript_bytes = event.prev_transcript_bytes;
+      if (event.prev_checkpoint_tokens !== undefined) {
+        cur.last_checkpoint_tokens = event.prev_checkpoint_tokens;
+      }
+      return cur;
+    });
+  } catch {
+    // fail-open — worst case the trigger stays consumed (old behavior)
+  }
+}
+
+/**
  * Worker mode — the actual extraction (runs detached, no hook timeout).
- * @param {object} event - PreCompact event JSON
+ * @param {object} event - PreCompact/Stop event JSON
  * @returns {Promise<void>}
  */
 async function runWorker(event) {
   const sessionId = event.session_id;
   if (!sessionId) return;
 
-  const transcriptText = ss.extractTranscriptTail(event.transcript_path, BUDGET_CHARS, { maxChars: TAIL_MAX_CHARS, minUserEntries: TAIL_MIN_USER });
+  // Delta extraction: send only the transcript content since the last
+  // extraction (usually one turn — seconds of prefill, not the 40-60s
+  // whole-tail calls that collided with the next user message and lost the
+  // trigger to the stale guard). Stop spawns carry the pre-spawn offset in
+  // the event; PreCompact spawns fall back to the state file's last
+  // offset. No offset at all (fresh session, first compaction) → full-tail
+  // read with the user-message guarantee.
+  const sigma = ss.loadSigma(sessionId);
+  const fromBytes = Number(event.prev_transcript_bytes)
+    || Number(sigma.last_extraction_transcript_bytes)
+    || 0;
+  const transcriptText = fromBytes > 0
+    ? ss.extractTranscriptDelta(event.transcript_path, fromBytes, { maxChars: BUDGET_CHARS })
+    : ss.extractTranscriptTail(event.transcript_path, BUDGET_CHARS, { maxChars: TAIL_MAX_CHARS, minUserEntries: TAIL_MIN_USER });
   if (!transcriptText) return; // recording disabled or unreadable — nothing to extract
 
   // Stale-worker guard: the transcript only grows after a Stop when the user
   // starts the next turn. If it grew during the LLM call, a fresher worker
   // will run on that next turn's Stop — merging this one-turn-old patch
   // (confirmed / next / anchor_revoked) would clobber the newer state, so
-  // skip the merge.
+  // skip the merge (and hand the trigger back — rearmTrigger below).
   const sizeAtRead = (() => {
     try { return fs.statSync(event.transcript_path).size; } catch { return 0; }
   })();
 
-  const sigma = ss.loadSigma(sessionId);
   const rawOutput = await ss.callSummaryLLM(ss.buildExtractionPrompt(sigma, transcriptText), LLM_TIMEOUT_MS);
 
   let sizeNow = 0;
@@ -77,12 +127,14 @@ async function runWorker(event) {
       event: 'extract_stale_skipped',
       trigger: event.trigger,
     });
+    rearmTrigger(sessionId, event); // trigger was consumed before spawn — hand it back
     return;
   }
 
   const rawPatch = ss.extractJsonPatch(rawOutput);
   if (!rawPatch || Object.keys(rawPatch).length === 0) {
     ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'extract_failed', trigger: event.trigger });
+    rearmTrigger(sessionId, event); // LLM failure — retry on the next Stop
     return; // fail-open — compaction proceeds without state
   }
 
@@ -198,6 +250,7 @@ function main() {
         event: 'worker_error',
         error: String((err && err.message) || err),
       });
+      rearmTrigger(event.session_id || '', event);
     });
     return;
   }
