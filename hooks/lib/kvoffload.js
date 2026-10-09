@@ -463,4 +463,6 @@ module.exports = {
   deleteChunk,
   deleteSession,
   sweepKv,
+  safeSessionStem,
+  sanitizeRefillText,
 };

@@ -76,6 +76,17 @@
             "timeout": 5000
           }
         ]
+      },
+      {
+        "matcher": "^mcp__focus-memory__note_(put|get|list)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${extensionPath}${/}hooks${/}log-tool-call.js",
+            "name": "log-note-call",
+            "timeout": 5000
+          }
+        ]
       }
     ],
     "Stop": [

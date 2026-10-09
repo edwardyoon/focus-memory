@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const { updateState, appendTelemetry, rotateJsonl, STATE_DIR } = require('./lib/state.js');
+const notes = require('./lib/notes.js');
 
 function main() {
   const raw = fs.readFileSync(0, 'utf8');
@@ -17,6 +18,14 @@ function main() {
 
   const sessionId = event.session_id;
   if (!sessionId) returnAllow();
+
+  // Stamp the active-session registry (notes.js): the note_* MCP tools carry
+  // no session of their own and resolve the caller from the freshest stamp.
+  // PreToolUse fires immediately before the tool executes, so this is the
+  // most accurate stamp source (the UserPromptSubmit stamp covers turn start).
+  try {
+    notes.stampActiveSession(sessionId, 'pretooluse');
+  } catch { /* fail-open */ }
 
   const toolName = event.tool_name || 'unknown';
   const logFile = path.join(STATE_DIR, `${sessionId}.jsonl`);

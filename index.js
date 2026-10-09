@@ -18,6 +18,7 @@ import hookState from "./hooks/lib/state.js";
 import skillState from "./hooks/lib/skillstate.js";
 import kvOffload from "./hooks/lib/kvoffload.js";
 import evictExtract from "./hooks/lib/evictextract.js";
+import notes from "./hooks/lib/notes.js";
 import { extractQueryFeatures, routeQuery, rerankMerged, pruneAndSummarize, filterRelevantItems, inferTopicKey, cosineSimilarity, resolveFilePath, isTrivialQuery } from "./lib/utils.js";
 import * as fmConfig from "./lib/config.js";
 
@@ -1814,6 +1815,139 @@ server.registerTool(
   }
 );
 
+// ─── Session notes (put/get) — external work-evidence + checklist store ───
+// plans/continous_work.md FR-1/FR-2: keyed, per-session, persistent,
+// rule-validated notes that survive KV eviction (Σ anchor = where the session
+// is; notes = what the model verified). Gate FOCUSMEMORY_NOTES=on
+// (off/unset → tools not registered, zero behavior change).
+// The model's session identity comes from the active-session registry
+// stamped by the hooks (UserPromptSubmit at turn start, PreToolUse at tool
+// time) — the MCP call itself carries no session id.
+if (notes.notesEnabled()) {
+  server.registerTool(
+    "note_put",
+    {
+      title: "Note Put",
+      description:
+        "Save a work note (verified finding or checklist item) to this session's external note store. " +
+        "Notes survive context eviction — the Session notes index in your prompt lists what is stored. " +
+        "Use when: you finished reading a large file/result, before switching files or sub-tasks, before editing, " +
+        "or after a decision later steps depend on. Keep text under 600 chars (facts, not narrative). " +
+        "A note that claims a verified result requires evidence: path:line or the exact command you ran. " +
+        "Rejected writes return a short reason — fix and retry.",
+      inputSchema: {
+        key: z
+          .string()
+          .describe('Note key: lowercase a-z, 0-9, ".", "_" or "-", max 64 chars. One topic per key. Suggested prefixes: file., plan., decision.'),
+        text: z.string().describe("Note content, max 600 chars. Facts, not narrative."),
+        mode: z
+          .enum(["replace", "append"])
+          .optional()
+          .default("replace")
+          .describe("replace overwrites the key; append grows a checklist-style note"),
+        status: z
+          .enum(["open", "done", "blocked"])
+          .optional()
+          .default("open")
+          .describe("open = in progress or unverified; done; blocked"),
+        evidence: z
+          .string()
+          .optional()
+          .default("")
+          .describe("Required when text claims a verified result: path:line or the exact command you ran"),
+      },
+    },
+    async ({ key, text, mode, status, evidence }) => {
+      const session = notes.resolveActiveSession();
+      if (!session) {
+        return {
+          content: [{ type: "text", text: "No active session detected — note_put unavailable in this context. Continue the task normally." }],
+          isError: true,
+        };
+      }
+      const res = notes.notePut(session.session_id, { key, text, mode, status, evidence });
+      log(
+        `[notes] PUT session=${session.session_id} key=${key} mode=${mode} status=${status} ok=${res.ok}${
+          res.error ? ` reason=${res.error}` : ""
+        }`
+      );
+      if (!res.ok) return { content: [{ type: "text", text: res.error }], isError: true };
+      return {
+        content: [{ type: "text", text: `Note "${key}" saved [${res.note.status}] (${res.note.text.length} chars).` }],
+      };
+    }
+  );
+
+  server.registerTool(
+    "note_get",
+    {
+      title: "Note Get",
+      description:
+        "Recall a session note by key (full text, status, evidence, updated_at). " +
+        "Keys are listed in the Session notes index attached to your prompt. " +
+        "Call before re-reading a file or range you already noted; re-read the source only when you need the exact current text.",
+      inputSchema: {
+        key: z.string().describe("Exact note key from the notes index"),
+      },
+    },
+    async ({ key }) => {
+      const session = notes.resolveActiveSession();
+      if (!session) {
+        return {
+          content: [{ type: "text", text: "No active session detected — note_get unavailable in this context." }],
+          isError: true,
+        };
+      }
+      const res = notes.noteGet(session.session_id, key);
+      log(`[notes] GET session=${session.session_id} key=${key} ok=${res.ok}`);
+      if (!res.ok) return { content: [{ type: "text", text: res.error }], isError: true };
+      const n = res.note;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `note "${key}" [${n.status}]\nupdated: ${n.updated_at}${n.evidence ? `\nevidence: ${n.evidence}` : ""}\n\n${n.text}`,
+          },
+        ],
+      };
+    }
+  );
+
+  server.registerTool(
+    "note_list",
+    {
+      title: "Note List",
+      description:
+        "List this session's notes (key, 80-char summary, status, updated_at; open-status first). " +
+        "Call first after a restart or compaction, and before deciding whether to re-read something you may have noted.",
+      inputSchema: {},
+    },
+    async () => {
+      const session = notes.resolveActiveSession();
+      if (!session) {
+        return {
+          content: [{ type: "text", text: "No active session detected — note_list unavailable in this context." }],
+          isError: true,
+        };
+      }
+      const res = notes.noteList(session.session_id);
+      log(`[notes] LIST session=${session.session_id} count=${res.entries.length}`);
+      if (!res.ok) return { content: [{ type: "text", text: res.error }], isError: true };
+      if (!res.entries.length) {
+        return { content: [{ type: "text", text: "No notes stored for this session yet." }] };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: res.entries.map((e) => `- ${e.key} [${e.status}] ${e.updated_at}\n  ${e.summary}`).join("\n"),
+          },
+        ],
+      };
+    }
+  );
+}
+
 // ─── HTTP Server: Generic Search V1 / UserPromptSubmit Hook endpoint ───
 
 const httpApp = new Hono();
@@ -2234,8 +2368,31 @@ httpApp.get("/v1/kv-offload/session/sigma", async (c) => {
       anchor = skillState.renderAnchor(skillState.loadSigma(sessionId));
     }
   } catch {}
-  log(`[kv-offload] SIGMA session=${sessionId} anchor_chars=${anchor.length}`);
-  return c.json({ ok: true, session_id: sessionId, anchor });
+  // FR-3: the session notes index rides on the same mid-turn anchor call so
+  // the model sees its own notes between turn boundaries too. Independent
+  // gate (FOCUSMEMORY_NOTES) — empty when notes are off or none stored.
+  let notesIndex = "";
+  try {
+    notesIndex = notes.renderNotesIndex(sessionId);
+  } catch {}
+  log(
+    `[kv-offload] SIGMA session=${sessionId} anchor_chars=${anchor.length} notes_index_chars=${notesIndex.length}`
+  );
+  return c.json({ ok: true, session_id: sessionId, anchor, notes_index: notesIndex });
+});
+
+// Session notes index — same payload as the sigma response's notes_index,
+// exposed standalone for the engine (DA scaffold tail) and debugging.
+httpApp.get("/v1/kv-offload/session/notes", async (c) => {
+  const denied = kvAuth(c);
+  if (denied) return denied;
+  if (!kvOffload.kvOffloadEnabled()) return c.json({ error: "kv-offload disabled" }, 404);
+  const sessionId = c.req.query("session_id") || "";
+  if (!sessionId) return c.json({ error: "session_id required" }, 400);
+  const notesIndex = notes.renderNotesIndex(sessionId);
+  const count = Object.keys(notes.loadNotes(sessionId).notes).length;
+  log(`[kv-offload] NOTES session=${sessionId} count=${count} index_chars=${notesIndex.length}`);
+  return c.json({ ok: true, session_id: sessionId, count, notes_index: notesIndex });
 });
 
 httpApp.delete("/v1/kv-offload/session", async (c) => {
