@@ -98,22 +98,42 @@ async function runWorker(event) {
   // offset. No offset at all (fresh session, first compaction) → full-tail
   // read with the user-message guarantee.
   const sigma = ss.loadSigma(sessionId);
-  const fromBytes = Number(event.prev_transcript_bytes)
-    || Number(sigma.last_extraction_transcript_bytes)
-    || 0;
+  // Stop spawns carry the pre-consumption offset explicitly — a fresh
+  // session's first Stop carries 0, which must mean "full-tail read". The
+  // old `Number(prev) || stateFile` chain treated 0 as absent and fell back
+  // to the state file, which the Stop hook had ALREADY consumed to the
+  // post-spawn offset → empty window → silent no-op (2026-10-09: every new
+  // session's first extraction was lost). PreCompact spawns omit the field
+  // → the state-file fallback stays for them.
+  const fromBytes = event.prev_transcript_bytes !== undefined
+    ? (Number(event.prev_transcript_bytes) || 0)
+    : (Number(sigma.last_extraction_transcript_bytes) || 0);
+  const sizeAtRead = (() => {
+    try { return fs.statSync(event.transcript_path).size; } catch { return 0; }
+  })();
   const transcriptText = fromBytes > 0
     ? ss.extractTranscriptDelta(event.transcript_path, fromBytes, { maxChars: BUDGET_CHARS })
     : ss.extractTranscriptTail(event.transcript_path, BUDGET_CHARS, { maxChars: TAIL_MAX_CHARS, minUserEntries: TAIL_MIN_USER });
-  if (!transcriptText) return; // recording disabled or unreadable — nothing to extract
+  if (!transcriptText) {
+    // Previously a silent return — that silence is what made the
+    // first-extraction miss undiagnosable (2026-10-09).
+    ss.appendTelemetry({
+      ts: Date.now(),
+      session_id: sessionId,
+      hook: 'precompact-extract-state',
+      event: 'extract_empty_delta',
+      trigger: event.trigger,
+      from_bytes: fromBytes,
+      size: sizeAtRead,
+    });
+    return; // empty window or unreadable transcript — nothing to extract
+  }
 
   // Stale-worker guard: the transcript only grows after a Stop when the user
   // starts the next turn. If it grew during the LLM call, a fresher worker
   // will run on that next turn's Stop — merging this one-turn-old patch
   // (confirmed / next / anchor_revoked) would clobber the newer state, so
   // skip the merge (and hand the trigger back — rearmTrigger below).
-  const sizeAtRead = (() => {
-    try { return fs.statSync(event.transcript_path).size; } catch { return 0; }
-  })();
 
   const rawOutput = await ss.callSummaryLLM(ss.buildExtractionPrompt(sigma, transcriptText), LLM_TIMEOUT_MS);
 
