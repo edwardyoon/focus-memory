@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import hookState from "./hooks/lib/state.js";
 import skillState from "./hooks/lib/skillstate.js";
 import kvOffload from "./hooks/lib/kvoffload.js";
+import evictExtract from "./hooks/lib/evictextract.js";
 import { extractQueryFeatures, routeQuery, rerankMerged, pruneAndSummarize, filterRelevantItems, inferTopicKey, cosineSimilarity, resolveFilePath, isTrivialQuery } from "./lib/utils.js";
 import * as fmConfig from "./lib/config.js";
 
@@ -2161,6 +2162,10 @@ httpApp.put("/v1/kv-offload/chunk", async (c) => {
   const res = kvOffload.putChunk(sessionId, key, text, body.tokens, body.hint);
   if (!res.ok) return c.json({ error: res.reason || "put failed" }, 500);
   log(`[kv-offload] PUT session=${sessionId} key=${key} bytes=${res.bytes}`);
+  // Eviction-PUT trigger (2026-10-09): the segment just left the model's KV —
+  // distill it into the session's Σ (mid-turn refresh). Fire-and-forget: the
+  // response returns immediately; the worker runs in-process (evictextract.js).
+  evictExtract.kickEvictExtract(sessionId, key, text);
   return c.json({ ok: true, session_id: sessionId, key, bytes: res.bytes });
 });
 
@@ -2209,6 +2214,28 @@ httpApp.get("/v1/kv-offload/session", async (c) => {
   const pinReleased = kvOffload.getPinReleased(sessionId);
   log(`[kv-offload] SESSION session=${sessionId} pin_released=${pinReleased}`);
   return c.json({ ok: true, session_id: sessionId, pin_released: pinReleased });
+});
+
+// Session Σ anchor for the engine's DA scaffold (2026-10-09): the llama-server
+// fetches this on every request while history is offloaded and appends the
+// anchor to the offloaded-chunks note, so a long autonomous turn keeps its
+// ground mid-turn (the Stop/UserPromptSubmit hooks only fire at turn
+// boundaries). The engine caps the call at 200ms and fails open — an empty
+// anchor (no Σ yet / gate off / error) means "nothing to inject".
+httpApp.get("/v1/kv-offload/session/sigma", async (c) => {
+  const denied = kvAuth(c);
+  if (denied) return denied;
+  if (!kvOffload.kvOffloadEnabled()) return c.json({ error: "kv-offload disabled" }, 404);
+  const sessionId = c.req.query("session_id") || "";
+  if (!sessionId) return c.json({ error: "session_id required" }, 400);
+  let anchor = "";
+  try {
+    if (skillState.skillStateEnabled()) {
+      anchor = skillState.renderAnchor(skillState.loadSigma(sessionId));
+    }
+  } catch {}
+  log(`[kv-offload] SIGMA session=${sessionId} anchor_chars=${anchor.length}`);
+  return c.json({ ok: true, session_id: sessionId, anchor });
 });
 
 httpApp.delete("/v1/kv-offload/session", async (c) => {
