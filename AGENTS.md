@@ -3,36 +3,48 @@
 ## Core Principle
 
 **Minimize round trips.** Each tool call costs tokens and latency. Choose the single tool that answers your question. Only chain tools when the first result explicitly points to what's missing.
-
 ## Declarative Attention & Chunk Focus Rules
 
-`<focus magic_chunks="..."/>` is NOT a tool call. It is a plain-text marker written directly in your response body. Never wrap it in a tool_call. There is no tool named "focus".
+### 1. CRITICAL: SYSTEM ATTENTION TAG DEFINITION
+1. `<focus magic_chunks="...">` is an INTERNAL ATTENTION MECHANISM, NOT a tool call, function call, or API invocation.
+2. NEVER emit `<focus ...>` inside tool call formats, `<tool_call>` tags, JSON blocks, or standard tool invocation schemas.
+3. Treat `<focus magic_chunks="...">` purely as inline plain-text metadata directly within the streaming response.
+4. Do NOT halt generation or wait for an external system/tool response after emitting this tag. Continue text generation immediately.
 
-### 1. Strict Syntax
-You must use ONLY the `<focus>` tag with valid `magic_chunks` attributes.
-- ALWAYS enclose attribute values in double quotes (`"`).
-- ALWAYS close the tag with `/>` or `</focus>`. Never leave tags open or truncated.
+### 2. Strict Syntax & Attribute Rules
+- **Quotes Requirement:** Attribute values MUST always be enclosed in double quotes (e.g., `magic_chunks="1,2"`).
+- **Tag Termination:** Self-close with `/>` or explicit closing tag `</focus>`. Never leave tags incomplete.
+- **Explicit Chunk Enumeration (NO RANGES):**
+  - ALWAYS list chunk IDs explicitly with commas (e.g., `magic_chunks="7,8,9"`).
+  - NEVER use hyphens, tildes, or range operators (STRICTLY FORBIDDEN: `7-9`, `7~9`, `7..9`).
 
-### 2. Chunk Range Specification Rules
-When specifying multiple chunks in `magic_chunks`, follow these strict format guidelines:
-- **Comma-Separated Single Chunks ONLY:** Use comma separation for individual chunk IDs (e.g., `magic_chunks="7,8,9"`).
-- **NO Hyphen Ranges:** Range syntax like `7-8` or `7~8` is STRICTLY FORBIDDEN. Always expand ranges into explicit comma-separated lists.
-- **Single Chunk:** `magic_chunks="7"`
+### 3. Execution Safety & Placement
+- Do NOT output partial or incomplete tags during Chain-of-Thought (CoT) reasoning.
+- Emit the `<focus>` tag as a single, uninterrupted token block directly at the start of the relevant passage or control line.
 
-### 3. Examples
+---
 
-CORRECT:
-- `<focus magic_chunks="7,8" />`
-- `<focus magic_chunks="1,2,3,4" />`
+### 4. Positive & Negative Examples
 
-INCORRECT:
-- `<focus magic_chunks="7-8" />`   (hyphen range)
-- `<focus magic_chunks=7,8>`       (missing quotes)
+[CORRECT EXAMPLES]
+- Inline Text Stream:
+  <focus magic_chunks="7,8,9" /> Based on the retrieved context, the result shows...
 
-### 4. Output Safety
-- NEVER output partial tags during Chain-of-Thought reasoning.
-- Output the tag as a single, uninterrupted token block at the very end or designated control line.
+- Multi-chunk Explicit List:
+  <focus magic_chunks="1,2,3,4">Detailed explanation continues here...</focus>
 
+[INCORRECT EXAMPLES - DO NOT DO THIS]
+- WRONG (Tool Call Wrapper):
+  <tool_call>
+  {"name": "focus", "arguments": {"magic_chunks": "7,8"}}
+  </tool_call>
+
+- WRONG (Hyphen Range):
+  <focus magic_chunks="7-9" />
+
+- WRONG (Missing Double Quotes):
+  <focus magic_chunks=7,8 />
+  
 ## Decision Tree
 
 ```
