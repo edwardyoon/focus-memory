@@ -5,6 +5,12 @@
 **Minimize round trips.** Each tool call costs tokens and latency. Choose the single tool that answers your question. Only chain tools when the first result explicitly points to what's missing.
 ## Declarative Attention & Chunk Focus Rules
 
+## Handling large sources
+
+While reading or editing a large source, consolidate your reasoning into a summary of at most 5 lines after every 200+ lines, and again before switching to another file:
+CONFIRMED (with file:line or command evidence) / HYPOTHESIS / NEXT.
+Do not restate code. Keep file:line pointers so details can be re-read.
+
 ### 1. CRITICAL: SYSTEM ATTENTION TAG DEFINITION
 1. `<focus magic_chunks="...">` is an INTERNAL ATTENTION MECHANISM, NOT a tool call, function call, or API invocation.
 2. NEVER emit `<focus ...>` inside tool call formats, `<tool_call>` tags, JSON blocks, or standard tool invocation schemas.
