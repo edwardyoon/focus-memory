@@ -1,9 +1,8 @@
 // FocusMemory garbage collection — time-based retention for unbounded
-// accumulators. Whitelist approach: ONLY the three targets below are ever
-// touched. Decisions (work_memory type=decision/bug_resolved), decision_chains,
-// graph_* and code_chunks are NEVER age-pruned — causal-chain integrity and
-// code-index freshness are managed elsewhere (recency decay, file-existence
-// sync).
+// accumulators. Decisions (work_memory type=decision/bug_resolved),
+// decision_chains, graph_* and code_chunks are NEVER age-pruned — causal-chain
+// integrity and code-index freshness are managed elsewhere (recency decay,
+// file-existence sync).
 //
 //   Phase A — todos/YYYY-MM-DD.md older than GC_TODOS_RETENTION_DAYS are
 //             MOVED (not deleted; todos/ is not under version control) to
@@ -13,12 +12,14 @@
 //   Phase B — work_memory points with type=state_checkpoint and
 //             timestamp < cutoff are deleted by explicit ID list (narrow
 //             filter + ID delete; no broad filter delete against work_memory).
-//   Phase C — per-session files (skill state, kv-offload, tool-call state)
-//             with mtime older than GC_SESSION_RETENTION_DAYS are deleted
-//             from the three whitelisted dirs under ~/.qwen/tmp. Active
-//             sessions keep rewriting their files, so mtime is the liveness
-//             signal; gate-telemetry.jsonl is already size-bounded by the
-//             writer (rotateJsonl) and is not touched here.
+//   Phase C — the ENTIRE ~/.qwen/tmp tree: files with mtime older than
+//             GC_SESSION_RETENTION_DAYS are deleted, then directories that
+//             become empty are removed (bottom-up). qwen-code never cleans
+//             this tree itself (per-session attachments, tool-results,
+//             background-shells, logs, scheduled_tasks), so without this it
+//             grows unbounded. Active sessions keep rewriting their files, so
+//             mtime is the liveness signal — anything written within the
+//             window is never deleted.
 //
 // Usage:
 //   node garbageCollect.js            # live run (requires GC_ENABLED=on)
@@ -44,15 +45,9 @@ const GC_ARCHIVE_DIR =
 const QDRANT_URL = process.env.QDRANT_URL || "http://127.0.0.1:6333";
 const GC_LOG_FILE = "/tmp/focus-memory/gc.log";
 
-// Phase C — per-session artifact dirs (see header). Only files matching
-// SESSION_FILE_RE in these exact dirs are ever age-deleted.
+// Phase C — sweep root (see header): the whole tree under this dir is
+// age-pruned by file mtime.
 const QWEN_TMP = path.join(os.homedir(), ".qwen", "tmp");
-const SESSION_DIRS = [
-  path.join(QWEN_TMP, "focus-memory", "state"),
-  path.join(QWEN_TMP, "focus-memory", "kv-offload"),
-  path.join(QWEN_TMP, "tool-calls"),
-];
-const SESSION_FILE_RE = /\.(json|jsonl|tmp|lock)$/;
 
 const LOCK_FILE = "/tmp/focusmemory-gc.lock";
 const LOCK_STALE_MS = 30 * 60 * 1000; // 30 min
@@ -213,43 +208,74 @@ async function gcCheckpoints(qdrant, retentionDays) {
 }
 
 /**
- * Phase C — delete per-session files (skill state, kv-offload, tool-call
- * state) whose mtime is older than the retention window. Only files matching
- * SESSION_FILE_RE inside the whitelisted SESSION_DIRS are ever touched; a
- * file written within the window (an active session) is never deleted.
+ * Phase C — sweep the entire ~/.qwen/tmp tree: delete files whose mtime is
+ * older than the retention window, then remove directories that become empty
+ * (bottom-up). A file written within the window (an active session) is never
+ * deleted; mtime is the liveness signal. Symlinks and special entries are
+ * left untouched.
  * @param {number} retentionDays
- * @returns {Promise<{removed: string[]}>} full paths of the files removed
- *   (in dry-run: the files that would be removed)
+ * @returns {Promise<{removed: string[], dirsRemoved: number}>} full paths of
+ *   the files removed (in dry-run: the files that would be removed) and the
+ *   number of directories removed (in dry-run: that would be removed)
  */
-async function gcSessionFiles(retentionDays) {
+async function gcQwenTmp(retentionDays) {
   const cutoff = Date.now() - retentionDays * 86400000;
   const removed = [];
-  for (const dir of SESSION_DIRS) {
+  const gone = new Set();
+  let dirsRemoved = 0;
+
+  /**
+   * Recursively sweep one directory, children first (post-order).
+   * @param {string} dir
+   * @returns {Promise<void>}
+   */
+  async function sweep(dir) {
     let entries;
     try {
-      entries = await fs.readdir(dir);
+      entries = await fs.readdir(dir, { withFileTypes: true });
     } catch {
-      continue; // dir absent — nothing to sweep
+      return; // dir absent — nothing to sweep
     }
-    for (const name of entries) {
-      if (!SESSION_FILE_RE.test(name)) continue;
-      const full = path.join(dir, name);
-      try {
-        const st = await fs.stat(full);
-        if (!st.isFile() || st.mtimeMs >= cutoff) continue;
-        if (!DRY_RUN) await fs.unlink(full);
-        removed.push(full);
-      } catch (err) {
-        console.error(`  ✗ session: ${name} — ${err.message}`);
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        await sweep(full);
+        // The dir survives iff at least one child is still live.
+        const live = entries.some((c) => !gone.has(path.join(dir, c.name)));
+        if (!live) {
+          if (!DRY_RUN) {
+            try {
+              await fs.rmdir(full);
+            } catch (err) {
+              console.error(`  ✗ qwen-tmp dir: ${full} — ${err.message}`);
+              continue;
+            }
+          }
+          gone.add(full);
+          dirsRemoved++;
+        }
+      } else if (e.isFile()) {
+        try {
+          const st = await fs.stat(full);
+          if (st.mtimeMs >= cutoff) continue; // active — keep
+          if (!DRY_RUN) await fs.unlink(full);
+          gone.add(full);
+          removed.push(full);
+        } catch (err) {
+          console.error(`  ✗ qwen-tmp file: ${full} — ${err.message}`);
+        }
       }
+      // symlinks and other special entries: left untouched
     }
   }
-  return { removed };
+
+  await sweep(QWEN_TMP);
+  return { removed, dirsRemoved };
 }
 
 /**
  * GC entry point: runs Phase A (todos archive), Phase B (checkpoint
- * retention) and Phase C (per-session file retention) when GC_ENABLED=on,
+ * retention) and Phase C (~/.qwen/tmp tree retention) when GC_ENABLED=on,
  * logging a one-line summary to gc.log.
  * @returns {Promise<void>}
  */
@@ -268,7 +294,7 @@ async function main() {
   const sessionDays = daysToNumber(process.env.GC_SESSION_RETENTION_DAYS, 7);
   console.log(
     `[config] todos retention ${todosDays}d, checkpoint retention ${checkpointDays}d, ` +
-      `session retention ${sessionDays}d, archive ${GC_ARCHIVE_DIR}`
+      `qwen-tmp retention ${sessionDays}d, archive ${GC_ARCHIVE_DIR}`
   );
 
   try {
@@ -293,19 +319,20 @@ async function main() {
     }
     console.log(`  ${DRY_RUN ? "would delete" : "deleted"} ${removed} state_checkpoint point(s)`);
 
-    // ── Phase C: per-session file retention ──────────────────────
-    console.log(`--- Phase C: per-session file retention (${sessionDays}d) ---`);
-    const { removed: sessionRemoved } = await gcSessionFiles(sessionDays);
+    // ── Phase C: ~/.qwen/tmp tree retention ──────────────────────
+    console.log(`--- Phase C: ~/.qwen/tmp tree retention (${sessionDays}d) ---`);
+    const { removed: tmpRemoved, dirsRemoved } = await gcQwenTmp(sessionDays);
     console.log(
-      `  ${DRY_RUN ? "would delete" : "deleted"} ${sessionRemoved.length} session file(s)`
+      `  ${DRY_RUN ? "would delete" : "deleted"} ${tmpRemoved.length} file(s) + ${dirsRemoved} emptied dir(s) under ~/.qwen/tmp`
     );
-    for (const p of sessionRemoved) {
-      console.log(`  [session] ${p}`);
+    for (const p of tmpRemoved) {
+      console.log(`  [qwen-tmp] ${p}`);
     }
 
     await gcLog(
       `gc ${DRY_RUN ? "dry-run" : "run"} todos_archived=${archived.length} ` +
-        `checkpoints_removed=${removed} sessions_removed=${sessionRemoved.length}`
+        `checkpoints_removed=${removed} tmp_removed=${tmpRemoved.length} ` +
+        `tmp_dirs_removed=${dirsRemoved}`
     );
     console.log("=== Done ===");
   } finally {

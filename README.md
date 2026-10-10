@@ -355,12 +355,13 @@ node FocusMemory/todoRunner.js --dry-run                   # preview the target 
 
 ## Garbage collection
 
-Most of the system is self-cleaning: session state files are swept by `cleanup-session.js` (7-day), the gate telemetry JSONL is size-bounded, and every indexer (autoIngest, buildGraph, indexCodeStructure, indexCodeChunks) drops entries for files deleted from disk. Two accumulators are unbounded by design and need time-based retention — `garbageCollect.js` (daily via `config/com.focusmemory.gc.plist`):
+Most of the system is self-cleaning: session state files are swept by `cleanup-session.js` (7-day), the gate telemetry JSONL is size-bounded, and every indexer (autoIngest, buildGraph, indexCodeStructure, indexCodeChunks) drops entries for files deleted from disk. Three accumulators are unbounded by design and need time-based retention — `garbageCollect.js` (daily via `config/com.focusmemory.gc.plist`):
 
 | Target | Rule | Why safe |
 |---|---|---|
 | `todos/YYYY-MM-DD.md` | older than `GC_TODOS_RETENTION_DAYS` → **moved** to `GC_ARCHIVE_DIR/YYYY-MM/` | todos/ is not under version control, so the move keeps it reversible; the archive dir is outside `TODOS_DIR` so autoIngest never re-indexes it, and its deleted-file detection drops the Meilisearch doc. todoRunner only scans the last 3 days. |
 | `work_memory` `type=state_checkpoint` | `timestamp` older than `GC_CHECKPOINT_RETENTION_DAYS` → deleted by explicit ID list | one upserted point per session (`checkpointId`); the Σ file on disk is already swept at 7 days, and no recovery path reads checkpoints older than a session's lifetime. |
+| `~/.qwen/tmp` (entire tree) | file `mtime` older than `GC_SESSION_RETENTION_DAYS` → deleted, then directories that become empty are removed (bottom-up) | qwen-code accumulates per-session artifacts here (attachments, tool-results, background-shells, logs, skill state, kv-offload, tool-calls) and never cleans them up itself. Active sessions keep rewriting their files, so mtime is the liveness signal: anything written within the window is never deleted. |
 
 **Whitelist by construction — never age-pruned:** `decision`/`bug_resolved`/`todo` points and `decision_chains` (causal-chain integrity; `trace_decision_chain` walks `supersedes`/`superseded_by` links, so dropping a node severs the chain — recency decay in reranking already downranks old decisions), and the code index (freshness is managed by file-existence sync, not age).
 
@@ -369,6 +370,7 @@ Most of the system is self-cleaning: session state files are swept by `cleanup-s
 GC_ENABLED=on
 GC_TODOS_RETENTION_DAYS=30
 GC_CHECKPOINT_RETENTION_DAYS=30
+GC_SESSION_RETENTION_DAYS=7
 GC_ARCHIVE_DIR={your_workspace}/todos_archive
 ```
 
