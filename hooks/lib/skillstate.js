@@ -347,7 +347,12 @@ function renderAnchor(sigma, opts = {}) {
     const n = sigma.recall_pointers.length;
     const last = sigma.recall_pointers[n - 1];
     const hint = last && last.hint ? ` (most recent: ${last.hint})` : '';
-    parts.push(`recall: ${n} offloaded segment(s) from before compaction are re-loadable via <focus> (see the offloaded-chunks note)${hint}`);
+    parts.push(
+      `offloaded: ${n} segment(s) from before compaction left the context. ` +
+      `Their chunk numbers are in the "offloaded" chunk list of the attention scaffold ` +
+      `(not a session note, not a tool). To re-read one, emit <focus magic_chunks="N"> ` +
+      `on its own line with that number${hint}`
+    );
   }
   return parts.join(' | ');
 }
