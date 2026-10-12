@@ -429,6 +429,25 @@ function mergeSigma(current, patch) {
       }
     }
   }
+  // 2026-10-12: on the transition to completed/revoked, clear the
+  // outstanding-work fields (next, hypothesis) unless the extractor
+  // provided fresh ones. A completed task whose stale next/hypothesis
+  // lingers gets re-injected as the next turn's anchor and the model
+  // resumes/re-verifies finished work (recurring 2026-10-02 incident:
+  // the render-side record frame covered only the legacy flat keys, so
+  // the 3-section `next` still read as a directive after COMPLETED).
+  // Fires only on the transition (not on sticky re-output), so a later
+  // new task's steps are never over-suppressed. confirmed is kept — it
+  // is historical ground, not outstanding work.
+  const doneTransition =
+    (patch.anchor_completed === true && current.anchor_completed !== true) ||
+    (patch.anchor_revoked === true && current.anchor_revoked !== true);
+  if (doneTransition) {
+    for (const k of ['next', 'hypothesis']) {
+      const provided = Array.isArray(patch[k]) && patch[k].some((x) => typeof x === 'string' && x.trim());
+      if (!provided) next[k] = [];
+    }
+  }
   return next;
 }
 
