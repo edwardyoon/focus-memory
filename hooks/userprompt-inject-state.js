@@ -36,23 +36,14 @@
 // candidates (unpinned, offloadable). The system prompt is untouched, so
 // --cache-reuse prefix caching is preserved.
 //
-// Session notes index (2026-10-09, plans/continous_work.md FR-3): a third,
-// independent block — the model's own work-note index (key [status]
-// summary, ≤30 entries, ~450 tokens), injected whenever non-empty. Gated by
-// FOCUSMEMORY_NOTES=on; the Σ blocks stay gated by FOCUSMEMORY_SKILLSTATE=on.
-// The hook also stamps the active-session registry (notes.js) so the
-// note_put/note_get/note_list MCP tools can resolve this session's identity
-// (the MCP call itself carries no session id).
-//
-// Gated by FOCUSMEMORY_SKILLSTATE=on / FOCUSMEMORY_NOTES=on (both off/unset
-// → immediate no-op, zero behavior change). Fail-open: any error → silent
-// exit 0, the turn proceeds without the injection.
+// Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, zero
+// behavior change). Fail-open: any error → silent exit 0, the turn proceeds
+// without the injection.
 
 const fs = require('fs');
 const crypto = require('crypto');
 const ss = require('./lib/skillstate.js');
 const kv = require('./lib/kvoffload.js');
-const notes = require('./lib/notes.js');
 
 // Keys that constitute the model-facing Σ content — the hash over these
 // decides re-injection. Deliberately EXCLUDES hook-internal bookkeeping
@@ -111,19 +102,17 @@ function ctxLine(sigma) {
 }
 
 /**
- * UserPromptSubmit hook entry — injects up to three independent blocks:
+ * UserPromptSubmit hook entry — injects up to two independent blocks:
  *   1. the Σ state anchor (+ the `ctx:` server KV line);
- *   2. the evicted user-instruction ledger (kv-offload);
- *   3. the session notes index (notes, FR-3).
- * Blocks 1-2 are gated together on "Σ content changed OR evictions > 0" and
+ *   2. the evicted user-instruction ledger (kv-offload).
+ * Both blocks are gated together on "Σ content changed OR evictions > 0" and
  * ride the current (last) user message, so kv_offload_evict's last-user
- * protection keeps them in the KV. Block 3 is injected whenever non-empty.
+ * protection keeps them in the KV.
  * @returns {void}
  */
 function main() {
   const ssOn = ss.skillStateEnabled();
-  const notesOn = notes.notesEnabled();
-  if (!ssOn && !notesOn) return; // both gates off → zero behavior change
+  if (!ssOn) return; // gate off → zero behavior change
 
   const raw = fs.readFileSync(0, 'utf8');
   let event;
@@ -135,14 +124,6 @@ function main() {
 
   const sessionId = event.session_id;
   if (!sessionId) return;
-
-  // Stamp the active-session registry so the note_* MCP tools (which carry
-  // no session id) resolve against THIS session. UserPromptSubmit fires at
-  // turn start — before any of this turn's tool calls — so the freshest
-  // entry at note_put time is the calling session.
-  try {
-    notes.stampActiveSession(sessionId, 'userpromptsubmit');
-  } catch { /* fail-open */ }
 
   const parts = [];
   let injectedSigma = false;
@@ -284,27 +265,6 @@ function main() {
           evictions,
         });
       }
-    }
-  }
-
-  // Session notes index (FR-3) — independent of the Σ gate: injected
-  // whenever the session has notes. Non-empty only after the first
-  // note_put, so the steady-state cost is the index itself (~450 tokens).
-  if (notesOn) {
-    let idx = '';
-    try {
-      idx = notes.renderNotesIndex(sessionId);
-    } catch { /* fail-open */ }
-    if (idx) {
-      parts.push(idx);
-      ss.appendTelemetry({
-        ts: Date.now(),
-        session_id: sessionId,
-        hook: 'userprompt-inject-state',
-        event: 'notes_index_injected',
-        chars: idx.length,
-        approx_tokens: Math.ceil(idx.length / 4),
-      });
     }
   }
 

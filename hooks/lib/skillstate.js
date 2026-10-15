@@ -318,6 +318,10 @@ function renderAnchor(sigma, opts = {}) {
   const next = strList('next');
   const confirmed = strList('confirmed');
   const hypothesis = strList('hypothesis');
+  // blocked first — constraints (DO NOT RETRY) must precede the actions they
+  // constrain; migrated from session notes' blocked status (2026-10-15).
+  const blocked = strList('blocked');
+  if (blocked.length) parts.push(`blocked (DO NOT RETRY): ${blocked.slice(0, 3).join('; ')}`);
   if (next.length) parts.push(`next: ${next.slice(0, 5).join('; ')}`);
   if (confirmed.length) parts.push(`confirmed: ${confirmed.slice(0, 10).join('; ')}`);
   if (hypothesis.length) parts.push(`hypothesis (UNVERIFIED — re-check before acting): ${hypothesis.slice(0, 5).join('; ')}`);
@@ -369,6 +373,9 @@ const KEY_RULES = {
   confirmed: 'replace',
   hypothesis: 'replace',
   next: 'replace',
+  // Active blockers (migrated from session notes' blocked status, 2026-10-15):
+  // a current-view snapshot of what must NOT be retried until it clears.
+  blocked: 'replace',
   // Snapshot of the offloaded (evicted) segments the model can re-load via
   // <focus> after compaction. Sourced mechanically from the kv-offload store
   // (NOT the LLM) by precompact-extract-state.js — a current-view snapshot, so
@@ -385,7 +392,7 @@ const KEY_RULES = {
   anchor_completed: 'sticky_true',
 };
 // Per-section item caps — keep Σ within the ~800-token injection budget.
-const SECTION_CAPS = { confirmed: 10, hypothesis: 5, next: 5 };
+const SECTION_CAPS = { confirmed: 10, hypothesis: 5, next: 5, blocked: 3 };
 const MAX_LIST_ITEMS = 50; // cap cumulative lists so Σ stays injection-sized
 
 /**
@@ -430,7 +437,7 @@ function mergeSigma(current, patch) {
     }
   }
   // 2026-10-12: on the transition to completed/revoked, clear the
-  // outstanding-work fields (next, hypothesis) unless the extractor
+  // outstanding-work fields (next, hypothesis, blocked) unless the extractor
   // provided fresh ones. A completed task whose stale next/hypothesis
   // lingers gets re-injected as the next turn's anchor and the model
   // resumes/re-verifies finished work (recurring 2026-10-02 incident:
@@ -443,7 +450,7 @@ function mergeSigma(current, patch) {
     (patch.anchor_completed === true && current.anchor_completed !== true) ||
     (patch.anchor_revoked === true && current.anchor_revoked !== true);
   if (doneTransition) {
-    for (const k of ['next', 'hypothesis']) {
+    for (const k of ['next', 'hypothesis', 'blocked']) {
       const provided = Array.isArray(patch[k]) && patch[k].some((x) => typeof x === 'string' && x.trim());
       if (!provided) next[k] = [];
     }
@@ -472,7 +479,7 @@ const GHOST_TODO_REF_RE = /((?:\/?[A-Za-z0-9._-]+\/)*todos\/\d{4}-\d{2}-\d{2}\.m
 function filterGhostRefs(patch, cwd) {
   const removed = [];
   if (!patch || typeof patch !== 'object' || !cwd) return { patch, removed };
-  for (const key of ['confirmed', 'hypothesis', 'next']) {
+  for (const key of ['confirmed', 'hypothesis', 'next', 'blocked']) {
     const arr = patch[key];
     if (!Array.isArray(arr)) continue;
     patch[key] = arr.filter((item) => {
@@ -687,7 +694,7 @@ function buildExtractionPrompt(sigma, transcriptText) {
   // sticky anchor flags) — bookkeeping (token counts, offsets, kv_state) and
   // the mechanical recall_pointers are noise for the extractor.
   const view = {};
-  for (const k of ['confirmed', 'hypothesis', 'next', 'anchor_revoked', 'anchor_completed']) {
+  for (const k of ['confirmed', 'hypothesis', 'next', 'blocked', 'anchor_revoked', 'anchor_completed']) {
     if (sigma[k] !== undefined) view[k] = sigma[k];
   }
   const current = Object.keys(view).length ? JSON.stringify(view, null, 2) : '{}';
@@ -706,6 +713,7 @@ ${transcriptText}
   "confirmed": ["verified fact — file:line"],
   "hypothesis": ["unverified belief or open question"],
   "next": ["outstanding step, in execution order"],
+  "blocked": ["currently active blocker — condition"],
   "anchor_revoked": "boolean — see the anchor_revoked rule",
   "anchor_completed": "boolean — see the anchor_completed rule"
 }
@@ -715,7 +723,8 @@ ${transcriptText}
 - confirmed: facts VERIFIED by a tool call in this segment or the current state (an edit/write that succeeded, a test run, a file read). EVERY item MUST end with a \`file:line\` citation of where the fact lives (for test/verification facts, the test or script file). If the conversation shows a previously confirmed fact is now stale (the code changed), drop or rewrite it.
 - hypothesis: beliefs NOT yet verified by a tool call — suspected causes, expected-but-untested outcomes, open questions. No speculation beyond what the conversation suggests.
 - next: steps still to be done, in execution order, each self-contained (a future reader must understand it without the chain-of-thought, which is NOT preserved after compaction). If the recent conversation shows the task CHANGED — a new user request, a pivot, or the previous task COMPLETED — you MUST output the updated next list: a finished or superseded task that lingers in Σ gets re-injected as the next turn's anchor and the model resumes it instead of the user's new message. Omit only when you are confident nothing changed; when in doubt, output the updated list.
-- BUDGET: the whole patch must fit in about 800 tokens. confirmed at most 10 items, hypothesis at most 5, next at most 5; each item at most 20 words. When over budget, keep the most actionable items.
+- blocked: currently active blockers — actions that must NOT be retried until the condition clears (e.g. 'apachectl restart — user approval required', 'test suite failing: X — fix before deploy'). Format: \`<what> — <condition>\`. Omit or empty when nothing is blocked. At most 3 items, each at most 12 words.
+- BUDGET: the whole patch must fit in about 800 tokens. confirmed at most 10 items, hypothesis at most 5, next at most 5, blocked at most 3; each item at most 20 words. When over budget, keep the most actionable items.
 - anchor_revoked: set true ONLY when the user explicitly cancels, rejects, or supersedes the session's ORIGINAL first request in the recent conversation (e.g. "I never asked you to restore that — delete it again"). A follow-up, refinement, or new sub-task within the same task is NOT a revocation. It is sticky: if the current state is already true, keep it true. Omit it when unchanged.
 - anchor_completed: set true when the recent conversation shows the session's ORIGINAL first request is FULLY COMPLETED — the work the user originally asked for is done (the deliverable exists, the tests pass, or the user has visibly moved on). It does NOT require a new task to have started: once the original work is done, the first-user-message pin has served its purpose and is released. A task that is only PARTIALLY done or still being actively worked on is NOT anchor_completed. It is sticky: if the current state is already true, keep it true. Omit it when unchanged.
 - Use only facts present in the conversation. No speculation.
@@ -783,7 +792,7 @@ async function callSummaryLLM(prompt, timeoutMs = 120000) {
   }
 }
 
-const SCHEMA_KEYS = ['confirmed', 'hypothesis', 'next', 'anchor_revoked', 'anchor_completed'];
+const SCHEMA_KEYS = ['confirmed', 'hypothesis', 'next', 'blocked', 'anchor_revoked', 'anchor_completed'];
 
 /**
  * Unwrap a {"state_patch": {...}} envelope if present.
