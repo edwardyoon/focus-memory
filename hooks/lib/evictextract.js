@@ -170,8 +170,25 @@ async function extractBatch(sessionId, batch) {
   // Locked merge + idempotency ledger. evict_processed_keys is a hook-internal
   // bookkeeping key: not in CONTENT_KEYS (the injection hash ignores it) and
   // mergeSigma spreads the current doc first, so it survives every merge.
+  // Anchor-done gate (2026-10-15 stale-anchor incident): the evicted
+  // segments are OLD history. When the anchor is already completed/revoked,
+  // a `next` list distilled from them describes the FINISHED task — merging
+  // it re-activates a completed task in the live Σ (the incident: the model
+  // resumed a committed/pushed task from a mid-turn re-presentation). Omit
+  // next from the patch so the merge PRESERVES the current next (a new
+  // task's steps, if already populated) instead of overwriting it.
+  let beforeNext = [];
+  let nextStripped = false;
   const written = ss.mutateSigma(sessionId, (cur) => {
-    const next = ss.mergeSigma(cur, patch);
+    beforeNext = Array.isArray(cur.next) ? cur.next.slice() : [];
+    let p = patch;
+    const anchorDone = cur.anchor_completed === true || cur.anchor_revoked === true;
+    if (anchorDone && Object.prototype.hasOwnProperty.call(p, 'next')) {
+      p = { ...p };
+      delete p.next;
+      nextStripped = true;
+    }
+    const next = ss.mergeSigma(cur, p);
     next.session_id = sessionId;
     next.updated_at = new Date().toISOString();
     const keys = Array.isArray(cur.evict_processed_keys) ? [...cur.evict_processed_keys] : [];
@@ -182,7 +199,23 @@ async function extractBatch(sessionId, batch) {
     return next;
   });
   if (!written) return;
-  ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'evict-extract', event: 'extracted', segments: fresh.length, keys: Object.keys(patch) });
+  // Mid-turn re-presentation visibility (incident follow-up 4): the DA
+  // scaffold re-presents Σ on every request after this merge, so the
+  // before/after `next` state here is the forensic record of WHAT the model
+  // was re-presented mid-turn.
+  const afterNext = Array.isArray(written.next) ? written.next : [];
+  ss.appendTelemetry({
+    ts: Date.now(),
+    session_id: sessionId,
+    hook: 'evict-extract',
+    event: 'extracted',
+    segments: fresh.length,
+    keys: Object.keys(patch),
+    next_before: beforeNext,
+    next_after: afterNext,
+    ...(nextStripped ? { next_stripped_anchor_done: true } : {}),
+    ...(beforeNext.length === 0 && afterNext.length > 0 ? { next_reactivated: true } : {}),
+  });
 
   // Best-effort work_memory dual-write (stable per-session point, upsert)
   try {

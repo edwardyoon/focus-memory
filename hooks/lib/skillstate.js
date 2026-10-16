@@ -727,6 +727,7 @@ ${transcriptText}
 - BUDGET: the whole patch must fit in about 800 tokens. confirmed at most 10 items, hypothesis at most 5, next at most 5, blocked at most 3; each item at most 20 words. When over budget, keep the most actionable items.
 - anchor_revoked: set true ONLY when the user explicitly cancels, rejects, or supersedes the session's ORIGINAL first request in the recent conversation (e.g. "I never asked you to restore that — delete it again"). A follow-up, refinement, or new sub-task within the same task is NOT a revocation. It is sticky: if the current state is already true, keep it true. Omit it when unchanged.
 - anchor_completed: set true when the recent conversation shows the session's ORIGINAL first request is FULLY COMPLETED — the work the user originally asked for is done (the deliverable exists, the tests pass, or the user has visibly moved on). It does NOT require a new task to have started: once the original work is done, the first-user-message pin has served its purpose and is released. A task that is only PARTIALLY done or still being actively worked on is NOT anchor_completed. It is sticky: if the current state is already true, keep it true. Omit it when unchanged.
+- anchor-done next guard: if the current state or the recent conversation shows the ORIGINAL task is already completed or revoked (anchor_completed / anchor_revoked true), the \`next\` list must NOT re-list steps of that finished task — those belong in \`confirmed\` (as verified outcomes) only. If a NEW task is underway, \`next\` lists only the new task's steps; if nothing new is underway, omit \`next\` entirely.
 - Use only facts present in the conversation. No speculation.
 - Grounding (anti-confabulation): an assistant message can CLAIM work it never did — citing files that no [call]/[result] line in this segment touched, or items "carried over from a previous session" with no tool-call evidence. A fact is confirmed only when a tool call in this segment (or the current state) shows it. Omit any confirmed / hypothesis / next item whose only support is such an unsupported claim.
 - Output JSON only. No markdown fences, no commentary.`;
@@ -790,6 +791,43 @@ async function callSummaryLLM(prompt, timeoutMs = 120000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Completion-signal patterns for the mechanical task-switch flip
+ * (2026-10-15 stale-anchor incident). A superset of check-writeback.js's
+ * COMPLETION_PATTERNS — same conservative base set, intentionally NOT shared
+ * (check-writeback gates a user-facing ask and must not pick up new
+ * patterns) plus commit/push-completion patterns: the incident's actual
+ * completion signal ("커밋·푸시 완료") falls outside the check-writeback set.
+ * Matched against the turn's final assistant message at Stop; the flag it
+ * sets is consumed by the UserPromptSubmit hook's flip, so a false positive
+ * costs at most one turn of state re-derivation (the flip marks the ORIGINAL
+ * anchor done and wipes the current view, which the next extraction
+ * re-derives from the live transcript).
+ */
+const COMPLETION_SIGNAL_PATTERNS = [
+  /테스트.*통과|all checks?\s*pass/i,
+  /버그?.*수정|bug.{0,5}fix|fixed the bug/i,
+  /기능.*완성|구현 완료|feature delivered|implementation complete/i,
+  /ready to commit|커밋.?해줘|commit this/i,
+  /done with the changes|작업 완료|수정 완료/i,
+  // Commit/push completion (the 2026-10-15 incident's signal) —
+  // check-writeback's set predates it.
+  /커밋[하하고]*[·\s]?푸시|커밋.{0,8}완료|푸시.{0,8}완료/i,
+  /committed and pushed|successfully pushed/i,
+];
+
+/**
+ * True when the given (final) assistant message carries a completion signal.
+ * The Stop hook uses it to set sigma.last_turn_completion_signal; the
+ * UserPromptSubmit hook consumes that flag as a mechanical anchor flip.
+ * @param {string} message - the turn's final assistant message
+ * @returns {boolean}
+ */
+function completionSignal(message) {
+  if (typeof message !== 'string' || !message.trim()) return false;
+  return COMPLETION_SIGNAL_PATTERNS.some((p) => p.test(message));
 }
 
 const SCHEMA_KEYS = ['confirmed', 'hypothesis', 'next', 'blocked', 'anchor_revoked', 'anchor_completed'];
@@ -998,6 +1036,7 @@ module.exports = {
   bumpCompactCount,
   sweepSigma,
   mergeSigma,
+  completionSignal,
   filterGhostRefs,
   SCHEMA_KEYS,
   hasMutatingCallsSince,

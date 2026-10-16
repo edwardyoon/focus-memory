@@ -187,6 +187,16 @@ async function main() {
     // A failed/absent fetch leaves the previous snapshot untouched (fail-open).
     if (kvState) sigma.kv_state = { ...kvState, ts: new Date().toISOString() };
 
+    // Completion-signal flag (2026-10-15 stale-anchor incident): the LLM
+    // anchor rule is one turn late — the FIRST turn after a completion runs
+    // with the stale anchor (the incident: a committed/pushed task resumed
+    // from a mid-turn re-presentation). Record whether THIS turn ended with
+    // a completion signal in the final assistant message; the UserPromptSubmit
+    // hook flips anchor_completed mechanically on the next user message when
+    // this flag is set. Every Stop rewrites the flag (false clears a stale
+    // one), so no separate consumption is needed here.
+    sigma.last_turn_completion_signal = ss.completionSignal(String(event.last_assistant_message || ''));
+
     // Pre-consumption offsets (for the worker's re-arm on failure).
     prevLogBytes = Number(sigma.last_extraction_log_bytes) || 0;
     prevTranscriptBytes = Number(sigma.last_extraction_transcript_bytes) || 0;

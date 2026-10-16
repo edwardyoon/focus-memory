@@ -132,6 +132,46 @@ function main() {
   if (ssOn) {
     let sigma = ss.loadSigma(sessionId);
 
+    // Completion-signal-gated task-switch flip (2026-10-15 stale-anchor
+    // incident): the Stop hook sets last_turn_completion_signal when the
+    // previous turn ended with a completion signal. The LLM anchor rule is
+    // one turn late — the first turn AFTER a completion runs with the stale
+    // anchor (the incident: the model resumed a committed/pushed task). When
+    // the flag is set and the anchor is not already done, flip
+    // anchor_completed mechanically (no LLM) and arm the one-shot reset:
+    // the B4 block below releases the pin, the reset block below wipes the
+    // finished task's current view, and the evict-extract anchor-done gate
+    // keeps old evicted segments from re-populating next.
+    if (sigma && sigma.last_turn_completion_signal === true &&
+        sigma.anchor_completed !== true && sigma.anchor_revoked !== true) {
+      try {
+        let flipKind = null;
+        const flipped = ss.mutateSigma(sessionId, (cur) => {
+          if (!cur || cur.last_turn_completion_signal !== true) return null; // re-check inside the lock
+          cur.last_turn_completion_signal = false; // consume — one-shot
+          if (cur.anchor_completed === true || cur.anchor_revoked === true) {
+            flipKind = 'consumed_already_done';
+            return cur;
+          }
+          cur.anchor_completed = true;
+          cur.anchor_reset_pending = true; // the reset block below wipes the current view
+          flipKind = 'flipped';
+          return cur;
+        });
+        if (flipped) {
+          sigma = flipped;
+          ss.appendTelemetry({
+            ts: Date.now(),
+            session_id: sessionId,
+            hook: 'userprompt-inject-state',
+            event: flipKind === 'flipped' ? 'anchor_flipped_completion_signal' : 'completion_signal_consumed',
+          });
+        }
+      } catch {
+        // fail-open — the turn proceeds even if the flip write throws
+      }
+    }
+
     // B4 pin release — rule-based, no LLM (2026-10-03): the existing release
     // path only fires at Stop/PreCompact extraction, which is one turn late —
     // the FIRST turn after a superseding user message ran with the stale pin.
@@ -238,6 +278,25 @@ function main() {
             `changed, or superseded earlier in the session (a later entry can cancel an ` +
             `earlier one):\n` +
             instrs.map((e) => `- ${String(e.ts || '').slice(11, 16)}Z (earlier user): ${e.text}`).join('\n')
+          );
+        }
+
+        // Verbatim re-citation of the current user instruction (2026-10-15
+        // stale-anchor incident): the distilled record lags by one turn and
+        // can re-frame a finished task as the current one (the model read
+        // "From session state: ..." and resumed a committed task). The
+        // user's actual latest words, quoted verbatim, are the authority —
+        // and this block rides the current (LAST) user message, so
+        // kv_offload_evict's last-user protection pins it in KV alongside
+        // the record.
+        const userMsg = (typeof event.submitted_prompt === 'string' && event.submitted_prompt.trim())
+          ? event.submitted_prompt.trim()
+          : (typeof event.prompt === 'string' ? event.prompt.trim() : '');
+        if (userMsg) {
+          const clipped = userMsg.length > 400 ? `${userMsg.slice(0, 400)}…` : userMsg;
+          parts.push(
+            `Current user instruction (verbatim — the AUTHORITY for this turn; ` +
+            `it overrides any task framing in the record above):\n${clipped}`
           );
         }
 
