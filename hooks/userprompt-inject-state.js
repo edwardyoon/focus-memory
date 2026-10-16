@@ -132,6 +132,31 @@ function main() {
   if (ssOn) {
     let sigma = ss.loadSigma(sessionId);
 
+    // Foreign-session scrub at presentation time (2026-10-17): Σ files written
+    // before the merge-time gate (or via a leak it missed) may carry another
+    // session's state-file citation. Scrub the loaded Σ in memory — the anchor
+    // below renders from it — and persist the scrub when it removed anything:
+    // the content-hash re-baseline re-injects the clean version next turn and
+    // the foreign anchor stops re-latching.
+    if (sigma) {
+      const scrubbed = ss.scrubSigmaForeignRefs(sigma, sessionId);
+      if (scrubbed.length) {
+        try {
+          ss.mutateSigma(sessionId, (cur) => {
+            const removed = ss.scrubSigmaForeignRefs(cur, sessionId);
+            return removed.length ? cur : null; // already clean — skip the write
+          });
+        } catch { /* fail-open — the in-memory scrub still covers this turn */ }
+        ss.appendTelemetry({
+          ts: Date.now(),
+          session_id: sessionId,
+          hook: 'userprompt-inject-state',
+          event: 'foreign_refs_scrubbed',
+          removed: scrubbed,
+        });
+      }
+    }
+
     // Completion-signal-gated task-switch flip (2026-10-15 stale-anchor
     // incident): the Stop hook sets last_turn_completion_signal when the
     // previous turn ended with a completion signal. The LLM anchor rule is

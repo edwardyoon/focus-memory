@@ -500,6 +500,88 @@ function filterGhostRefs(patch, cwd) {
   return { patch, removed };
 }
 
+// Foreign-session state reference (2026-10-17 incident): the model reads
+// ANOTHER session's Σ file (state/<uuid>.json) — e.g. during incident
+// forensics — and the extraction LLM distills that citation (sometimes with
+// the foreign session's facts) into THIS session's Σ. Re-injected, the
+// foreign anchor re-latches the model onto another session's task. The
+// pattern matches the 8-hex uuid prefix followed by either dash groups
+// (full or partial uuid) or an elision marker (`…` / `...`). The dot
+// before `json` is optional: the ASCII-dots form swallows it
+// (`state/29a17fe5-...json`), while `…` leaves it (`-….json`). Plain
+// project files like state/abcd1234.json (no dash, no elision) never match.
+const FOREIGN_STATE_REF_RE = /state\/([0-9a-f]{8}(?:(?:-[0-9a-f]+)*-?(?:…|\.\.\.)|(?:-[0-9a-f]+)+))\.?json/g;
+
+/**
+ * Foreign session prefixes cited by a string — `state/<uuid>.json` refs whose
+ * first 8 hex chars do not match the current session's id. Self-references
+ * (the session citing its own Σ file) are allowed: the incident pattern is
+ * foreign refs only.
+ * @param {string} item
+ * @param {string} sessionId - the current session's id
+ * @returns {string[]} the foreign 8-hex prefixes (empty when clean)
+ */
+function foreignSessionRefs(item, sessionId) {
+  if (typeof item !== 'string' || !sessionId) return [];
+  const out = [];
+  for (const m of item.matchAll(FOREIGN_STATE_REF_RE)) {
+    const prefix = m[1].slice(0, 8);
+    if (sessionId.slice(0, 8) !== prefix && !out.includes(prefix)) out.push(prefix);
+  }
+  return out;
+}
+
+/**
+ * Drop new patch items citing OTHER sessions' state files. Mechanical
+ * pre-merge gate (the extraction-prompt cross-session rule is the soft
+ * layer). Patch items only — existing Σ content is scrubbed at presentation
+ * time (userprompt-inject-state.js / sessionstart-inject-state.js), which
+ * also cleans Σ files written before this filter existed.
+ * @param {object} patch - extracted state patch (mutated in place)
+ * @param {string} sessionId - the current session's id
+ * @returns {{patch: object, removed: Array<{key: string, item: string, refs: string[]}>}} the (mutated) patch plus the removed items for telemetry
+ */
+function filterForeignSessionRefs(patch, sessionId) {
+  const removed = [];
+  if (!patch || typeof patch !== 'object' || !sessionId) return { patch, removed };
+  for (const key of ['confirmed', 'hypothesis', 'next', 'blocked']) {
+    const arr = patch[key];
+    if (!Array.isArray(arr)) continue;
+    patch[key] = arr.filter((item) => {
+      const refs = foreignSessionRefs(item, sessionId);
+      if (refs.length) removed.push({ key, item, refs });
+      return refs.length === 0;
+    });
+    if (patch[key].length === 0) delete patch[key];
+  }
+  return { patch, removed };
+}
+
+/**
+ * Scrub a loaded Σ's content sections of foreign-session state refs (in
+ * place). Presentation-time gate: covers Σ files written before
+ * filterForeignSessionRefs existed and any leak the merge gate missed, so a
+ * foreign anchor is never re-presented to the model.
+ * @param {object} sigma - the loaded Σ (mutated in place)
+ * @param {string} sessionId - the current session's id
+ * @returns {Array<{key: string, item: string, refs: string[]}>} the removed items for telemetry
+ */
+function scrubSigmaForeignRefs(sigma, sessionId) {
+  const removed = [];
+  if (!sigma || typeof sigma !== 'object' || !sessionId) return removed;
+  for (const key of ['confirmed', 'hypothesis', 'next', 'blocked']) {
+    const arr = sigma[key];
+    if (!Array.isArray(arr)) continue;
+    const kept = arr.filter((item) => {
+      const refs = foreignSessionRefs(item, sessionId);
+      if (refs.length) removed.push({ key, item, refs });
+      return refs.length === 0;
+    });
+    if (kept.length !== arr.length) sigma[key] = kept;
+  }
+  return removed;
+}
+
 // ─── Transcript extraction ────────────────────────────────────────────────
 
 /**
@@ -687,9 +769,10 @@ function extractTranscriptDelta(transcriptPath, fromBytes, opts = {}) {
  * JSON and breaking it).
  * @param {object} sigma - current Σ (may be {})
  * @param {string} transcriptText - compact transcript tail
+ * @param {string} [sessionId] - the current session's id (cross-session isolation rule)
  * @returns {string}
  */
-function buildExtractionPrompt(sigma, transcriptText) {
+function buildExtractionPrompt(sigma, transcriptText, sessionId) {
   // Show the model only the content-relevant keys (the three sections + the
   // sticky anchor flags) — bookkeeping (token counts, offsets, kv_state) and
   // the mechanical recall_pointers are noise for the extractor.
@@ -728,6 +811,8 @@ ${transcriptText}
 - anchor_revoked: set true ONLY when the user explicitly cancels, rejects, or supersedes the session's ORIGINAL first request in the recent conversation (e.g. "I never asked you to restore that — delete it again"). A follow-up, refinement, or new sub-task within the same task is NOT a revocation. It is sticky: if the current state is already true, keep it true. Omit it when unchanged.
 - anchor_completed: set true when the recent conversation shows the session's ORIGINAL first request is FULLY COMPLETED — the work the user originally asked for is done (the deliverable exists, the tests pass, or the user has visibly moved on). It does NOT require a new task to have started: once the original work is done, the first-user-message pin has served its purpose and is released. A task that is only PARTIALLY done or still being actively worked on is NOT anchor_completed. It is sticky: if the current state is already true, keep it true. Omit it when unchanged.
 - anchor-done next guard: if the current state or the recent conversation shows the ORIGINAL task is already completed or revoked (anchor_completed / anchor_revoked true), the \`next\` list must NOT re-list steps of that finished task — those belong in \`confirmed\` (as verified outcomes) only. If a NEW task is underway, \`next\` lists only the new task's steps; if nothing new is underway, omit \`next\` entirely.
+- Latest-request alignment: the LATEST user message in the recent conversation defines the current task. If it starts or changes the task, \`next\` lists only that task's outstanding steps — steps of an older task that linger in the current state are dropped from \`next\` (verified outcomes of a finished task belong in \`confirmed\`).
+- Cross-session isolation: this session is \`${sessionId || 'unknown'}\`. A path like \`state/<session-id>.json\` whose id does not match it cites ANOTHER session's state — omit any confirmed / hypothesis / next item that cites such a foreign file or whose only support is that file's content.
 - Use only facts present in the conversation. No speculation.
 - Grounding (anti-confabulation): an assistant message can CLAIM work it never did — citing files that no [call]/[result] line in this segment touched, or items "carried over from a previous session" with no tool-call evidence. A fact is confirmed only when a tool call in this segment (or the current state) shows it. Omit any confirmed / hypothesis / next item whose only support is such an unsupported claim.
 - Output JSON only. No markdown fences, no commentary.`;
@@ -1038,6 +1123,9 @@ module.exports = {
   mergeSigma,
   completionSignal,
   filterGhostRefs,
+  foreignSessionRefs,
+  filterForeignSessionRefs,
+  scrubSigmaForeignRefs,
   SCHEMA_KEYS,
   hasMutatingCallsSince,
   hasNewUserMessageSince,

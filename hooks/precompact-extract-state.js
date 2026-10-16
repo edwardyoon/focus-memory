@@ -135,7 +135,7 @@ async function runWorker(event) {
   // (confirmed / next / anchor_revoked) would clobber the newer state, so
   // skip the merge (and hand the trigger back — rearmTrigger below).
 
-  const rawOutput = await ss.callSummaryLLM(ss.buildExtractionPrompt(sigma, transcriptText), LLM_TIMEOUT_MS);
+  const rawOutput = await ss.callSummaryLLM(ss.buildExtractionPrompt(sigma, transcriptText, sessionId), LLM_TIMEOUT_MS);
 
   let sizeNow = 0;
   try { sizeNow = fs.statSync(event.transcript_path).size; } catch {}
@@ -165,6 +165,14 @@ async function runWorker(event) {
   const { patch, removed: ghostRemoved } = ss.filterGhostRefs(rawPatch, event.cwd);
   if (ghostRemoved.length) {
     ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'ghost_refs_filtered', trigger: event.trigger, removed: ghostRemoved });
+  }
+  // Foreign-session gate (2026-10-17 incident): drop new items citing another
+  // session's state file (a forensic read of state/29a17fe5-*.json re-latched
+  // a later session onto that session's task). Same patch-only scope as the
+  // ghost filter.
+  const foreign = ss.filterForeignSessionRefs(patch, sessionId);
+  if (foreign.removed.length) {
+    ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'foreign_refs_filtered', trigger: event.trigger, removed: foreign.removed });
   }
   if (Object.keys(patch).length === 0) {
     ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'extract_empty_after_filter', trigger: event.trigger });
@@ -291,7 +299,8 @@ function main() {
 
   let nudge =
     'FocusMemory SKILL.state: a structured execution state (files touched, test status, current step, pending checks, decisions) is being extracted from this conversation in parallel and persisted separately. ' +
-    'In your summary, do NOT re-enumerate those facts — focus on decisions, rationale, and open issues not captured as structured state.';
+    'In your summary, do NOT re-enumerate those facts — focus on decisions, rationale, and open issues not captured as structured state. ' +
+    'When naming the session\'s current or latest request, first locate the ACTUAL last user message in the transcript and base that section on it (quote it, with its timestamp when present); if the original task is completed or superseded, say so explicitly — do NOT re-date an older message as the latest request.';
   // DA on: keep dead [[da:N]] marker strings out of the summary. The
   // focus-llama scanner (tail anchoring) already makes copied markers
   // harmless — this only lowers the copy frequency (defense in depth).

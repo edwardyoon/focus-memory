@@ -142,7 +142,7 @@ async function extractBatch(sessionId, batch) {
   // retry loop — the engine re-PUTs a key only after an engine restart.
   let raw;
   try {
-    raw = await ss.callSummaryLLM(ss.buildExtractionPrompt(sigma, text), LLM_TIMEOUT_MS);
+    raw = await ss.callSummaryLLM(ss.buildExtractionPrompt(sigma, text, sessionId), LLM_TIMEOUT_MS);
   } catch (err) {
     raw = '';
   }
@@ -153,6 +153,18 @@ async function extractBatch(sessionId, batch) {
   const patch = ss.extractJsonPatch(raw);
   if (!patch || !Object.keys(patch).length) {
     ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'evict-extract', event: 'extract_empty', segments: fresh.length });
+    return;
+  }
+  // Foreign-session gate (2026-10-17 incident): evicted segments are OLD
+  // history — exactly where a forensic read of another session's state file
+  // lives; without the gate the foreign anchor re-enters the live Σ mid-turn.
+  // (filterGhostRefs is intentionally absent here — no cwd in the PUT payload.)
+  const foreign = ss.filterForeignSessionRefs(patch, sessionId);
+  if (foreign.removed.length) {
+    ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'evict-extract', event: 'foreign_refs_filtered', removed: foreign.removed });
+  }
+  if (!Object.keys(patch).length) {
+    ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'evict-extract', event: 'extract_empty_after_filter', segments: fresh.length });
     return;
   }
 
@@ -215,6 +227,10 @@ async function extractBatch(sessionId, batch) {
     next_after: afterNext,
     ...(nextStripped ? { next_stripped_anchor_done: true } : {}),
     ...(beforeNext.length === 0 && afterNext.length > 0 ? { next_reactivated: true } : {}),
+    // Large-evict wave marker (2026-10-17): a big eviction batch (163-class)
+    // is the forensic signature of the stale-framing window — joins
+    // next_before/after as the record for it.
+    ...(fresh.length >= 8 ? { evict_wave: true } : {}),
   });
 
   // Best-effort work_memory dual-write (stable per-session point, upsert)
