@@ -752,6 +752,52 @@ function extractTranscriptDelta(transcriptPath, fromBytes, opts = {}) {
   }
 }
 
+/**
+ * Extract the verbatim last user message from a transcript JSONL — the
+ * post-compaction ground truth for the current task. Scans the entries from
+ * the end and returns the text of the most recent `type === 'user'` entry
+ * with real user text parts. Tool results are their own
+ * `type: 'tool_result'` entries, so the type filter already excludes them.
+ * Two client-side wrappers are stripped so the result is the user's actual
+ * words: the `[User message received during tool execution]:` prefix
+ * (mid-execution sends) and attachment metadata parts ("User attachment
+ * stored on the daemon host..."). The full file is read, not a tail window:
+ * the message this hook recovers is the one before the compaction, which can
+ * sit hundreds of KB back after a long tool-only stretch — and the hook runs
+ * once per compaction, off the per-turn hot path. Fail-open: '' when the
+ * transcript has no user entry or is unreadable.
+ * @param {string} transcriptPath
+ * @param {number} [maxChars=400] - max chars of the returned message
+ * @returns {string} verbatim user message (clipped)
+ */
+function extractLastUserMessage(transcriptPath, maxChars = 400) {
+  if (!transcriptPath) return '';
+  let raw;
+  try {
+    raw = fs.readFileSync(transcriptPath, 'utf8');
+  } catch {
+    return '';
+  }
+  const lines = raw.split('\n').filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let entry;
+    try {
+      entry = JSON.parse(lines[i]);
+    } catch {
+      continue;
+    }
+    if (entry.type !== 'user' || !entry.message || !Array.isArray(entry.message.parts)) continue;
+    const texts = entry.message.parts
+      .map((p) => (p && typeof p.text === 'string' ? p.text.trim() : ''))
+      .filter((t) => t && !/^User attachment stored on the daemon host/i.test(t));
+    if (!texts.length) continue; // metadata-only user entry
+    let msg = texts.join('\n');
+    msg = msg.replace(/^\[User message received during tool execution\]:\s*/i, '');
+    return clip(msg, Math.max(100, Number(maxChars) || 400));
+  }
+  return '';
+}
+
 // ─── SUMMARY_LLM extraction ───────────────────────────────────────────────
 
 /**
@@ -1133,6 +1179,7 @@ module.exports = {
   checkpointId,
   extractTranscriptTail,
   extractTranscriptDelta,
+  extractLastUserMessage,
   buildExtractionPrompt,
   callSummaryLLM,
   extractJsonPatch,

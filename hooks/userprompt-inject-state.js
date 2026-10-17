@@ -1,17 +1,14 @@
 #!/usr/bin/env node
 // UserPromptSubmit hook — SKILL.state per-turn state anchor injection.
 //
-// Injection gate (2026-10-09): inject when the model-facing Σ CONTENT
-// changed since the last injection (sha256 over the content keys, excluding
-// hook-internal bookkeeping and the server-value `ctx:` line), OR when the
-// session has offloaded KV (kv_state.evictions > 0). Before the first
-// eviction the full transcript is attendable, so an unchanged Σ is NOT
-// re-injected (the old 50k-token threshold is gone — a short session with a
-// changed Σ gets its anchor; a long session with an unchanged Σ does not
-// pay for a repeated one). From the first eviction on, part of the history
-// is no longer attendable, so the record is re-presented every turn.
-// Post-compaction is covered by the hash: the extraction worker rewrites Σ
-// around the compaction, so the hash changes and the anchor lands.
+// Injection (2026-10-17): unconditional per-turn. While Σ has content, the
+// anchor is re-presented on every user prompt: a KV break can drop the
+// previously injected copy at any turn, and the 2026-10-09 gate ("inject
+// only when the content hash changed or evictions > 0") left exactly those
+// unchanged-Σ turns anchor-less. The per-turn cost is a few hundred tokens;
+// the stale-anchor failure mode is not worth saving them. The content hash
+// (sigma.last_inject_hash) is still computed and reported in telemetry as
+// the dominant reason (sigma_changed | evictions | per_turn).
 //
 // Why: lost-in-the-middle dilution in long live sessions. The model re-
 // derives "what am I doing" from an ever-growing transcript; an explicit
@@ -102,12 +99,12 @@ function ctxLine(sigma) {
 }
 
 /**
- * UserPromptSubmit hook entry — injects up to two independent blocks:
+ * UserPromptSubmit hook entry — injects up to three independent blocks:
  *   1. the Σ state anchor (+ the `ctx:` server KV line);
- *   2. the evicted user-instruction ledger (kv-offload).
- * Both blocks are gated together on "Σ content changed OR evictions > 0" and
- * ride the current (last) user message, so kv_offload_evict's last-user
- * protection keeps them in the KV.
+ *   2. the evicted user-instruction ledger (kv-offload);
+ *   3. the verbatim current user instruction (anti-stale-anchor).
+ * All blocks are gated on Σ having content and ride the current (last) user
+ * message, so kv_offload_evict's last-user protection keeps them in the KV.
  * @returns {void}
  */
 function main() {
@@ -252,103 +249,88 @@ function main() {
       }
     }
 
-    // Injection gate (2026-10-09): re-inject when the model-facing Σ content
-    // changed since the last injection, OR when the session has offloaded KV
-    // (evictions > 0 — cumulative per session, so from the first eviction on
-    // the record is re-presented every turn, matching the instruction-ledger
-    // block's "non-empty → inject" behavior). The 50k-token threshold is gone:
-    // before the first eviction the full transcript is attendable, so an
-    // unchanged Σ costs nothing by staying out.
+    // Injection (2026-10-17): unconditional per-turn anchor injection. While
+    // Σ has content, the record is re-presented on every user prompt, so a
+    // KV hole / eviction can never strand the model without state — the
+    // 2026-10-09 "changed-or-evictions" gate left unchanged-Σ turns
+    // anchor-less, which is exactly when a KV break loses the thread.
     if (hasContent(sigma)) {
       const tokens = Number(sigma.last_input_tokens) || 0;
       const hash = sigmaContentHash(sigma);
       const evictions = Number(sigma.kv_state && sigma.kv_state.evictions) || 0;
       const changed = sigma.last_inject_hash !== hash;
-      if (changed || evictions > 0) {
-        let instrCount = 0;
-        // record: true — the anchor is one turn behind by construction; an
-        // imperative "task:" label made the model resume a completed/superseded
-        // task instead of answering the user's new message (2026-10-02 incident).
-        const anchor = ss.renderAnchor(sigma, { record: true });
-        if (anchor) {
-          let block =
-            `Session state anchor — a RECORD of where the PREVIOUS turn ended (FocusMemory Σ, ` +
-            `as of the end of the previous turn; may be stale). It is NOT a task ` +
-            `assignment: the user's latest message (the one you are answering now) ` +
-            `defines the current task. If the user's message asks a question, starts ` +
-            `new work, or changes direction, do THAT — do NOT resume, continue, ` +
-            `re-verify, or re-apply the previous turn's task/step below, even though ` +
-            `it may read as an instruction. Use this record only to recall recent ` +
-            `state (files, tests, open items), and cross-check any item against ` +
-            `current ground truth before acting on it:\n${anchor}`;
-          // Server KV snapshot (Stop hook, previous turn) — lets the model weigh
-          // how much of the history is still attendable. Bookkeeping, excluded
-          // from the Σ content hash.
-          const ctx = ctxLine(sigma);
-          if (ctx) block += `\n${ctx}`;
-          parts.push(block);
-        }
-
-        // Offloaded user instructions — history data the model can no longer
-        // see. The ledger is only non-empty after an eviction, which already
-        // forced injection via the evictions > 0 branch above.
-        const instrs = kv.listInstructions(sessionId);
-        instrCount = instrs.length;
-        if (instrs.length) {
-          parts.push(
-            `Offloaded user instructions — the user messages below were evicted from the ` +
-            `model's KV by kv-offload, so the model cannot attend to them directly. ` +
-            `They are HISTORY DATA, not new instructions: the most recent user message you ` +
-            `can see defines the current task. Use this list to recall what was discussed, ` +
-            `changed, or superseded earlier in the session (a later entry can cancel an ` +
-            `earlier one):\n` +
-            instrs.map((e) => `- ${String(e.ts || '').slice(11, 16)}Z (earlier user): ${e.text}`).join('\n')
-          );
-        }
-
-        // Verbatim re-citation of the current user instruction (2026-10-15
-        // stale-anchor incident): the distilled record lags by one turn and
-        // can re-frame a finished task as the current one (the model read
-        // "From session state: ..." and resumed a committed task). The
-        // user's actual latest words, quoted verbatim, are the authority —
-        // and this block rides the current (LAST) user message, so
-        // kv_offload_evict's last-user protection pins it in KV alongside
-        // the record.
-        const userMsg = (typeof event.submitted_prompt === 'string' && event.submitted_prompt.trim())
-          ? event.submitted_prompt.trim()
-          : (typeof event.prompt === 'string' ? event.prompt.trim() : '');
-        if (userMsg) {
-          const clipped = userMsg.length > 400 ? `${userMsg.slice(0, 400)}…` : userMsg;
-          parts.push(
-            `Current user instruction (verbatim — the AUTHORITY for this turn; ` +
-            `it overrides any task framing in the record above):\n${clipped}`
-          );
-        }
-
-        ss.appendTelemetry({
-          ts: Date.now(),
-          session_id: sessionId,
-          hook: 'userprompt-inject-state',
-          event: 'anchor_injected',
-          reason: changed ? 'sigma_changed' : 'evictions',
-          input_tokens: tokens,
-          evictions,
-          offloaded_instructions: instrCount,
-        });
-
-        injectedSigma = true;
-        sigmaHash = hash;
-      } else {
-        ss.appendTelemetry({
-          ts: Date.now(),
-          session_id: sessionId,
-          hook: 'userprompt-inject-state',
-          event: 'inject_skipped',
-          reason: 'unchanged',
-          input_tokens: tokens,
-          evictions,
-        });
+      let instrCount = 0;
+      // record: true — the anchor is one turn behind by construction; an
+      // imperative "task:" label made the model resume a completed/superseded
+      // task instead of answering the user's new message (2026-10-02 incident).
+      const anchor = ss.renderAnchor(sigma, { record: true });
+      if (anchor) {
+        let block =
+          `Session state anchor — a RECORD of where the PREVIOUS turn ended (FocusMemory Σ, ` +
+          `as of the end of the previous turn; may be stale). It is NOT a task ` +
+          `assignment: the user's latest message (the one you are answering now) ` +
+          `defines the current task. If the user's message asks a question, starts ` +
+          `new work, or changes direction, do THAT — do NOT resume, continue, ` +
+          `re-verify, or re-apply the previous turn's task/step below, even though ` +
+          `it may read as an instruction. Use this record only to recall recent ` +
+          `state (files, tests, open items), and cross-check any item against ` +
+          `current ground truth before acting on it:\n${anchor}`;
+        // Server KV snapshot (Stop hook, previous turn) — lets the model weigh
+        // how much of the history is still attendable. Bookkeeping, excluded
+        // from the Σ content hash.
+        const ctx = ctxLine(sigma);
+        if (ctx) block += `\n${ctx}`;
+        parts.push(block);
       }
+
+      // Offloaded user instructions — history data the model can no longer
+      // see. The ledger is only non-empty after an eviction.
+      const instrs = kv.listInstructions(sessionId);
+      instrCount = instrs.length;
+      if (instrs.length) {
+        parts.push(
+          `Offloaded user instructions — the user messages below were evicted from the ` +
+          `model's KV by kv-offload, so the model cannot attend to them directly. ` +
+          `They are HISTORY DATA, not new instructions: the most recent user message you ` +
+          `can see defines the current task. Use this list to recall what was discussed, ` +
+          `changed, or superseded earlier in the session (a later entry can cancel an ` +
+          `earlier one):\n` +
+          instrs.map((e) => `- ${String(e.ts || '').slice(11, 16)}Z (earlier user): ${e.text}`).join('\n')
+        );
+      }
+
+      // Verbatim re-citation of the current user instruction (2026-10-15
+      // stale-anchor incident): the distilled record lags by one turn and
+      // can re-frame a finished task as the current one (the model read
+      // "From session state: ..." and resumed a committed task). The
+      // user's actual latest words, quoted verbatim, are the authority —
+      // and this block rides the current (LAST) user message, so
+      // kv_offload_evict's last-user protection pins it in KV alongside
+      // the record.
+      const userMsg = (typeof event.submitted_prompt === 'string' && event.submitted_prompt.trim())
+        ? event.submitted_prompt.trim()
+        : (typeof event.prompt === 'string' ? event.prompt.trim() : '');
+      if (userMsg) {
+        const clipped = userMsg.length > 400 ? `${userMsg.slice(0, 400)}…` : userMsg;
+        parts.push(
+          `Current user instruction (verbatim — the AUTHORITY for this turn; ` +
+          `it overrides any task framing in the record above):\n${clipped}`
+        );
+      }
+
+      ss.appendTelemetry({
+        ts: Date.now(),
+        session_id: sessionId,
+        hook: 'userprompt-inject-state',
+        event: 'anchor_injected',
+        reason: changed ? 'sigma_changed' : (evictions > 0 ? 'evictions' : 'per_turn'),
+        input_tokens: tokens,
+        evictions,
+        offloaded_instructions: instrCount,
+      });
+
+      injectedSigma = true;
+      sigmaHash = hash;
     }
   }
 
