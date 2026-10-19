@@ -208,6 +208,10 @@ async function extractBatch(sessionId, batch) {
       if (!keys.includes(s.key)) keys.push(s.key);
     }
     next.evict_processed_keys = keys.slice(-MAX_KEYS_TRACKED);
+    // Keep the hypothesis age stamps consistent when evict extraction
+    // merges a patch that changes the hypothesis list (measurement-only
+    // bookkeeping — no drift telemetry here: the segments are OLD history).
+    ss.updateHypoStamps(next, Number(cur.turn_count) || 0);
     return next;
   });
   if (!written) return;

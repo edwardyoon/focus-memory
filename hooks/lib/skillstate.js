@@ -557,6 +557,109 @@ function filterForeignSessionRefs(patch, sessionId) {
   return { patch, removed };
 }
 
+// ─── Drift telemetry (2026-10-19: stamping + base-rate measurement) ──────
+// The drift detectors (hypo-aging, ghost refs, stale citations) are
+// MEASUREMENT-ONLY: they stamp hook-internal bookkeeping (hypo_stamps,
+// turn_count — not in SCHEMA_KEYS, so an extraction patch never carries
+// them; not in CONTENT_KEYS, so the injection hash is unaffected) and emit
+// telemetry. Nothing is dropped, rewritten, or shown to the model. The
+// collected base rates decide whether a detector is worth promoting to a
+// real gate.
+const HYPO_PENDING_TURNS = 3; // a hypothesis still listed after this many turns is "aged"
+
+/**
+ * File paths cited in a state item (`file:line` refs, the QWEN.md
+ * citation convention — basename or project-relative paths).
+ * @param {string} item
+ * @returns {string[]} unique cited paths (empty when the item cites no file)
+ */
+function citedFiles(item) {
+  if (typeof item !== 'string' || !item) return [];
+  const out = [];
+  for (const m of item.matchAll(/([A-Za-z0-9._\-/]+\.\w+):\d+/g)) {
+    if (!out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
+/**
+ * Tool-call file activity in a rendered transcript segment: `touched` =
+ * every file any [call] referenced, `edited` = files mutated by edit /
+ * write_file calls. Parsed from the deterministic entryToText rendering
+ * (`[call] <name> <args-json>`); the args window is scoped to the call's
+ * own 500-char clip and bounded by the next token separator, so result
+ * text cannot inflate the sets.
+ * @param {string} text - rendered segment (extractTranscriptDelta/Tail output)
+ * @returns {{touched: Set<string>, edited: Set<string>}}
+ */
+function segmentCallFiles(text) {
+  const touched = new Set();
+  const edited = new Set();
+  if (typeof text !== 'string' || !text) return { touched, edited };
+  const callRe = /\[call\] (\S+) \{/g;
+  let m;
+  while ((m = callRe.exec(text))) {
+    const name = m[1];
+    const start = m.index + m[0].length; // just past the args' opening brace
+    let end = start + 500; // same clip as entryToText
+    for (const sep of [' | [call]', ' | [result', '\n']) {
+      const i = text.indexOf(sep, start);
+      if (i !== -1 && i < end) end = i;
+    }
+    const win = text.slice(start, end);
+    for (const f of win.matchAll(/"file_path"\s*:\s*"([^"\\]+)"/g)) {
+      touched.add(f[1]);
+      if (name === 'edit' || name === 'write_file') edited.add(f[1]);
+    }
+  }
+  return { touched, edited };
+}
+
+/**
+ * True when a cited path (basename or project-relative, per the QWEN.md
+ * citation convention) refers to an absolute tool-call path: exact match,
+ * path-suffix, or basename match. The basename fallback keeps the ghost
+ * detector conservative — an over-match under-flags, never false-flags.
+ * @param {string} cited - the citation from a state item
+ * @param {string} absPath - a tool-call file path
+ * @returns {boolean}
+ */
+function pathRefersTo(cited, absPath) {
+  if (!cited || !absPath) return false;
+  if (cited === absPath) return true;
+  if (absPath.endsWith('/' + cited)) return true;
+  return cited.split('/').pop() === absPath.split('/').pop();
+}
+
+/**
+ * Update the hypothesis age stamps (sigma.hypo_stamps: item → first-seen
+ * turn_count) after a merge and report the items that have now aged
+ * HYPO_PENDING_TURNS turns without leaving the list — the mechanical proxy
+ * for "repeatedly unverified". Stamps are hook-internal bookkeeping (same
+ category as kv_state / evict_processed_keys). Must run inside the locked
+ * read-modify-write (it mutates sigma in place).
+ * @param {object} sigma - the merged Σ (mutated in place)
+ * @param {number} turn - the current turn_count
+ * @returns {Array<{item: string, pending_since: number, turns: number}>} the aged items
+ */
+function updateHypoStamps(sigma, turn) {
+  const t = Number.isFinite(turn) ? turn : 0;
+  const list = Array.isArray(sigma.hypothesis) ? sigma.hypothesis : [];
+  const prev = (typeof sigma.hypo_stamps === 'object' && sigma.hypo_stamps !== null && !Array.isArray(sigma.hypo_stamps))
+    ? sigma.hypo_stamps : {};
+  const stamps = {};
+  const aged = [];
+  for (const item of list) {
+    if (typeof item !== 'string' || !item) continue;
+    const first = Number(prev[item]);
+    stamps[item] = Number.isFinite(first) ? first : t;
+    const turns = t - stamps[item];
+    if (turns >= HYPO_PENDING_TURNS) aged.push({ item, pending_since: stamps[item], turns });
+  }
+  sigma.hypo_stamps = stamps;
+  return aged;
+}
+
 /**
  * Scrub a loaded Σ's content sections of foreign-session state refs (in
  * place). Presentation-time gate: covers Σ files written before
@@ -1186,4 +1289,8 @@ module.exports = {
   recordCheckpoint,
   emitHookOutput,
   appendTelemetry,
+  citedFiles,
+  segmentCallFiles,
+  pathRefersTo,
+  updateHypoStamps,
 };

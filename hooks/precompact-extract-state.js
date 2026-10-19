@@ -196,7 +196,13 @@ async function runWorker(event) {
   // keys (last_input_tokens, last_checkpoint_tokens, last_extraction_log
   // bytes) during that window. Merging against a fresh read inside the lock
   // is lost-update-safe without a post-hoc key re-copy.
+  // Drift measurement (2026-10-19): the pre-merge confirmed list (stale
+  // citation baseline) and the aged-hypothesis report are captured inside
+  // the same locked RMW as the merge.
+  let agedHypo = [];
+  let preConfirmed = [];
   const written = ss.mutateSigma(sessionId, (current) => {
+    preConfirmed = Array.isArray(current.confirmed) ? current.confirmed : [];
     const next = ss.mergeSigma(current, patch);
     next.session_id = sessionId;
     next.updated_at = new Date().toISOString();
@@ -211,6 +217,8 @@ async function runWorker(event) {
     const wasDone = current.anchor_revoked === true || current.anchor_completed === true;
     const isDone = next.anchor_revoked === true || next.anchor_completed === true;
     if (isDone && !wasDone) next.anchor_reset_pending = true;
+    // Hypothesis age stamps (hook-internal bookkeeping, measurement only).
+    agedHypo = ss.updateHypoStamps(next, Number(current.turn_count) || 0);
     return next;
   });
   if (written) {
@@ -236,6 +244,36 @@ async function runWorker(event) {
           reason: res.reason,
         });
       }
+    }
+  }
+  // Drift base-rate telemetry (2026-10-19, measurement only — no item is
+  // dropped or rewritten, nothing is model-facing): (a) hypotheses that
+  // have aged 3+ turns without leaving the list, (b) NEW confirmed items
+  // citing files the segment's tool calls never touched, (c) EXISTING
+  // confirmed items whose cited file was edited in the segment. The base
+  // rates decide whether any of these becomes a real gate.
+  if (written) {
+    const { touched, edited } = ss.segmentCallFiles(transcriptText);
+    if (agedHypo.length) {
+      ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'drift', event: 'drift_hypo_aged', items: agedHypo });
+    }
+    const ghosts = [];
+    for (const item of Array.isArray(patch.confirmed) ? patch.confirmed : []) {
+      if (typeof item !== 'string' || !item || preConfirmed.includes(item)) continue;
+      const missing = ss.citedFiles(item).filter((c) => ![...touched].some((t) => ss.pathRefersTo(c, t)));
+      if (missing.length) ghosts.push({ item, refs: missing });
+    }
+    if (ghosts.length) {
+      ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'drift', event: 'drift_ghost_ref', items: ghosts });
+    }
+    const stale = [];
+    for (const item of preConfirmed) {
+      if (typeof item !== 'string' || !item) continue;
+      const hit = ss.citedFiles(item).filter((c) => [...edited].some((e) => ss.pathRefersTo(c, e)));
+      if (hit.length) stale.push({ item, files: hit });
+    }
+    if (stale.length) {
+      ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'drift', event: 'drift_stale_citation', items: stale });
     }
   }
   ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'extracted', trigger: event.trigger, keys: Object.keys(patch) });

@@ -182,6 +182,11 @@ async function main() {
     // Always: persist the current context size (anchor threshold input).
     sigma.last_input_tokens = inputTokens;
 
+    // Turn counter (drift-stamp bookkeeping): one increment per Stop. The
+    // hypothesis age stamps (hypo_stamps) are measured in these turns —
+    // hook-internal, like last_input_tokens (never merged from a patch).
+    sigma.turn_count = (Number(sigma.turn_count) || 0) + 1;
+
     // Hook-internal KV bookkeeping (separate from the model-facing Σ schema —
     // not in SCHEMA_KEYS, so the extraction worker's merge never touches it).
     // A failed/absent fetch leaves the previous snapshot untouched (fail-open).
