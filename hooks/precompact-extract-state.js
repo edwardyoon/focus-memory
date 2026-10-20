@@ -201,9 +201,40 @@ async function runWorker(event) {
   // the same locked RMW as the merge.
   let agedHypo = [];
   let preConfirmed = [];
+  let nextStripped = false;
+  let anchorReleased = false;
   const written = ss.mutateSigma(sessionId, (current) => {
     preConfirmed = Array.isArray(current.confirmed) ? current.confirmed : [];
-    const next = ss.mergeSigma(current, patch);
+    const wasDone = current.anchor_revoked === true || current.anchor_completed === true;
+    let p = patch;
+    // Anchor-done gate (2026-10-20 stale-anchor fix, same as evict-extract):
+    // a `next` distilled while the anchor is already completed/revoked is
+    // either a stale re-derivation of the finished task ('strip' — preserve
+    // the current list) or a genuinely new task ('release' — clear the
+    // premature/sticky anchor so the new task runs under a clean anchor).
+    const gate = ss.anchorDoneGateAction(current, p);
+    if (gate.action === 'strip') {
+      p = { ...p };
+      delete p.next;
+      nextStripped = true;
+    } else if (gate.action === 'release') {
+      current.anchor_completed = false;
+      current.anchor_revoked = false;
+      current.anchor_reset_pending = false;
+      current.anchor_done_next = [];
+      delete current.confirmed;
+      delete current.hypothesis;
+      delete current.next;
+      delete current.notes;
+      delete current.task_summary;
+      delete current.current_step;
+      delete current.pending_checks;
+      p = { ...p };
+      delete p.anchor_completed;
+      delete p.anchor_revoked;
+      anchorReleased = true;
+    }
+    const next = ss.mergeSigma(current, p);
     next.session_id = sessionId;
     next.updated_at = new Date().toISOString();
     // One-shot context-switch marker (2026-10-03): the first extraction
@@ -213,10 +244,15 @@ async function runWorker(event) {
     // user message — exactly one Σ reset per completion, so the new task's
     // re-populated keys (merge rule: replace) survive all later turns. The
     // sticky flags themselves never re-transition, which is what makes the
-    // marker a reliable one-shot without a turn counter.
-    const wasDone = current.anchor_revoked === true || current.anchor_completed === true;
+    // marker a reliable one-shot without a turn counter. (2026-10-20: the
+    // release path above is the one sanctioned re-transition — a genuinely
+    // new task clears a premature anchor, and the marker re-arms normally.)
     const isDone = next.anchor_revoked === true || next.anchor_completed === true;
-    if (isDone && !wasDone) next.anchor_reset_pending = true;
+    if (isDone && !wasDone) {
+      next.anchor_reset_pending = true;
+      // Completed task's next = the gate's re-derivation baseline.
+      next.anchor_done_next = Array.isArray(next.next) ? next.next.slice() : [];
+    }
     // Hypothesis age stamps (hook-internal bookkeeping, measurement only).
     agedHypo = ss.updateHypoStamps(next, Number(current.turn_count) || 0);
     return next;
@@ -276,7 +312,16 @@ async function runWorker(event) {
       ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'drift', event: 'drift_stale_citation', items: stale });
     }
   }
-  ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'extracted', trigger: event.trigger, keys: Object.keys(patch) });
+  ss.appendTelemetry({
+    ts: Date.now(),
+    session_id: sessionId,
+    hook: 'precompact-extract-state',
+    event: 'extracted',
+    trigger: event.trigger,
+    keys: Object.keys(patch),
+    ...(nextStripped ? { next_stripped_anchor_done: true } : {}),
+    ...(anchorReleased ? { anchor_released_new_task: true } : {}),
+  });
 }
 
 /**

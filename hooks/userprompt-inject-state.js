@@ -177,6 +177,11 @@ function main() {
           }
           cur.anchor_completed = true;
           cur.anchor_reset_pending = true; // the reset block below wipes the current view
+          // Baseline for the anchor-done gate (2026-10-20 stale-anchor fix):
+          // the reset block below wipes cur.next, so capture the completed
+          // task's next HERE — the gate compares incoming next lists against
+          // it to tell a stale re-derivation (strip) from a new task (release).
+          cur.anchor_done_next = Array.isArray(cur.next) ? cur.next.slice() : [];
           flipKind = 'flipped';
           return cur;
         });

@@ -1395,6 +1395,87 @@ function emitHookOutput(hookSpecificOutput) {
   process.stdout.write(JSON.stringify({ hookSpecificOutput }));
 }
 
+/**
+ * Normalize a next-item for overlap comparison (lowercase, word chars only —
+ * keeps CJK so Korean steps compare correctly).
+ * @param {string} s
+ * @returns {string}
+ */
+function normItem(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9가-힣]+/g, ' ').trim();
+}
+
+/**
+ * Word-token Jaccard similarity between two next-items.
+ * @param {string} a
+ * @param {string} b
+ * @returns {number} 0..1
+ */
+function itemSimilarity(a, b) {
+  const ta = new Set(normItem(a).split(' ').filter(Boolean));
+  const tb = new Set(normItem(b).split(' ').filter(Boolean));
+  if (!ta.size || !tb.size) return 0;
+  let inter = 0;
+  for (const t of ta) if (tb.has(t)) inter++;
+  const union = ta.size + tb.size - inter;
+  return union ? inter / union : 0;
+}
+
+/**
+ * Fraction of incoming next-items that resemble a baseline item (the
+ * re-derivation signal). >= 0.5 means the incoming list is mostly the SAME
+ * task's steps (a stale re-derivation); < 0.5 means it is a genuinely new task.
+ * @param {string[]} incoming
+ * @param {string[]} baseline
+ * @returns {number} 0..1 (0 when either list is empty)
+ */
+function nextOverlapRatio(incoming, baseline) {
+  const inc = (incoming || []).filter((x) => typeof x === 'string' && x.trim());
+  const base = (baseline || []).filter((x) => typeof x === 'string' && x.trim());
+  if (!inc.length || !base.length) return 0;
+  let matched = 0;
+  for (const item of inc) {
+    let best = 0;
+    for (const b of base) {
+      const sim = itemSimilarity(item, b);
+      if (sim > best) best = sim;
+    }
+    if (best >= 0.4) matched++;
+  }
+  return matched / inc.length;
+}
+
+/**
+ * Anchor-done gate action for an incoming `next` patch (2026-10-20 stale-anchor
+ * fix). The 2026-10-15 gate only ever STRIPPED next (preserving the current
+ * list), which — combined with sticky anchor_completed and no reset-arming in
+ * evict-extract — FROZE a stale next indefinitely. This adds a RELEASE action:
+ *   'none'    — anchor not done, or no next in the patch: merge normally.
+ *   'strip'   — anchor done and the incoming next re-derives the completed
+ *               task's steps (high overlap with the baseline): omit next from
+ *               the patch so the current list is preserved (the 2026-10-15
+ *               stale-anchor protection).
+ *   'release' — anchor done but the incoming next is a genuinely NEW task
+ *               (low overlap with the baseline, or no baseline): the
+ *               completed/revoked anchor is stale (premature flip or a
+ *               superseded task). Release it so the new task runs under a clean
+ *               anchor instead of a "COMPLETED + new work" framing.
+ * @param {object} cur - the current Σ (before merge)
+ * @param {object} patch - the incoming patch
+ * @returns {{action: 'none'|'strip'|'release'}}
+ */
+function anchorDoneGateAction(cur, patch) {
+  const anchorDone = cur.anchor_completed === true || cur.anchor_revoked === true;
+  if (!anchorDone || !Object.prototype.hasOwnProperty.call(patch, 'next')) return { action: 'none' };
+  const incoming = (Array.isArray(patch.next) ? patch.next : []).filter((x) => typeof x === 'string' && x.trim());
+  if (!incoming.length) return { action: 'none' };
+  const baseline = (Array.isArray(cur.anchor_done_next) && cur.anchor_done_next.length)
+    ? cur.anchor_done_next
+    : (Array.isArray(cur.next) ? cur.next : []);
+  if (!baseline.length) return { action: 'release' }; // no completed-task baseline → new task
+  return { action: nextOverlapRatio(incoming, baseline) >= 0.5 ? 'strip' : 'release' };
+}
+
 module.exports = {
   SIGMA_DIR,
   skillStateEnabled,
@@ -1432,4 +1513,6 @@ module.exports = {
   segmentCallFiles,
   pathRefersTo,
   updateHypoStamps,
+  anchorDoneGateAction,
+  nextOverlapRatio,
 };

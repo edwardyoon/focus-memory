@@ -182,23 +182,54 @@ async function extractBatch(sessionId, batch) {
   // Locked merge + idempotency ledger. evict_processed_keys is a hook-internal
   // bookkeeping key: not in CONTENT_KEYS (the injection hash ignores it) and
   // mergeSigma spreads the current doc first, so it survives every merge.
-  // Anchor-done gate (2026-10-15 stale-anchor incident): the evicted
-  // segments are OLD history. When the anchor is already completed/revoked,
-  // a `next` list distilled from them describes the FINISHED task — merging
-  // it re-activates a completed task in the live Σ (the incident: the model
-  // resumed a committed/pushed task from a mid-turn re-presentation). Omit
-  // next from the patch so the merge PRESERVES the current next (a new
-  // task's steps, if already populated) instead of overwriting it.
+  // Anchor-done gate (2026-10-15 stale-anchor incident, extended 2026-10-20):
+  // the evicted segments are OLD history. When the anchor is already
+  // completed/revoked, a `next` list distilled from them usually describes
+  // the FINISHED task — merging it re-activates a completed task in the live
+  // Σ (the incident: the model resumed a committed/pushed task from a
+  // mid-turn re-presentation). The gate now distinguishes the two cases via
+  // ss.anchorDoneGateAction():
+  //   'strip'   — the incoming next re-derives the completed task's steps
+  //               (high overlap with the anchor_done_next baseline): omit
+  //               next from the patch so the merge PRESERVES the current
+  //               next instead of overwriting it (the 2026-10-15 behavior).
+  //   'release' — the incoming next is a genuinely NEW task (low overlap):
+  //               the completed/revoked anchor is stale (premature
+  //               completion-signal flip or a superseded task). Release it —
+  //               clear the sticky flags, wipe the finished task's view, and
+  //               let the new next merge — so the new task runs under a clean
+  //               anchor instead of a frozen "COMPLETED + old next" state
+  //               (the 2026-10-20 stale-anchor repetition: a sub-task
+  //               completion flipped the anchor while the task continued, and
+  //               strip-only semantics froze the stale next for 3h+).
   let beforeNext = [];
   let nextStripped = false;
+  let anchorReleased = false;
   const written = ss.mutateSigma(sessionId, (cur) => {
     beforeNext = Array.isArray(cur.next) ? cur.next.slice() : [];
+    const wasDone = cur.anchor_completed === true || cur.anchor_revoked === true;
     let p = patch;
-    const anchorDone = cur.anchor_completed === true || cur.anchor_revoked === true;
-    if (anchorDone && Object.prototype.hasOwnProperty.call(p, 'next')) {
+    const gate = ss.anchorDoneGateAction(cur, p);
+    if (gate.action === 'strip') {
       p = { ...p };
       delete p.next;
       nextStripped = true;
+    } else if (gate.action === 'release') {
+      cur.anchor_completed = false;
+      cur.anchor_revoked = false;
+      cur.anchor_reset_pending = false;
+      cur.anchor_done_next = [];
+      delete cur.confirmed;
+      delete cur.hypothesis;
+      delete cur.next;
+      delete cur.notes;
+      delete cur.task_summary;
+      delete cur.current_step;
+      delete cur.pending_checks;
+      p = { ...p };
+      delete p.anchor_completed;
+      delete p.anchor_revoked;
+      anchorReleased = true;
     }
     const next = ss.mergeSigma(cur, p);
     next.session_id = sessionId;
@@ -212,6 +243,17 @@ async function extractBatch(sessionId, batch) {
     // merges a patch that changes the hypothesis list (measurement-only
     // bookkeeping — no drift telemetry here: the segments are OLD history).
     ss.updateHypoStamps(next, Number(cur.turn_count) || 0);
+    // One-shot context-switch marker (2026-10-20 stale-anchor fix): evict
+    // extraction previously had NO reset-arming (only the turn-boundary
+    // worker did), so an anchor_completed set HERE never wiped the finished
+    // task's view — the stale next froze and re-injected every turn. Arm the
+    // marker and store the completed task's next as the baseline the gate
+    // above compares incoming next lists against.
+    const isDone = next.anchor_revoked === true || next.anchor_completed === true;
+    if (isDone && !wasDone) {
+      next.anchor_reset_pending = true;
+      next.anchor_done_next = Array.isArray(next.next) ? next.next.slice() : [];
+    }
     return next;
   });
   if (!written) return;
@@ -230,6 +272,7 @@ async function extractBatch(sessionId, batch) {
     next_before: beforeNext,
     next_after: afterNext,
     ...(nextStripped ? { next_stripped_anchor_done: true } : {}),
+    ...(anchorReleased ? { anchor_released_new_task: true } : {}),
     ...(beforeNext.length === 0 && afterNext.length > 0 ? { next_reactivated: true } : {}),
     // Large-evict wave marker (2026-10-17): a big eviction batch (163-class)
     // is the forensic signature of the stale-framing window — joins
