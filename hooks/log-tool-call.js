@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const { updateState, appendTelemetry, rotateJsonl, STATE_DIR } = require('./lib/state.js');
+const { stampActiveSession } = require('./lib/skillstate.js');
 
 function main() {
   const raw = fs.readFileSync(0, 'utf8');
@@ -17,6 +18,12 @@ function main() {
 
   const sessionId = event.session_id;
   if (!sessionId) returnAllow();
+
+  // Stamp this session as the freshest active caller so the sigma_note MCP
+  // tool (which carries no session of its own) can resolve its caller from the
+  // newest stamp under a TTL. Runs on every tool call, so the stamp is fresh
+  // when sigma_note fires. Fail-open: a stamp error must never block the tool.
+  stampActiveSession(sessionId, 'hook');
 
   const toolName = event.tool_name || 'unknown';
   const logFile = path.join(STATE_DIR, `${sessionId}.jsonl`);

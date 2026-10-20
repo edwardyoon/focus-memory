@@ -129,6 +129,121 @@ function mutateSigma(sessionId, mutate) {
   });
 }
 
+// ─── Model-owned session notes (verbatim work evidence) ─────────────────────
+// `notes` is a model-owned Σ key: the model writes it via the sigma_note MCP
+// tool, and the extraction LLM never touches it (mergeSigma drops any `notes`
+// in a patch — see KEY_RULES.model_only). It lives in the same Σ file as the
+// anchor, so it survives KV eviction like the anchor does, and is re-injected
+// verbatim by renderAnchor every turn (no re-derivation). Per-task: wiped on
+// the post-completion reset (anchor_reset_pending) like the other current-view
+// keys.
+const NOTE_KEY_RE = /^[a-z0-9._-]{1,64}$/;
+const NOTE_MAX_KEYS = 8;
+const NOTE_MAX_CHARS = 500;
+
+/**
+ * Upsert one model-owned note in the session's Σ (locked read-modify-write).
+ * @param {string} sessionId
+ * @param {string} key - lowercase a-z, 0-9, ".", "_", "-" (max 64)
+ * @param {string} text - verbatim note text (max 500 chars)
+ * @param {string} [mode='set'] - 'set' replaces, 'append' adds a line
+ * @returns {{ok: boolean, note?: {key: string, text: string}, error?: string}}
+ */
+function setSigmaNote(sessionId, key, text, mode = 'set') {
+  const k = String(key == null ? '' : key);
+  const t = String(text == null ? '' : text);
+  if (!NOTE_KEY_RE.test(k)) {
+    return { ok: false, error: 'Invalid key: use lowercase a-z, 0-9, ".", "_" or "-" (max 64 chars).' };
+  }
+  if (!t.trim()) return { ok: false, error: 'Note text is empty.' };
+  if (mode !== 'set' && mode !== 'append') return { ok: false, error: 'mode must be "set" or "append".' };
+  if (t.length > NOTE_MAX_CHARS) {
+    return { ok: false, error: `Note text is ${t.length} chars (max ${NOTE_MAX_CHARS}). Keep it to facts.` };
+  }
+  let result = null;
+  try {
+    mutateSigma(sessionId, (sigma) => {
+      const base = sigma && typeof sigma === 'object' ? sigma : {};
+      const cur = typeof base.notes === 'object' && base.notes !== null && !Array.isArray(base.notes) ? base.notes : {};
+      const notes = { ...cur };
+      const existing = typeof notes[k] === 'string' ? notes[k] : null;
+      if (mode === 'append' && existing) {
+        const combined = `${existing}\n${t}`;
+        if (combined.length > NOTE_MAX_CHARS) {
+          result = { ok: false, error: `Append would reach ${combined.length} chars (max ${NOTE_MAX_CHARS}). Use mode="set" to condense.` };
+          return null;
+        }
+        notes[k] = combined;
+      } else if (!existing && Object.keys(notes).length >= NOTE_MAX_KEYS) {
+        result = { ok: false, error: `Note limit reached (${NOTE_MAX_KEYS} keys). Update an existing key with mode="set".` };
+        return null;
+      } else {
+        notes[k] = t;
+      }
+      base.notes = notes;
+      result = { ok: true, note: { key: k, text: notes[k] } };
+      return base;
+    });
+  } catch (err) {
+    result = { ok: false, error: `note store error: ${err.message}` };
+  }
+  return result || { ok: false, error: 'note write skipped' };
+}
+
+// ─── Active-session registry (MCP tool → caller identity) ────────────────────
+// The sigma_note MCP tool carries no session of its own. The PreToolUse hook
+// (log-tool-call.js) stamps the freshest active session before each tool call;
+// the tool resolves its caller from the newest stamp under a 15-min TTL. Same
+// mechanism the spec'd-out notes.js used (commit 6e5db5e).
+const ACTIVE_SESSION_FILE = path.join(SIGMA_DIR, 'active-sessions.json');
+const ACTIVE_SESSION_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * Stamp a session as the freshest active caller (used by the PreToolUse hook).
+ * @param {string} sessionId
+ * @param {string} [source]
+ * @returns {void}
+ */
+function stampActiveSession(sessionId, source) {
+  if (!sessionId) return;
+  try {
+    withLock(ACTIVE_SESSION_FILE, () => {
+      let map = {};
+      try {
+        const cur = JSON.parse(fs.readFileSync(ACTIVE_SESSION_FILE, 'utf8'));
+        if (cur && typeof cur === 'object') map = cur;
+      } catch { /* first stamp */ }
+      map[sessionId] = { ts: Date.now(), source: source || 'hook' };
+      const cutoff = Date.now() - ACTIVE_SESSION_TTL_MS;
+      for (const k of Object.keys(map)) {
+        if (!map[k] || Number(map[k].ts) < cutoff) delete map[k];
+      }
+      atomicWrite(ACTIVE_SESSION_FILE, JSON.stringify(map));
+    });
+  } catch { /* fail-open */ }
+}
+
+/**
+ * Resolve the freshest active session (for the sigma_note MCP tool).
+ * @returns {{session_id: string, ts: number}|null}
+ */
+function resolveActiveSession() {
+  try {
+    const map = JSON.parse(fs.readFileSync(ACTIVE_SESSION_FILE, 'utf8'));
+    if (!map || typeof map !== 'object') return null;
+    const cutoff = Date.now() - ACTIVE_SESSION_TTL_MS;
+    let best = null;
+    for (const [sid, v] of Object.entries(map)) {
+      if (v && Number(v.ts) >= cutoff && (!best || Number(v.ts) > Number(best.ts))) {
+        best = { session_id: sid, ts: Number(v.ts) };
+      }
+    }
+    return best;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Bump Σ.compact_count (locked read-modify-write) with a 30s dedup window so a
  * single compaction firing both PostCompact and SessionStart counts once, while
@@ -310,6 +425,19 @@ function renderAnchor(sigma, opts = {}) {
   if (sigma.anchor_revoked === true) parts.push('original-task-anchor: REVOKED by user');
   if (sigma.anchor_completed === true) parts.push('original-task-anchor: COMPLETED');
 
+  // Model-owned verbatim notes (2026-10-20): re-injected exactly as the model
+  // wrote them (no re-derivation). They take precedence over the extracted
+  // sections below when they conflict — the model wrote them mid-task, so they
+  // are fresher than the one-turn-behind extraction.
+  if (sigma.notes && typeof sigma.notes === 'object' && !Array.isArray(sigma.notes)) {
+    const noteEntries = Object.entries(sigma.notes)
+      .filter(([, v]) => typeof v === 'string' && v.trim())
+      .slice(0, NOTE_MAX_KEYS);
+    if (noteEntries.length) {
+      parts.push(`notes (you wrote these, verbatim — take precedence over the sections below when they conflict): ${noteEntries.map(([k, v]) => `${k}: ${v}`).join(' | ')}`);
+    }
+  }
+
   // 2026-10-09 three-section schema: confirmed (verified, file:line) /
   // hypothesis (unverified) / next (outstanding steps). next first — it is
   // what the next turn acts on; confirmed second — the verified ground the
@@ -390,6 +518,11 @@ const KEY_RULES = {
   // supersede), so the first turn after the task ends does not run under a
   // stale anchor (incident a39ee3d9).
   anchor_completed: 'sticky_true',
+  // Model-owned verbatim work notes (2026-10-20): written ONLY by the model via
+  // the sigma_note MCP tool, never by the extraction LLM. mergeSigma drops any
+  // `notes` in a patch mechanically (code, not prompt) so the extractor can
+  // never overwrite or re-derive them. See setSigmaNote().
+  notes: 'model_only',
 };
 // Per-section item caps — keep Σ within the ~800-token injection budget.
 const SECTION_CAPS = { confirmed: 10, hypothesis: 5, next: 5, blocked: 3 };
@@ -404,6 +537,9 @@ const MAX_LIST_ITEMS = 50; // cap cumulative lists so Σ stays injection-sized
 function mergeSigma(current, patch) {
   const next = { ...current };
   for (const [key, value] of Object.entries(patch)) {
+    // Model-owned key (notes): the extraction LLM must never write or clear
+    // it. Drop the patch value mechanically — keep the model-written notes.
+    if (KEY_RULES[key] === 'model_only') continue;
     if (value === null || value === undefined) {
       delete next[key];
       continue;
@@ -1267,6 +1403,9 @@ module.exports = {
   loadSigma,
   saveSigma,
   mutateSigma,
+  setSigmaNote,
+  stampActiveSession,
+  resolveActiveSession,
   bumpCompactCount,
   sweepSigma,
   mergeSigma,

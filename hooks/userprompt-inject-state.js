@@ -237,6 +237,9 @@ function main() {
           delete cur.confirmed;
           delete cur.hypothesis;
           delete cur.next;
+          // Model-owned verbatim notes are the current task's too — wipe them
+          // with the view so the next task starts clean.
+          delete cur.notes;
           // Legacy flat keys (pre-2026-10-09 Σ files).
           delete cur.task_summary;
           delete cur.current_step;

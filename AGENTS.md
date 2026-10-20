@@ -140,6 +140,22 @@ Question received
 | `search_project_facts` | Search docs/plans | "What's in the schema?" | — |
 | `remember_decision` | Write a decision to memory | Task complete with tests passing | — |
 | `search_web` | Web search via local server | External knowledge needed | — |
+| `sigma_note` | Save a verbatim note into this session's Σ (survives compaction) | You need work evidence to survive context compaction exactly as written (a fix that worked, a verified file:line, a settled threshold) | — |
+
+### Sigma notes — when to write one
+
+`sigma_note` is your own scratchpad, **not** memory search. Write the note
+**at the moment you settle a hard-won finding and move on** — not later. The note
+must survive context compaction **exactly as written**:
+- a fix that actually worked (vs. the one you first tried),
+- a verified `file:line` you don't want to re-derive,
+- a threshold / config value you settled on after testing.
+
+Each note is re-injected verbatim on every turn (no re-derivation), takes
+precedence over the extracted Σ sections when they conflict, and is wiped on
+task completion. Keep notes to facts — max 500 chars, 8 keys. Don't use it for
+general knowledge (use `remember_decision`) or for anything you can re-read from
+the files.
 
 ## Stop Conditions (when to STOP searching)
 
