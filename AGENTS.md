@@ -26,7 +26,7 @@ Context on this server is finite. Old tool output and old reasoning leave the wi
 
 # Part A. Declarative Attention Tags (plain text, handled by the server)
 
-DA tags are NOT tool calls, function calls, or API invocations. The server reads them in your text and switches what you can see. The scaffold at the end of the user message explains the modes. This section only fixes the syntax.
+DA tags are NOT tool calls, read files, function calls, or API invocations. The server reads them in your text and switches what you can see. The scaffold at the end of the user message explains the modes. This section only fixes the syntax.
 
 ## Syntax (strict)
 1. Every tag goes on its own line, at the start of the line. A tag inside a sentence is treated as plain text and ignored.
