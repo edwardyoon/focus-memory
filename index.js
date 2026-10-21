@@ -967,8 +967,10 @@ server.registerTool(
 // are re-injected verbatim every turn — the extraction LLM never touches them
 // (mergeSigma drops `notes` in a patch). They survive KV eviction because they
 // live in the same Σ file as the anchor, and are wiped on task completion. The
-// tool resolves its caller session from the freshest active-session stamp
-// (stamped by the PreToolUse hook — see resolveActiveSession).
+// tool resolves its caller session from QWEN_CODE_SESSION_ID (qwen-code sets it
+// in the per-session MCP server's env — the exact caller identity), falling
+// back to the active-session stamp / Σ state-file mtime — see
+// resolveActiveSession.
 server.registerTool(
   "sigma_note",
   {
@@ -985,7 +987,7 @@ server.registerTool(
     const session = skillState.resolveActiveSession();
     if (!session) {
       return {
-        content: [{ type: "text", text: "No active session found (stale/absent active-session stamp). The note was not saved. Retry on the next tool call." }],
+        content: [{ type: "text", text: "No active session found (QWEN_CODE_SESSION_ID unset, no fresh active-session stamp or state-file signal within 15 min). The note was not saved." }],
         isError: true,
       };
     }
@@ -993,7 +995,7 @@ server.registerTool(
     if (!res.ok) {
       return { content: [{ type: "text", text: res.error }], isError: true };
     }
-    log(`[MCP sigma_note] session=${session.session_id.slice(0, 8)}, key="${key}", mode=${mode}, len=${res.note.text.length}`);
+    log(`[MCP sigma_note] session=${session.session_id.slice(0, 8)} (via ${session.source}), key="${key}", mode=${mode}, len=${res.note.text.length}`);
     return {
       content: [{ type: "text", text: `Note saved under "${key}" — it will be re-injected verbatim every turn and survives compaction. Current: ${res.note.text}` }],
     };

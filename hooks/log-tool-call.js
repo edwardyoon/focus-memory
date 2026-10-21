@@ -3,6 +3,9 @@
 // enforcement. search_memory stamps the satisfaction epoch (memoryCalledEpoch
 // = current turnEpoch) so the gate can distinguish "searched THIS turn" from
 // a stale stamp of an earlier turn.
+// Fires only for the tools in qwen-extension.json's PreToolUse matchers
+// (mcp__focus-memory__search_memory / remember_decision, edit, write_file) —
+// NOT every tool call.
 
 const fs = require('fs');
 const path = require('path');
@@ -19,10 +22,11 @@ function main() {
   const sessionId = event.session_id;
   if (!sessionId) returnAllow();
 
-  // Stamp this session as the freshest active caller so the sigma_note MCP
-  // tool (which carries no session of its own) can resolve its caller from the
-  // newest stamp under a TTL. Runs on every tool call, so the stamp is fresh
-  // when sigma_note fires. Fail-open: a stamp error must never block the tool.
+  // Stamp this session as the freshest active caller — a FALLBACK resolution
+  // channel for the sigma_note MCP tool: primary since 2026-10-21 is
+  // QWEN_CODE_SESSION_ID (qwen-code sets it in the per-session MCP server's
+  // env). The ACP/VS Code host never fires PreToolUse, so on that host this
+  // stamp never refreshes. Fail-open: a stamp error must never block the tool.
   stampActiveSession(sessionId, 'hook');
 
   const toolName = event.tool_name || 'unknown';

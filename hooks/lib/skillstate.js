@@ -191,12 +191,22 @@ function setSigmaNote(sessionId, key, text, mode = 'set') {
 }
 
 // ─── Active-session registry (MCP tool → caller identity) ────────────────────
-// The sigma_note MCP tool carries no session of its own. The PreToolUse hook
-// (log-tool-call.js) stamps the freshest active session before each tool call;
-// the tool resolves its caller from the newest stamp under a 15-min TTL. Same
-// mechanism the spec'd-out notes.js used (commit 6e5db5e).
+// The sigma_note MCP tool carries no session of its own. Resolution layers
+// (resolveActiveSession, 2026-10-21):
+//   1. QWEN_CODE_SESSION_ID — qwen-code sets this in the per-session MCP
+//      server's env (the MCP server is spawned per session), so inside the
+//      server it IS the caller: deterministic, no TTL, no cross-session race.
+//      Primary on every qwen-code host, including ACP/VS Code — the host that
+//      never fires PreToolUse and therefore leaves no layer-2 stamp at all.
+//   2. PreToolUse stamp (log-tool-call.js) under a 15-min TTL — the mechanism
+//      the spec'd-out notes.js used (commit 6e5db5e); fallback for hosts that
+//      don't set the env.
+//   3. Freshest per-session Σ state file mtime under the same TTL — last
+//      resort (UserPromptSubmit/Stop hooks write it every live turn). The TTL
+//      gate keeps a session switch from adopting the previous session's Σ.
 const ACTIVE_SESSION_FILE = path.join(SIGMA_DIR, 'active-sessions.json');
 const ACTIVE_SESSION_TTL_MS = 15 * 60 * 1000;
+const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Stamp a session as the freshest active caller (used by the PreToolUse hook).
@@ -224,18 +234,40 @@ function stampActiveSession(sessionId, source) {
 }
 
 /**
- * Resolve the freshest active session (for the sigma_note MCP tool).
- * @returns {{session_id: string, ts: number}|null}
+ * Resolve the calling session (for the sigma_note MCP tool).
+ * Primary: QWEN_CODE_SESSION_ID (qwen-code per-session MCP env — exact
+ * identity, no TTL). Fallbacks: newest PreToolUse stamp under the 15-min TTL,
+ * then the newest per-session Σ state file mtime under the same TTL.
+ * @returns {{session_id: string, ts: number, source: string}|null}
  */
 function resolveActiveSession() {
+  const envSid = (process.env.QWEN_CODE_SESSION_ID || '').trim();
+  if (SESSION_UUID_RE.test(envSid)) {
+    return { session_id: envSid, ts: Date.now(), source: 'env' };
+  }
+  const cutoff = Date.now() - ACTIVE_SESSION_TTL_MS;
   try {
     const map = JSON.parse(fs.readFileSync(ACTIVE_SESSION_FILE, 'utf8'));
-    if (!map || typeof map !== 'object') return null;
-    const cutoff = Date.now() - ACTIVE_SESSION_TTL_MS;
+    if (map && typeof map === 'object') {
+      let best = null;
+      for (const [sid, v] of Object.entries(map)) {
+        if (v && Number(v.ts) >= cutoff && (!best || Number(v.ts) > Number(best.ts))) {
+          best = { session_id: sid, ts: Number(v.ts), source: 'stamp' };
+        }
+      }
+      if (best) return best;
+    }
+  } catch { /* no stamp file */ }
+  try {
     let best = null;
-    for (const [sid, v] of Object.entries(map)) {
-      if (v && Number(v.ts) >= cutoff && (!best || Number(v.ts) > Number(best.ts))) {
-        best = { session_id: sid, ts: Number(v.ts) };
+    for (const f of fs.readdirSync(SIGMA_DIR)) {
+      if (f === 'active-sessions.json' || !f.endsWith('.json')) continue;
+      const sid = f.slice(0, -5);
+      if (!SESSION_UUID_RE.test(sid)) continue;
+      let st;
+      try { st = fs.statSync(path.join(SIGMA_DIR, f)); } catch { continue; }
+      if (st.mtimeMs >= cutoff && (!best || st.mtimeMs > best.ts)) {
+        best = { session_id: sid, ts: st.mtimeMs, source: 'state_file' };
       }
     }
     return best;
