@@ -36,6 +36,14 @@
 // Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, zero
 // behavior change). Fail-open: any error → silent exit 0, the turn proceeds
 // without the injection.
+//
+// FOCUSMEMORY_INJECT_PER_TURN=off (2026-10-23): kill-switch for the per-turn
+// Σ injection ONLY — the anchor/ctx block, offloaded ledger, verbatim
+// instruction, hook output and last_inject_hash record are skipped (one
+// `inject=skipped reason=flag` log line per prompt). The mechanical
+// UserPromptSubmit features (foreign scrub, completion-signal flip, B4 pin
+// release, anchor reset) keep running. Default on — unset or any other value
+// = current behavior.
 
 const fs = require('fs');
 const crypto = require('crypto');
@@ -257,12 +265,22 @@ function main() {
       }
     }
 
-    // Injection (2026-10-17): unconditional per-turn anchor injection. While
-    // Σ has content, the record is re-presented on every user prompt, so a
-    // KV hole / eviction can never strand the model without state — the
-    // 2026-10-09 "changed-or-evictions" gate left unchanged-Σ turns
-    // anchor-less, which is exactly when a KV break loses the thread.
-    if (hasContent(sigma)) {
+    // Per-turn injection kill-switch (2026-10-23): FOCUSMEMORY_INJECT_PER_TURN=off
+    // skips ONLY the Σ injection below — the anchor/ctx block, the offloaded
+    // ledger, the verbatim instruction, the hook output, and the
+    // last_inject_hash record. The mechanical UserPromptSubmit features
+    // above (foreign scrub, completion-signal flip, B4 pin release, anchor
+    // reset) keep running. Default on — unset or any other value injects as
+    // before.
+    const perTurnOn = ss.env('FOCUSMEMORY_INJECT_PER_TURN', 'on').toLowerCase() !== 'off';
+    if (!perTurnOn) {
+      console.error('[skillstate] inject=skipped reason=flag');
+    } else if (hasContent(sigma)) {
+      // Injection (2026-10-17): unconditional per-turn anchor injection.
+      // While Σ has content, the record is re-presented on every user
+      // prompt, so a KV hole / eviction can never strand the model without
+      // state — the 2026-10-09 "changed-or-evictions" gate left unchanged-Σ
+      // turns anchor-less, which is exactly when a KV break loses the thread.
       const tokens = Number(sigma.last_input_tokens) || 0;
       const hash = sigmaContentHash(sigma);
       const evictions = Number(sigma.kv_state && sigma.kv_state.evictions) || 0;

@@ -1002,6 +1002,54 @@ server.registerTool(
   },
 );
 
+// --- Tool 3a-bis: live recent-activity digest (recent_work) ---
+// Read-only, no arguments. The auto-injected recent_digest (eviction-PUT
+// snapshot) lags the current turn by design (scaffold cache stability);
+// this tool reads the transcript tail LIVE, so it is fresher — use it when
+// unsure what was just done or before re-reading a file. Session resolves
+// from QWEN_CODE_SESSION_ID ONLY (the exact caller identity — no stamp/mtime
+// fallback, so another session's transcript can never be read).
+server.registerTool(
+  "recent_work",
+  {
+    title: "Recent Work (Live Digest)",
+    description:
+      "Read-only, no arguments. Returns a rule-based digest of the most recent actions in this session's transcript: tool calls with targets, ok/error status, and short text snippets — tool-result bodies are excluded. Use it ONCE when you are unsure what you just did, or before re-reading a file you already examined. Prefer it over re-reading files or re-running finished checks.",
+    inputSchema: {},
+  },
+  async () => {
+    const sid = (process.env.QWEN_CODE_SESSION_ID || "").trim();
+    if (!sid) {
+      return {
+        content: [{ type: "text", text: "No session id (QWEN_CODE_SESSION_ID unset) — recent_work unavailable in this context." }],
+        isError: true,
+      };
+    }
+    let tp = "";
+    try {
+      tp = skillState.loadSigma(sid).transcript_path;
+    } catch {}
+    if (typeof tp !== "string" || !tp) {
+      return {
+        content: [{ type: "text", text: "No transcript path recorded for this session yet — the Stop hook records it at the end of each turn. Re-ground on the Σ anchor instead." }],
+        isError: true,
+      };
+    }
+    let digest = "";
+    try {
+      digest = skillState.digestTranscript(tp, { events: 24, maxChars: 2400 });
+    } catch {}
+    log(`[MCP recent_work] session=${sid.slice(0, 8)} chars=${digest.length}`);
+    if (!digest) {
+      return {
+        content: [{ type: "text", text: "Transcript digest is empty (no recent parseable entries in the tail)." }],
+        isError: true,
+      };
+    }
+    return { content: [{ type: "text", text: digest }] };
+  },
+);
+
 // --- Tool 3b: trace causal decision chain ---
 server.registerTool(
   "trace_decision_chain",
@@ -2202,6 +2250,24 @@ httpApp.put("/v1/kv-offload/chunk", async (c) => {
   const res = kvOffload.putChunk(sessionId, key, text, body.tokens, body.hint);
   if (!res.ok) return c.json({ error: res.reason || "put failed" }, 500);
   log(`[kv-offload] PUT session=${sessionId} key=${key} bytes=${res.bytes}`);
+  // recent_digest snapshot (2026-10-23): eviction means history is leaving
+  // the KV — refresh the mid-turn Σ auto-injection NOW, at this moment. A
+  // snapshot (not a live read) keeps the /session/sigma response stable
+  // across requests (scaffold cache stability); the recent_work MCP tool is
+  // the live-reading counterpart. Hook-internal Σ field — not in
+  // CONTENT_KEYS/SCHEMA_KEYS, so the extraction merge never touches it
+  // (same as kv_state / transcript_path).
+  try {
+    if (skillState.skillStateEnabled()) {
+      const tp = skillState.loadSigma(sessionId).transcript_path;
+      const digest = skillState.digestTranscript(typeof tp === "string" ? tp : "", { events: 24, maxChars: 1600 });
+      if (digest) {
+        skillState.mutateSigma(sessionId, (s) => {
+          s.recent_digest = { text: digest, ts: new Date().toISOString() };
+        });
+      }
+    }
+  } catch {}
   // Eviction-PUT trigger (2026-10-09): the segment just left the model's KV —
   // distill it into the session's Σ (mid-turn refresh). Fire-and-forget: the
   // response returns immediately; the worker runs in-process (evictextract.js).
@@ -2269,15 +2335,30 @@ httpApp.get("/v1/kv-offload/session/sigma", async (c) => {
   const sessionId = c.req.query("session_id") || "";
   if (!sessionId) return c.json({ error: "session_id required" }, 400);
   let anchor = "";
+  let digest = "";
   try {
     if (skillState.skillStateEnabled()) {
-      anchor = skillState.renderAnchor(skillState.loadSigma(sessionId));
+      const sigma = skillState.loadSigma(sessionId);
+      anchor = skillState.renderAnchor(sigma);
+      // recent_digest snapshot (refreshed at eviction PUT, 2026-10-23):
+      // appended AFTER the anchor in the same string — the engine treats it
+      // as one Σ block (da_sigma keep-set), and a digest-only response
+      // (empty anchor, no Σ yet) still injects the recent activity.
+      digest =
+        sigma.recent_digest && typeof sigma.recent_digest.text === "string"
+          ? sigma.recent_digest.text
+          : "";
     }
   } catch {}
+  const block = anchor
+    ? digest
+      ? `${anchor}\nrecent:\n${digest}`
+      : anchor
+    : digest;
   log(
-    `[kv-offload] SIGMA session=${sessionId} anchor_chars=${anchor.length}`
+    `[kv-offload] SIGMA session=${sessionId} anchor_chars=${anchor.length} digest_chars=${digest.length}`
   );
-  return c.json({ ok: true, session_id: sessionId, anchor });
+  return c.json({ ok: true, session_id: sessionId, anchor: block });
 });
 
 httpApp.delete("/v1/kv-offload/session", async (c) => {

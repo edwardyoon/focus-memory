@@ -41,6 +41,16 @@
 // Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, zero
 // behavior change). Fail-open: any error → silent exit 0; the session is
 // unaffected. Emits no hook output (non-interfering: does not block or steer).
+//
+// FOCUSMEMORY_STOP_EXTRACT=off (2026-10-23): kill-switch for the Stop hook's
+// LLM extraction ONLY. When a trigger fires, the detached worker is NOT
+// spawned and the trigger offsets are NOT consumed — so the trigger re-arms
+// when extraction is re-enabled (same consume-once-spawn invariant as the
+// 2026-10-09 re-arm fix; consuming here would freeze the trigger). The
+// per-turn bookkeeping (last_input_tokens, turn_count, kv_state,
+// last_turn_completion_signal) keeps running: the UserPromptSubmit anchor
+// threshold and the completion-signal flip depend on it. Default on — unset
+// or any other value = current behavior.
 
 const fs = require('fs');
 const path = require('path');
@@ -50,6 +60,10 @@ const { STATE_DIR } = require('./lib/state.js');
 
 // Growth (tokens) since the last extraction that triggers the fallback.
 const INTERVAL = Math.max(1000, parseInt(process.env.FOCUSMEMORY_SKILLSTATE_CHECKPOINT_INTERVAL || '50000', 10) || 50000);
+
+// Kill-switch for the Stop hook's LLM extraction (header note): when true,
+// a fired trigger neither spawns the worker nor consumes its offsets.
+const STOP_EXTRACT_OFF = (process.env.FOCUSMEMORY_STOP_EXTRACT || '').trim().toLowerCase() === 'off';
 
 /**
  * Current size of the session's tool-call JSONL (0 when absent).
@@ -187,6 +201,16 @@ async function main() {
     // hook-internal, like last_input_tokens (never merged from a patch).
     sigma.turn_count = (Number(sigma.turn_count) || 0) + 1;
 
+    // Transcript path bookkeeping (2026-10-23, recent_work MCP tool): the
+    // tool resolves its caller session from QWEN_CODE_SESSION_ID alone (no
+    // mtime fallback) and reads the transcript path from HERE — the hook is
+    // the only component that sees event.transcript_path reliably. Runs on
+    // every Stop like the other bookkeeping above (not gated by
+    // FOCUSMEMORY_STOP_EXTRACT; that gate only skips the worker spawn).
+    if (typeof event.transcript_path === 'string' && event.transcript_path) {
+      sigma.transcript_path = event.transcript_path;
+    }
+
     // Hook-internal KV bookkeeping (separate from the model-facing Σ schema —
     // not in SCHEMA_KEYS, so the extraction worker's merge never touches it).
     // A failed/absent fetch leaves the previous snapshot untouched (fail-open).
@@ -222,13 +246,14 @@ async function main() {
     // (prose-only task changes / cancellations).
     newUserMsg = ss.hasNewUserMessageSince(event.transcript_path, prevTranscriptBytes);
 
-    if (stateChanged || intervalHit || newUserMsg) {
+    if ((stateChanged || intervalHit || newUserMsg) && !STOP_EXTRACT_OFF) {
       // Consume the triggers before spawning (persist first) so a
       // re-entrant Stop cannot re-fire: growth is re-gated by
       // last_checkpoint_tokens, state change by the tool-log byte offset,
       // user messages by the transcript byte offset. The worker gets both
       // the prev and consumed values so it can hand the trigger back if it
-      // fails or is stale-skipped (re-arm).
+      // fails or is stale-skipped (re-arm). When STOP_EXTRACT_OFF the
+      // offsets are left untouched, so the trigger re-arms on re-enable.
       sigma.last_checkpoint_tokens = inputTokens;
       sigma.last_extraction_log_bytes = toolLogSize(sessionId);
       sigma.last_extraction_transcript_bytes = transcriptSize(event.transcript_path);
@@ -244,6 +269,24 @@ async function main() {
       session_id: sessionId,
       hook: 'stop-checkpoint-state',
       event: 'no_trigger',
+      input_tokens: inputTokens,
+    });
+    return;
+  }
+
+  if (STOP_EXTRACT_OFF) {
+    // A trigger fired but FOCUSMEMORY_STOP_EXTRACT=off: skip the spawn. The
+    // offsets were NOT consumed above, so the trigger re-arms when extraction
+    // is re-enabled (consuming here would freeze it — the 2026-10-09 bug).
+    // Bookkeeping (last_input_tokens, turn_count, kv_state, completion
+    // signal) already persisted in the locked RMW above.
+    ss.appendTelemetry({
+      ts: Date.now(),
+      session_id: sessionId,
+      hook: 'stop-checkpoint-state',
+      event: 'extract_skipped',
+      reason: 'flag',
+      trigger: stateChanged ? 'state-change' : intervalHit ? 'context-growth' : 'user-message',
       input_tokens: inputTokens,
     });
     return;

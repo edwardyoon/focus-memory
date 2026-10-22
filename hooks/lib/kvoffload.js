@@ -465,4 +465,5 @@ module.exports = {
   sweepKv,
   safeSessionStem,
   sanitizeRefillText,
+  stripInjectedBlocks,
 };

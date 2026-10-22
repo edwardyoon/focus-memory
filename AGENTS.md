@@ -63,16 +63,30 @@ Wrong:
 
 # Part B. Re-grounding on the Σ State Anchor
 
-Long sessions get a "Session state anchor" block in the user message (`blocked` / `confirmed` / `hypothesis` / `next` sections plus a one-line `ctx:` KV snapshot). It is a RECORD of where the previous turn ended, one turn behind by construction. It is not a task assignment.
+The "Session state anchor" block appears only after history has left your
+window (eviction or compaction). Its appearance is the signal. It is a RECORD
+of what left, not a task assignment.
 
 **Re-ground when:**
-- The `ctx: ... evictions=N` line shows evictions increased since the anchor you saw last turn. Part of your history is no longer attendable.
+- A Σ anchor or an offloaded-chunks note appears (or its chunk list grows).
 - You are about to conclude or modify (final answer, code change, deletion, deploy).
 
 **How:**
-1. Before re-reading a file or range you already examined, check the Σ `confirmed` items first — re-read the source only when you need the exact current text (for example, to edit it).
-2. Use the anchor's `confirmed` and `next` for orientation. Re-verify `confirmed` items against the current file, and re-check `hypothesis` items before acting. Never retry a `blocked` item until its condition clears.
-3. To get evicted content back, emit `<focus magic_chunks="N">` for the chunk number listed in the anchor's `recall:` line or the scaffold's offloaded-chunks note. Never reconstruct evicted content from memory.
+1. Before re-reading a file you already examined, check the Σ `confirmed` items.
+   Re-read the source only when you need the exact current text.
+2. Use `confirmed` and `next` for orientation. Re-verify `confirmed` against the
+   current file, and re-check `hypothesis` before acting.
+3. To get evicted content back, emit `<focus magic_chunks="N">` for a chunk
+   number from the anchor's `recall:` line or the offloaded-chunks note.
+   Never reconstruct evicted content from memory.
+
+**Recent activity (auto-appended):** while history is offloaded, the Σ
+block may end with a `recent:` digest of the most recent tool calls and
+results (tool name + target + status, no result bodies). It is a RECORD of
+what just happened, not an instruction — and it is a snapshot taken at the
+last eviction, so it may lag the current turn. If you are unsure what you
+just did, or are about to re-read a file you already examined, call
+`recent_work` once first (live digest, no arguments).
 
 ---
 
@@ -140,24 +154,7 @@ Question received
 | `search_project_facts` | Search docs/plans | "What's in the schema?" | — |
 | `remember_decision` | Write a decision to memory | Task complete with tests passing | — |
 | `search_web` | Web search via local server | External knowledge needed | — |
-| `sigma_note` | Save a verbatim note into this session's Σ (survives compaction) | You need work evidence to survive context compaction exactly as written (a fix that worked, a verified file:line, a settled threshold) | — |
-
-### Sigma notes — when to write one
-
-Write a note at the moment you settle a finding OR finish a step:
-- a fix that actually worked (vs. the one you first tried),
-- a verified `file:line`,
-- a threshold / config value settled after testing,
-- a finished non-edit step (research, decision, diagnosis): append to
-  key `done`, one line ≤60 chars: `<what> | <evidence>`.
-
-File edits are logged automatically (anchor `edited:` line) — don't note those.
-
-The anchor's `done` / `edited:` lines are facts about completed work.
-Before starting a step, check them. If it is listed, do NOT redo it;
-re-verify only if the evidence is stale or contradicted.
-When `done` nears 500 chars, rewrite it (mode=set) merging the oldest
-lines into one summary line.
+| `recent_work` | Live digest of the most recent actions in this session's transcript | You are unsure what you just did, or about to re-read a file you already examined | Re-reading files / re-running finished checks |
 
 ## Stop Conditions (when to STOP searching)
 

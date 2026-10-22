@@ -18,6 +18,10 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { withLock, atomicWrite, appendTelemetry, STATE_DIR } = require('./state.js');
+// stripInjectedBlocks (kvoffload.js): removes client-appended context blocks
+// (user-prompt-submit context, system-reminder) before digesting transcript
+// text, so injected blocks cannot roll back into the recent-work digest.
+const { stripInjectedBlocks } = require('./kvoffload.js');
 
 const HOME = process.env.HOME || process.env.USERPROFILE || '.';
 const SIGMA_DIR = path.join(HOME, '.qwen', 'tmp', 'focus-memory', 'state');
@@ -432,6 +436,149 @@ function hasNewUserMessageSince(transcriptPath, fromBytes = 0) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Rule-based digest of the recent transcript entries (recent_work MCP tool +
+ * mid-turn Σ auto-injection, 2026-10-23). NO LLM: inside long autonomous
+ * turns the model forgets its own recent actions (within-turn tool results
+ * are evicted first, Σ lags by a turn), so the RAW transcript tail is the
+ * freshest action record — compressed to tool name + target + status.
+ *
+ * Reads only the last 64KB of the transcript JSONL. The file is appended in
+ * real time during a turn (verified 2026-10-23: entries land with age ~0s
+ * mid-turn), so a mid-turn read sees the current turn's calls and results.
+ * The first tail line is discarded when the 64KB cut lands mid-line (it may
+ * be truncated JSON) and unparseable lines are skipped. `system` entries
+ * (per-event bookkeeping, no message parts) are ignored; user/assistant
+ * carry text parts, tool_result carries functionResponse parts.
+ *
+ * Line grammar (chronological, oldest→newest):
+ *   HH:MM <tool> <target>|<command first 80 chars>   (assistant tool call)
+ *   ok | error: <first 60 chars>                     (tool result — BODY NEVER:
+ *   [ai] <first 100 chars>                           including bodies is what
+ *   [user] <first 150 chars>                         would persist instructions
+ *   read <path> ×N                                   embedded in web/file
+ * Consecutive reads of the same file collapse to `read X ×N` (intermediate
+ * result lines dropped); over maxChars the OLDEST lines drop first.
+ * @param {string} transcriptPath - session transcript JSONL (event.transcript_path)
+ * @param {object} [opts]
+ * @param {number} [opts.events=24] - max transcript entries (tail window)
+ * @param {number} [opts.maxChars=1600] - digest char cap
+ * @returns {string} digest text; '' on any failure (fail-open)
+ */
+function digestTranscript(transcriptPath, opts = {}) {
+  const events = Math.max(1, Number(opts.events) || 24);
+  const maxChars = Math.max(200, Number(opts.maxChars) || 1600);
+  if (!transcriptPath) return '';
+  let tail;
+  try {
+    const size = fs.statSync(transcriptPath).size;
+    const cut = size > 64 * 1024;
+    const len = Math.min(size, 64 * 1024);
+    const fd = fs.openSync(transcriptPath, 'r');
+    try {
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, size - len);
+      tail = buf.toString('utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+    // First tail line may be cut mid-JSON at the byte boundary — discard it.
+    if (cut) {
+      const nl = tail.indexOf('\n');
+      if (nl >= 0) tail = tail.slice(nl + 1);
+    }
+  } catch {
+    return '';
+  }
+  const entries = [];
+  for (const line of tail.split('\n')) {
+    if (!line) continue;
+    try {
+      entries.push(JSON.parse(line));
+    } catch {
+      /* skip unparseable (a torn append) */
+    }
+  }
+  const hhmm = (ts) => (typeof ts === 'string' && ts.length >= 16 ? ts.slice(11, 16) : '');
+  const flat = (s) => String(s).replace(/\s+/g, ' ').trim();
+
+  // {text, baseText, kind: 'read'|'result'|'call'|'text', readPath, count}
+  const out = [];
+  for (const e of entries.slice(-events)) {
+    const parts = e.message && Array.isArray(e.message.parts) ? e.message.parts : [];
+    const t = hhmm(e.timestamp);
+    if (e.type === 'assistant') {
+      for (const p of parts) {
+        const fc = p.functionCall;
+        if (!fc || typeof fc.name !== 'string') continue;
+        const args = fc.args && typeof fc.args === 'object' ? fc.args : {};
+        const target =
+          typeof args.file_path === 'string' ? args.file_path
+          : typeof args.path === 'string' ? args.path
+          : '';
+        const cmd =
+          typeof args.command === 'string' ? args.command
+          : typeof args.query === 'string' ? args.query
+          : typeof args.pattern === 'string' ? args.pattern
+          : '';
+        if (fc.name === 'read_file' && target) {
+          // Collapse consecutive same-file reads (result line may sit in
+          // between) into `read X ×N`; intermediate results are dropped —
+          // only the final status survives.
+          let li = out.length - 1;
+          if (
+            li >= 1 && out[li].kind === 'result' &&
+            out[li - 1].kind === 'read' && out[li - 1].readPath === target
+          ) {
+            out.pop();
+            li -= 1;
+          }
+          if (li >= 0 && out[li].kind === 'read' && out[li].readPath === target) {
+            const rd = out[li];
+            rd.count = (rd.count || 1) + 1;
+            rd.text = `${rd.baseText} ×${rd.count}`;
+          } else {
+            out.push({
+              text: `${t} read ${target}`,
+              baseText: `${t} read ${target}`,
+              kind: 'read',
+              readPath: target,
+              count: 1,
+            });
+          }
+        } else {
+          const cmdPart = cmd ? `|${flat(cmd).slice(0, 80)}` : '';
+          out.push({
+            text: `${t} ${fc.name}${target ? ` ${target}` : ''}${cmdPart}`,
+            kind: 'call',
+          });
+        }
+      }
+      const text = flat(parts.map((p) => (typeof p.text === 'string' ? p.text : '')).join(' '));
+      if (text) out.push({ text: `[ai] ${flat(stripInjectedBlocks(text)).slice(0, 100)}`, kind: 'text' });
+    } else if (e.type === 'tool_result') {
+      for (const p of parts) {
+        const fr = p.functionResponse;
+        if (!fr || !fr.response) continue;
+        const err = fr.response.error;
+        // Result BODY is never included — status only. This is what blocks
+        // instructions embedded in web/file content from being persisted via
+        // the digest into the Σ auto-injection.
+        out.push({ text: err ? `error: ${flat(err).slice(0, 60)}` : 'ok', kind: 'result' });
+      }
+    } else if (e.type === 'user') {
+      const text = flat(parts.map((p) => (typeof p.text === 'string' ? p.text : '')).join(' '));
+      if (text) out.push({ text: `[user] ${flat(stripInjectedBlocks(text)).slice(0, 150)}`, kind: 'text' });
+    }
+    // 'system' entries: bookkeeping only (no message parts) — ignored.
+  }
+  let lines = out.map((o) => o.text);
+  while (lines.length > 1 && lines.join('\n').length > maxChars) {
+    lines.shift(); // over budget → drop the OLDEST lines first
+  }
+  return lines.join('\n').slice(0, maxChars);
 }
 
 /**
@@ -1530,6 +1677,7 @@ module.exports = {
   SCHEMA_KEYS,
   hasMutatingCallsSince,
   hasNewUserMessageSince,
+  digestTranscript,
   renderAnchor,
   checkpointId,
   extractTranscriptTail,
