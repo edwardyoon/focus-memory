@@ -253,7 +253,7 @@ Its full output is appended to: ${logPath} (see the last "bash ${scriptPath}" se
 Diagnose the failing tests and fix the workspace code. Then re-run the script
 yourself and confirm it exits 0. Do NOT modify the verification script itself
 unless a test is objectively wrong — if you do, explain why.`;
-  const fix = await runProcess(QWEN_BIN, ["-p", fixPrompt], logPath, WORKSPACE, env);
+  const fix = await runProcess(QWEN_BIN, ["-p", "--yolo", fixPrompt], logPath, WORKSPACE, env);
   log(`Post-run verification: fix round exited with code ${fix.code} — re-running script to verify...`);
   const re = await runProcess("bash", [scriptPath], logPath, WORKSPACE);
   const durationSec = Math.round((Date.now() - startedAt) / 1000);
@@ -301,9 +301,11 @@ When you are done, call the finish_task MCP tool EXACTLY ONCE:
 This is the ONLY way the task is marked done. If you exit without calling
 finish_task, the runner will mark the task failed.`;
 
+  // Headless `-p` mode excludes approval-gated tools (shell/edit/write) unless
+  // approval is yolo; the runner is unattended, so always pass --yolo.
   const { code, timedOut } = await runProcess(
     QWEN_BIN,
-    ["-p", prompt],
+    ["-p", "--yolo", prompt],
     logPath,
     WORKSPACE,
     buildQwenEnv(),
