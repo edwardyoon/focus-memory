@@ -1,26 +1,41 @@
 #!/usr/bin/env node
 /**
- * todoRunner.js — Scheduled TODO execution runner (PM2-managed).
+ * todoRunner.js — Scheduled TODO execution runner (PM2-managed, DB queue mode).
  *
- * Runs daily in the early morning (default 06:00, configurable via
- * TODO_RUN_TIME in FocusMemory/.env) for backlog management. The TODO file
- * (todos/{date}.md) holds the next day's work plan — organized in the
- * previous evening — plus any carry-over items. The early-morning run
- * executes it while the user is away, so results are ready for review when
- * the work day starts.
- * 1. Target selection: today's TODO file; if it has no pending items (or is
- *    missing), scans the last CATCHUP_LOOKBACK_DAYS for the most recent file
- *    with leftovers, so a failed run is never orphaned by a date rollover.
- * 2. Spawns `qwen` with default instructions + execution prompt, logs output.
- * 3. Final verification: re-reads the file, counts remaining pending item
- *    headers, logs them, and records the outcome (exit code, duration,
- *    pending before/after, error line) in todo_runner_state.json.
- * 4. Triggers FocusMemory auto-ingest on completion.
- * 5. Optional post-run verification: when POSTRUN_TEST_SCRIPT is set in
- *    FocusMemory/.env, the script runs ONCE at the very end of a fully
- *    completed run (all items [x] + clean qwen exit) — never per item.
- *    On a non-zero exit, one qwen fix round is delegated, then the script
- *    is re-run as the independent arbiter. Unset = disabled (no-op).
+ * Runs daily (default 02:00, configurable via TODO_RUN_TIME in FocusMemory/.env).
+ * The queue is the udanax.todo_tasks table (120 master write / 121 slave read,
+ * lib/taskdb.js) — tasks are registered by the admin panel (taskReceiver),
+ * the put_task MCP tool, or manual INSERT.
+ *
+ * Nightly cycle:
+ * 1. fetchPendingTasks() — status='pending' AND scheduled_date <= CURDATE()
+ *    (catch-up built in), capped at TODO_NIGHT_LIMIT (default 10).
+ * 2. Per task (sequential):
+ *    a. markRunning(id) — optimistic lock (pending→running); skip if lost the race.
+ *    b. Spawn qwen with the task content + git/PR protocol + finish_task protocol.
+ *    c. Post-run verification: re-read the task from the MASTER. If it is still
+ *       'running' (the agent never called finish_task), force 'failed' with a
+ *       reason: exit≠0 → "qwen exit <code>: <log tail>"; exit=0 →
+ *       "no completion record"; timeout → "timeout (<min> min)" + 20-line log tail.
+ *       The runner NEVER marks 'done' — only the agent's finish_task can.
+ * 3. Optional post-run verification script (POSTRUN_TEST_SCRIPT) — runs ONCE,
+ *    only when EVERY task in the batch ended 'done'.
+ * 4. Optional FocusMemory auto-ingest (AUTO_INGEST, default on; set off on 123
+ *    where the shared index is maintained by the local Mac).
+ *
+ * Flags:
+ *   --dry-run  list pending tasks (DB query only — no qwen, no state write)
+ *   --now      run one cycle immediately, then continue the schedule
+ *
+ * Env (FocusMemory/.env):
+ *   TASK_DB_HOST / TASK_DB_SLAVE_HOST / TASK_DB_USER / TASK_DB_PASS / TASK_DB_NAME
+ *   TODO_RUN_TIME     24h HH:MM (default 02:00)
+ *   TODO_NIGHT_LIMIT  max tasks per night (default 10)
+ *   TASK_TIMEOUT_MIN  per-task qwen timeout in minutes (default 120)
+ *   AUTO_INGEST       on|off — run autoIngest.js after the batch (default on)
+ *   QWEN_BIN          qwen CLI path (default /opt/homebrew/bin/qwen;
+ *                     123: /home/edwardyoon/.local/bin/qwen)
+ *   POSTRUN_TEST_SCRIPT  optional verification script (see .env.example)
  */
 
 import { spawn } from "child_process";
@@ -28,30 +43,52 @@ import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import * as taskdb from "./lib/taskdb.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Load FocusMemory/.env (existing process env wins over file values).
 dotenv.config({ path: path.join(__dirname, ".env") });
+
 const WORKSPACE = path.resolve(__dirname, "..");
-const TODOS_DIR = path.join(WORKSPACE, "todos");
 const LOG_DIR = "/tmp/focus-memory";
-const QWEN_BIN = "/opt/homebrew/bin/qwen";
 const FOCUSMEMORY_DIR = __dirname;
-const CATCHUP_LOOKBACK_DAYS = 3; // scan this many past days for leftover items
 const STATE_FILE = path.join(FOCUSMEMORY_DIR, "todo_runner_state.json");
 
-// ─── Default instructions (injected into every execution prompt) ───
+const QWEN_BIN = process.env.QWEN_BIN || "/opt/homebrew/bin/qwen";
+const NIGHT_LIMIT = Math.max(1, parseInt(process.env.TODO_NIGHT_LIMIT || "10", 10));
+const TASK_TIMEOUT_MIN = Math.max(5, parseInt(process.env.TASK_TIMEOUT_MIN || "120", 10));
+const AUTO_INGEST = (process.env.AUTO_INGEST || "on").toLowerCase() !== "off";
 
-const DEFAULT_INSTRUCTIONS = `CRITICAL INSTRUCTIONS:
-- Do NOT commit, push, or deploy. All changes will be reviewed by the user later the same day.
-- Process items sequentially, one at a time. Do NOT use parallel sub-agents.
-- Progress tracking: Handle ONE item at a time. On start, update its \`##\` header checkbox \`[ ]\` → \`[~]\` (in progress). On completion, update to \`[x]\` and add a 1-2 line result summary below the item. If interrupted or partially done, mark \`[!]\` with "last completed step / remaining steps" so the next run can resume exactly where it left off. For large items, update internal checkboxes (Steps) at each stage.
-- Workspace: /opt/homebrew/var/www
-- This file is a TODO record. Execute items in order from top to bottom.
-- Verification: DDL/data changes ONLY to local DB (127.0.0.1). All functional verification in local environment (127.0.0.1:3000 + headless). Production DB/server is READ-ONLY (zero access).`;
+// ─── Instructions (injected into every execution prompt) ───
 
-// ─── Helpers ──────────────────────────────────────────────────────
+/**
+ * Build the standing instructions for the nightly qwen agent — workspace
+ * location, the git/PR protocol (runner branch from origin/main, PR via gh),
+ * production-safety and DB read/write rules, and the finish_task mandate.
+ * @returns {string} instruction block
+ */
+function buildInstructions() {
+  const masterHost = process.env.TASK_DB_HOST || "192.168.219.120";
+  const slaveHost = process.env.TASK_DB_SLAVE_HOST || masterHost;
+  return `CRITICAL INSTRUCTIONS (nightly autonomous run):
+- Workspace: ${WORKSPACE} — one git repository per project directory.
+- You are executing ONE task from the todo_tasks queue (the task id is in the prompt below).
+- Git/PR protocol (MANDATORY for any code change):
+  1. In each repository you modify: git fetch origin, then branch from origin/main:
+     git checkout -b runner/<YYYYMMDD> origin/main   (YYYYMMDD = today)
+  2. Commit per logical change with clear messages. NEVER commit to or push main/master.
+  3. When the work is done: git push -u origin runner/<YYYYMMDD>, then create a PR
+     with the gh CLI: gh pr create (Korean title/body is fine).
+- Production safety: do NOT restart or modify services on the 120-124 servers
+  (Apache, pm2, docker). Code changes go out via PR only.
+- Database: writes to the master (${masterHost}) only; the slave (${slaveHost}) is READ-ONLY.
+- Completion: when the task is finished AND verified, you MUST call the finish_task
+  MCP tool EXACTLY ONCE (see the completion protocol below). If you cannot finish,
+  still call finish_task with status="failed" before exiting — never exit silently.`;
+}
+
+// ─── Helpers ──────────────────────────────────────────────
 
 function log(message) {
   const line = `[${new Date().toISOString()}] ${message}`;
@@ -76,52 +113,18 @@ function dateStr(daysAgo = 0) {
 }
 
 /**
- * Top-level item headers that are not completed: "## [ ]", "## [~]", "## [!]".
- * Inner step checkboxes are ignored — the item header is the contract.
- * @param {string} content
- * @returns {string[]} matching header lines
- */
-function listPendingHeaders(content) {
-  return content.match(/^## \[(?: |~|!)\].*$/gm) || [];
-}
-
-/**
- * Pick the TODO file to process: today's file if it has pending items,
- * otherwise the most recent past file within CATCHUP_LOOKBACK_DAYS with
- * leftovers (a failed run must not be orphaned by a date rollover).
- * @returns {{file: string, date: string, isCatchup: boolean} | null}
- */
-function findTargetFile() {
-  for (let i = 0; i <= CATCHUP_LOOKBACK_DAYS; i++) {
-    const date = dateStr(i);
-    const file = path.join(TODOS_DIR, `${date}.md`);
-    if (!fs.existsSync(file)) continue;
-    const pending = listPendingHeaders(fs.readFileSync(file, "utf-8"));
-    if (pending.length > 0) {
-      return { file, date, isCatchup: i > 0 };
-    }
-  }
-  return null;
-}
-
-/**
- * Pull the most relevant error line from a run log.
+ * Last N non-empty lines of a log file (for the failed-fallback error text).
  * @param {string} logPath
- * @returns {string} error line, or "" if none found
+ * @param {number} [n=20]
+ * @returns {string} tail text, or "" if the log is missing
  */
-function extractError(logPath) {
+function logTail(logPath, n = 20) {
   try {
-    const log = fs.readFileSync(logPath, "utf-8");
-    const apiErrors = log.match(/\[?API Error:[^\n]*/g);
-    if (apiErrors && apiErrors.length > 0) {
-      return apiErrors[apiErrors.length - 1].trim();
-    }
-    const spawnErr = log.match(/=== spawn error: [^\n]*/);
-    if (spawnErr) return spawnErr[0].trim();
+    const lines = fs.readFileSync(logPath, "utf-8").split("\n").filter((l) => l.trim());
+    return lines.slice(-n).join("\n");
   } catch {
-    // log file missing — no extractable error
+    return "";
   }
-  return "";
 }
 
 /**
@@ -136,32 +139,43 @@ function saveState(record) {
   } catch {
     // first run — start fresh
   }
-  state.consecutiveFailures =
-    record.exitCode !== 0 ? (state.consecutiveFailures || 0) + 1 : 0;
+  const bad = (record.failed || 0) + (record.error ? 1 : 0);
+  state.consecutiveFailures = bad > 0 ? (state.consecutiveFailures || 0) + 1 : 0;
   state.lastRun = record;
   state.history = [...(state.history || []), record].slice(-30);
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
 /**
- * Spawn a child process and wait for it to finish.
+ * Spawn a child process, tee stdout+stderr into a log file, wait for exit.
  * @param {string} cmd
  * @param {string[]} args
  * @param {string} logPath
  * @param {string} [cwd]
  * @param {object} [env]
- * @returns {Promise<number>} exit code
+ * @param {number} [timeoutMs] 0 = no timeout; otherwise SIGKILL at the deadline
+ * @returns {Promise<{code: number, timedOut: boolean}>} exit code + timeout flag
  */
-function runProcess(cmd, args, logPath, cwd, env) {
+function runProcess(cmd, args, logPath, cwd, env, timeoutMs = 0) {
   return new Promise((resolve) => {
     const logStream = fs.createWriteStream(logPath, { flags: "a" });
     logStream.write(`\n=== ${cmd} ${args.join(" ")} ===\n`);
 
+    let timedOut = false;
     const child = spawn(cmd, args, {
       cwd: cwd || WORKSPACE,
       env: env || process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            logStream.write(`\n=== timeout after ${Math.round(timeoutMs / 60000)} min — SIGKILL ===\n`);
+            child.kill("SIGKILL");
+          }, timeoutMs)
+        : null;
 
     child.stdout.on("data", (chunk) => {
       logStream.write(chunk);
@@ -170,24 +184,42 @@ function runProcess(cmd, args, logPath, cwd, env) {
       logStream.write(chunk);
     });
     child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
       logStream.end(`\n=== exit code: ${code} ===\n`);
-      resolve(code ?? 1);
+      resolve({ code: code ?? 1, timedOut });
     });
     child.on("error", (err) => {
+      if (timer) clearTimeout(timer);
       logStream.write(`\n=== spawn error: ${err.message} ===\n`);
       logStream.end();
-      resolve(1);
+      resolve({ code: 1, timedOut });
     });
   });
 }
 
 /**
+ * Build the env for qwen: explicit PATH (~/.local/bin + /opt/homebrew/bin)
+ * and the qwen project dir derived from the workspace path.
+ * @returns {object} env object
+ */
+function buildQwenEnv() {
+  const home = process.env.HOME || "";
+  const extraPath = [path.join(home, ".local", "bin"), "/opt/homebrew/bin", process.env.PATH || "/usr/bin:/bin"]
+    .filter(Boolean)
+    .join(":");
+  return {
+    ...process.env,
+    PATH: extraPath,
+    QWEN_CODE_PROJECT_DIR: path.join(home, ".qwen", "projects", WORKSPACE.replace(/\//g, "-")),
+  };
+}
+
+/**
  * Run the optional post-run verification script (POSTRUN_TEST_SCRIPT in
  * FocusMemory/.env, absolute or workspace-relative). Invoked exactly once
- * per runTodo cycle — never per item — and only after ALL items completed
- * with a clean qwen exit. On failure, one fix round is delegated to qwen
- * (with the failure log), then the script is re-run as the independent
- * arbiter. No retry loop beyond that single fix round.
+ * per runTodo cycle — never per task — and only after ALL tasks ended done.
+ * On failure, one fix round is delegated to qwen (with the failure log),
+ * then the script is re-run as the independent arbiter.
  * @param {string} logPath
  * @param {object} env qwen spawn env (PATH/QWEN_CODE_PROJECT_DIR)
  * @returns {Promise<object|null>} result record, or null when not configured
@@ -203,163 +235,186 @@ async function runPostRunTest(logPath, env) {
 
   const startedAt = Date.now();
   log("Post-run verification: running script...");
-  const firstCode = await runProcess("bash", [scriptPath], logPath, WORKSPACE);
+  const first = await runProcess("bash", [scriptPath], logPath, WORKSPACE);
 
-  if (firstCode === 0) {
+  if (first.code === 0) {
     const durationSec = Math.round((Date.now() - startedAt) / 1000);
     log(`Post-run verification: PASSED (${durationSec}s)`);
     return { configured: true, ran: true, passed: true, fixed: false, exitCode: 0, durationSec };
   }
 
-  log(`Post-run verification: FAILED (exit ${firstCode}) — delegating one fix round to qwen...`);
-  const fixPrompt = `${DEFAULT_INSTRUCTIONS}
+  log(`Post-run verification: FAILED (exit ${first.code}) — delegating one fix round to qwen...`);
+  const fixPrompt = `${buildInstructions()}
 
-The post-run verification script failed after the TODO run completed.
+The post-run verification script failed after the TODO batch completed.
 Script: ${scriptPath}
 Its full output is appended to: ${logPath} (see the last "bash ${scriptPath}" section).
 
-Diagnose the failing tests and fix the workspace code (local environment only, 127.0.0.1).
-Then re-run the script yourself and confirm it exits 0.
-Do NOT modify the verification script itself unless a test is objectively wrong — if you do, explain why.`;
-  const fixCode = await runProcess(QWEN_BIN, ["-p", fixPrompt], logPath, WORKSPACE, env);
-  log(`Post-run verification: fix round exited with code ${fixCode} — re-running script to verify...`);
-  const reCode = await runProcess("bash", [scriptPath], logPath, WORKSPACE);
+Diagnose the failing tests and fix the workspace code. Then re-run the script
+yourself and confirm it exits 0. Do NOT modify the verification script itself
+unless a test is objectively wrong — if you do, explain why.`;
+  const fix = await runProcess(QWEN_BIN, ["-p", fixPrompt], logPath, WORKSPACE, env);
+  log(`Post-run verification: fix round exited with code ${fix.code} — re-running script to verify...`);
+  const re = await runProcess("bash", [scriptPath], logPath, WORKSPACE);
   const durationSec = Math.round((Date.now() - startedAt) / 1000);
 
-  if (reCode === 0) {
+  if (re.code === 0) {
     log(`Post-run verification: PASSED after fix round (${durationSec}s)`);
     return { configured: true, ran: true, passed: true, fixed: true, exitCode: 0, durationSec };
   }
-  log(`Post-run verification: still FAILED after fix round (exit ${reCode}) — leaving for user review.`);
-  return { configured: true, ran: true, passed: false, fixed: true, exitCode: reCode, durationSec };
+  log(`Post-run verification: still FAILED after fix round (exit ${re.code}) — leaving for user review.`);
+  return { configured: true, ran: true, passed: false, fixed: true, exitCode: re.code, durationSec };
 }
 
 // ─── Main execution ───────────────────────────────────────────────
 
 /**
- * Execute the TODO run: pick target file, spawn qwen, auto-ingest,
- * then verify completion and record the outcome.
- * @param {string} [trigger="schedule"] "schedule" | "manual"
- * @returns {Promise<void>}
+ * Execute one queued task: optimistic lock → qwen → master verification →
+ * failed fallback (the runner never marks done).
+ * @param {object} task row from fetchPendingTasks (id, title, content, source, scheduled_date)
+ * @param {string} today YYYY-MM-DD (log file naming)
+ * @returns {Promise<object>} result record
  */
-async function runTodo(trigger = "schedule") {
-  const target = findTargetFile();
-  const logPath = target ? path.join(LOG_DIR, `todo-${target.date}.log`) : null;
-
-  ensureLogDir();
-
-  if (!target) {
-    log(`No pending items in today's file or the last ${CATCHUP_LOOKBACK_DAYS} days. Nothing to do.`);
-    return;
-  }
-
-  const { file: todoFile, date, isCatchup } = target;
+async function runTask(task, today) {
+  const logPath = path.join(LOG_DIR, `${today}-task-${task.id}.log`);
   const startedAt = Date.now();
 
-  log(
-    `--- Todo runner triggered for ${date} ` +
-      `(${isCatchup ? "CATCH-UP from earlier file" : "daily"}, trigger: ${trigger}) ---`
-  );
-
-  const pendingBefore = listPendingHeaders(fs.readFileSync(todoFile, "utf-8"));
-
-  const prompt = `${DEFAULT_INSTRUCTIONS}
-
-Read the TODO file: ${todoFile}${
-    isCatchup
-      ? ` (carry-over from ${date} — resume exactly where it left off)`
-      : " (today's TODO file)"
+  const locked = await taskdb.markRunning(task.id);
+  if (!locked) {
+    log(`task ${task.id}: lost the pending→running race — skipped`);
+    return { id: task.id, title: task.title, status: "skipped", exitCode: null, timedOut: false, durationSec: 0, error: "lost lock" };
   }
-Execute the pending items (marked [ ], [~] or [!]) from top to bottom, one at a time.
-After each item, update its checkbox and record a 1-2 line summary in the file.`;
 
-  // Build env for qwen: ensure PATH and project dir are explicit
-  const qwenEnv = {
-    ...process.env,
-    PATH: `/opt/homebrew/bin:${path.join(process.env.HOME, ".local", "bin")}:${process.env.PATH || "/usr/bin:/bin"}`.split(":").filter(Boolean).join(":"),
-    QWEN_CODE_PROJECT_DIR: path.join(process.env.HOME, ".qwen", "projects", "-opt-homebrew-var-www"),
-  };
+  log(`task ${task.id}: running — "${task.title}"`);
 
-  log(`Spawning qwen execution...`);
-  const code = await runProcess(
+  const prompt = `${buildInstructions()}
+
+## Task (id=${task.id}, source=${task.source}, scheduled ${task.scheduled_date})
+Title: ${task.title}
+
+${task.content}
+
+## Completion protocol (MANDATORY)
+When you are done, call the finish_task MCP tool EXACTLY ONCE:
+- success: finish_task(task_id=${task.id}, status="done", result_summary="<PR URL(s), commit hash(es), verification result>")
+- failure: finish_task(task_id=${task.id}, status="failed", error="<what failed — prefix 'BLOCKED: ' if you are stuck>")
+This is the ONLY way the task is marked done. If you exit without calling
+finish_task, the runner will mark the task failed.`;
+
+  const { code, timedOut } = await runProcess(
     QWEN_BIN,
     ["-p", prompt],
     logPath,
     WORKSPACE,
-    qwenEnv,
+    buildQwenEnv(),
+    TASK_TIMEOUT_MIN * 60000,
   );
-  log(`qwen exited with code ${code}`);
+  log(`task ${task.id}: qwen exited with code ${code}${timedOut ? " (TIMEOUT)" : ""}`);
 
-  // Trigger auto-ingest to update FocusMemory index
-  log("Triggering auto-ingest...");
-  const ingestCode = await runProcess(
-    "node",
-    ["autoIngest.js"],
-    logPath,
-    FOCUSMEMORY_DIR,
-  );
-  log(`auto-ingest exited with code ${ingestCode}`);
-
-  // ── Final verification: did the run actually finish the work? ──
-  let pendingAfter = null;
+  // Post-run verification — MASTER read (fresh, no replication lag).
+  let final = null;
   try {
-    pendingAfter = listPendingHeaders(fs.readFileSync(todoFile, "utf-8"));
-  } catch {
-    log("Final check: TODO file missing after run — cannot verify.");
+    final = await taskdb.getTask(task.id);
+  } catch (err) {
+    log(`task ${task.id}: post-run DB read failed: ${err.message}`);
   }
 
-  const durationSec = Math.round((Date.now() - startedAt) / 1000);
-  const error = code !== 0 ? extractError(logPath) : "";
-
-  if (pendingAfter !== null) {
-    if (pendingAfter.length === 0) {
-      log(
-        `Final check: ALL items completed ` +
-          `(was ${pendingBefore.length} pending, ${durationSec}s)`
-      );
-    } else {
-      log(
-        `Final check: ${pendingBefore.length} → ${pendingAfter.length} pending ` +
-          `(${durationSec}s). Remaining:`
-      );
-      for (const header of pendingAfter) {
-        log(`  ${header.trim()}`);
-      }
+  if (final && final.status === "running") {
+    // The agent never called finish_task — force failed (runner never marks done).
+    const reason = timedOut
+      ? `timeout (${TASK_TIMEOUT_MIN} min)\n--- log tail ---\n${logTail(logPath, 20)}`
+      : code !== 0
+        ? `qwen exit ${code}${logTail(logPath, 10) ? `:\n${logTail(logPath, 10)}` : ""}`
+        : "no completion record (agent exited 0 without calling finish_task)";
+    try {
+      await taskdb.updateResult(task.id, { status: "failed", error: reason });
+      final = { ...final, status: "failed", error: reason };
+      log(`task ${task.id}: marked failed — ${reason.split("\n")[0]}`);
+    } catch (err) {
+      log(`task ${task.id}: failed to record fallback error: ${err.message}`);
     }
   }
-  if (code !== 0) {
-    log(
-      `ERROR: qwen failed (exit ${code})${error ? ` — ${error}` : ""}. ` +
-        `Leftover items will be picked up by the next run.`
-    );
+
+  return {
+    id: task.id,
+    title: task.title,
+    status: final ? final.status : "unknown",
+    exitCode: code,
+    timedOut,
+    durationSec: Math.round((Date.now() - startedAt) / 1000),
+    error: final && final.error ? final.error : null,
+    result: final && final.result_summary ? final.result_summary : null,
+  };
+}
+
+/**
+ * Execute the nightly batch: fetch pending → run each task sequentially →
+ * post-run verification (all-done only) → auto-ingest → record outcome.
+ * @param {string} [trigger="schedule"] "schedule" | "manual"
+ * @returns {Promise<void>}
+ */
+async function runTodo(trigger = "schedule") {
+  ensureLogDir();
+  const today = dateStr(0);
+
+  let tasks = [];
+  try {
+    tasks = await taskdb.fetchPendingTasks({ limit: NIGHT_LIMIT });
+  } catch (err) {
+    log(`ERROR: failed to fetch pending tasks: ${err.message}`);
+    saveState({ at: new Date().toISOString(), trigger, date: today, total: 0, done: 0, failed: 0, error: `fetch failed: ${err.message}`, tasks: [] });
+    return;
   }
 
-  // ── Post-run verification (optional): ONCE, only after a fully completed run ──
+  if (tasks.length === 0) {
+    log(`No pending tasks (scheduled_date <= ${today}). Nothing to do.`);
+    return;
+  }
+
+  log(`--- Todo runner: ${tasks.length} task(s) (trigger: ${trigger}) ---`);
+  const qwenEnv = buildQwenEnv();
+  const records = [];
+  for (const task of tasks) {
+    try {
+      records.push(await runTask(task, today));
+    } catch (err) {
+      log(`task ${task.id}: unexpected error: ${err.message}`);
+      records.push({ id: task.id, title: task.title, status: "error", exitCode: null, timedOut: false, durationSec: 0, error: err.message });
+    }
+  }
+
+  const done = records.filter((r) => r.status === "done").length;
+  const failed = records.filter((r) => r.status === "failed").length;
+  log(`--- Batch complete: ${done} done, ${failed} failed, ${records.length - done - failed} other ---`);
+
+  // Post-run verification script — ONCE, only when EVERY task ended done.
   let postRun = null;
-  if (code === 0 && pendingAfter !== null && pendingAfter.length === 0) {
-    postRun = await runPostRunTest(logPath, qwenEnv);
+  if (records.length > 0 && done === records.length) {
+    postRun = await runPostRunTest(path.join(LOG_DIR, `${today}-postrun.log`), qwenEnv);
+  }
+
+  // Auto-ingest (shared vector index — off on 123, maintained by the local Mac).
+  if (AUTO_INGEST) {
+    log("Triggering auto-ingest...");
+    const ingest = await runProcess("node", ["autoIngest.js"], path.join(LOG_DIR, `${today}-ingest.log`), FOCUSMEMORY_DIR);
+    log(`auto-ingest exited with code ${ingest.code}`);
   }
 
   saveState({
     at: new Date().toISOString(),
     trigger,
-    file: path.relative(WORKSPACE, todoFile),
-    date,
-    catchup: isCatchup,
-    exitCode: code,
-    durationSec,
-    pendingBefore: pendingBefore.length,
-    pendingAfter: pendingAfter === null ? null : pendingAfter.length,
-    remaining:
-      pendingAfter === null ? ["<file missing>"] : pendingAfter.map((h) => h.trim()),
-    error,
+    date: today,
+    total: records.length,
+    done,
+    failed,
+    tasks: records,
     postRun,
   });
 }
 
 // ─── Scheduler ────────────────────────────────────────────────────
 
-const DEFAULT_RUN_TIME = "06:00"; // 24h "HH:MM" — TODO_RUN_TIME 미설정/오류 시 폴백
+const DEFAULT_RUN_TIME = "02:00"; // 24h "HH:MM" — TODO_RUN_TIME 미설정/오류 시 폴백
 
 /**
  * Daily run time from TODO_RUN_TIME (24h "HH:MM") in FocusMemory/.env.
@@ -375,7 +430,8 @@ function parseRunTime() {
   if (raw) {
     log(`TODO_RUN_TIME "${raw}" is invalid (expected 24h HH:MM) — using default ${DEFAULT_RUN_TIME}.`);
   }
-  return { hour: 6, minute: 0, source: "default" };
+  const [h, min] = DEFAULT_RUN_TIME.split(":").map(Number);
+  return { hour: h, minute: min, source: "default" };
 }
 
 const RUN_TIME = parseRunTime();
@@ -409,27 +465,33 @@ function scheduleNext() {
 
 // ─── Startup ──────────────────────────────────────────────────────
 
-log(`todoRunner started (PID ${process.pid})`);
-log(`TODOS_DIR: ${TODOS_DIR}`);
+log(`todoRunner started (PID ${process.pid}) — DB queue mode (udanax.todo_tasks)`);
+log(`Workspace: ${WORKSPACE}`);
 log(`Log directory: ${LOG_DIR}`);
 log(
   `Run time: ${String(SCHEDULE_HOUR).padStart(2, "0")}:${String(SCHEDULE_MINUTE).padStart(2, "0")}` +
-    ` (${RUN_TIME.source})`
+    ` (${RUN_TIME.source}) | night limit: ${NIGHT_LIMIT} | task timeout: ${TASK_TIMEOUT_MIN} min | auto-ingest: ${AUTO_INGEST ? "on" : "off"}`
 );
 
-// Dry run: resolve target + pending items, print, exit (no qwen, no state write)
+// Dry run: query pending tasks, print, exit (no qwen, no state write)
 if (process.argv.includes("--dry-run")) {
-  const target = findTargetFile();
-  if (!target) {
-    log("Dry run: no pending items in today's file or the lookback window.");
-    process.exit(0);
-  }
-  const pending = listPendingHeaders(fs.readFileSync(target.file, "utf-8"));
-  log(`Dry run: target=${target.date} (catchup=${target.isCatchup}), pending=${pending.length}`);
-  for (const header of pending) {
-    log(`  ${header.trim()}`);
-  }
-  process.exit(0);
+  taskdb
+    .fetchPendingTasks({ limit: NIGHT_LIMIT })
+    .then((tasks) => {
+      if (tasks.length === 0) {
+        log("Dry run: no pending tasks (scheduled_date <= today).");
+        process.exit(0);
+      }
+      log(`Dry run: ${tasks.length} pending task(s):`);
+      for (const t of tasks) {
+        log(`  #${t.id} [${t.source}] scheduled=${t.scheduled_date} — ${t.title}`);
+      }
+      process.exit(0);
+    })
+    .catch((err) => {
+      log(`Dry run failed: ${err.message}`);
+      process.exit(1);
+    });
 }
 
 // Support manual trigger: `node todoRunner.js --now`

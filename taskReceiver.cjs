@@ -14,8 +14,8 @@
  * and responds immediately; a background queue processes tasks serially:
  *   FocusMemory hard gate (business context search)
  *   -> MAIN_LLM (qwen27b) formatting
- *   -> append to the NEXT day's todos file (the 06:00 backlog run picks
- *      it up in the early morning; the title suffix keeps the actual
+ *   -> INSERT into udanax.todo_tasks on the 120 master (the 02:00 runner
+ *      on the 123 server picks it up; the title suffix keeps the actual
  *      request date, i.e. today)
  *
  * FocusMemory hard gate:
@@ -41,15 +41,14 @@
  *   translated). The /toc day labels (어제/오늘/내일) are panel UI chrome and
  *   are intentionally left in Korean.
  *
- * Todos file convention (shared with the cron-qwen runner, todoRunner.js):
- * - Line 1 of the file: `# MM월 DD일 해야할 일` (KR) / `# To-Do List - MM/DD` (EN)
- * - Item: `## [ ] <title> (MM-DD user request)` — new items are always `[ ]`
- * - Item body: bullets like `- **Requirement** / **Current state** / ...`
- * - Progress: `[ ]` -> `[~]` (in progress) -> `[x]` (done + summary)
- *   / `[!]` (interrupted)
- * Note: other consumers (todoRunner.js) only parse the checkboxes
- * ([ ]/[~]/[x]/[!]); the header/title text is free-form (read by the qwen
- * LLM), so it is safe to let it follow DOCS_LANGUAGE.
+ * todo_tasks queue convention (shared with the 02:00 runner, todoRunner.js):
+ * - Table: udanax.todo_tasks — 120 master (writes) / 121 slave (reads)
+ * - title: first `## [ ]` line of the formatted item, prefix stripped
+ * - content: the formatted item (or the raw text on LLM failure)
+ * - status: pending -> running (runner optimistic lock) -> done | failed
+ *   (done only via the agent's finish_task MCP tool)
+ * Note: content is free-form Markdown read by the qwen agent, so it is
+ * safe to let it follow DOCS_LANGUAGE.
  *
  * ── API usage ────────────────────────────────────────────────────────────
  * Base URL:
@@ -63,10 +62,10 @@
  * POST /receive
  *   - Register a task (fire-and-forget). No auth. Rate limit: 10 req/min.
  *   - Request body (JSON): { "task": "<raw task text, max 20000 chars>" }
- *   - Responds IMMEDIATELY with the target file (the NEXT day's todos
- *     file); formatting runs in the background (may take a few minutes).
- *   - 200: { "success": true, "data": { "date": "YYYY-MM-DD",
- *           "file": "YYYY-MM-DD.md", "queued": true } }
+ *   - Responds IMMEDIATELY with the target date (the NEXT day — the 02:00
+ *     runner's execution day); formatting + DB insert run in the background
+ *     (may take a few minutes).
+ *   - 200: { "success": true, "data": { "date": "YYYY-MM-DD", "queued": true } }
  *   - 400 (empty task):  { "success": false, "error": "..." }
  *   - 400 (too long):    { "success": false, "error": "..." }
  *   - 429 (rate limit):  { "success": false, "error": "..." }
@@ -82,24 +81,25 @@
  *       -d '{"task":"add a weekly digest email feature"}'
  *
  * GET  /toc
- *   - Todos TOC for yesterday/today/tomorrow (same shape as the FocusMemory
- *     dashboard /api/todos/toc; tomorrow is included because task
- *     registration targets the next day's file). No auth.
+ *   - Task queue TOC for yesterday/today/tomorrow from udanax.todo_tasks
+ *     (121 slave; tomorrow is included because task registration targets
+ *     the next day's run). No auth.
  *   - 200: { "success": true, "data": { "days": [
  *           { "date": "YYYY-MM-DD",
  *             "label": "어제" | "오늘" | "내일",
  *             "total": N, "done": M,
- *             "headers": [ { "status": " " | "x" | "~" | "!",
- *                             "title": "..." }, ... ] }, ... ] } }
+ *             "tasks": [ { "id": N,
+ *                          "status": "pending" | "running" | "done" | "failed",
+ *                          "title": "...", "source": "admin" | "mcp" | "manual",
+ *                          "result_summary": "...", "error": "...",
+ *                          "finished_at": "..." }, ... ] }, ... ] } }
  *
- * LLM failure fallback: the raw text is appended as-is as a `## [ ]` item
- * (to avoid losing the task).
+ * LLM failure fallback: the raw text is inserted as-is as a `## [ ]` item
+ * (title = first line) so no task is lost.
  */
 
 require('dotenv').config();
 
-const fs = require('fs');
-const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
@@ -172,9 +172,6 @@ const DOC_LANG = {
 /** Listener port (run via pm2 on 8888 — optionally fronted by a reverse proxy) */
 const PORT = parseInt(process.env.TASK_RECEIVER_PORT, 10) || 8888;
 
-/** todos storage directory (overridable via env, defaults to ./todos) */
-const TODOS_DIR = process.env.TODOS_DIR || path.join(process.cwd(), 'todos');
-
 /** Max length (chars) of the textarea raw text */
 const MAX_TASK_LENGTH = 20000;
 
@@ -215,30 +212,6 @@ function tomorrowDateParts() {
         md: `${m}-${d}`,
         header: DOC_LANG.dateHeader(m, d)
     };
-}
-
-/**
- * Return the todos file path for a given date.
- * @param {string} ymd - YYYY-MM-DD
- * @returns {string} absolute path
- */
-function todosFilePath(ymd) {
-    return path.join(TODOS_DIR, `${ymd}.md`);
-}
-
-/**
- * Read a todos file.
- * @param {string} fp - file path
- * @returns {string|null} content, or null if the file does not exist
- */
-function readTodosFile(fp) {
-    try {
-        if (!fs.existsSync(fp)) return null;
-        return fs.readFileSync(fp, 'utf8');
-    } catch (e) {
-        console.error('[taskReceiver] failed to read file:', e.message);
-        return null;
-    }
 }
 
 // ── FocusMemory hard gate — business context search ──────────────────────
@@ -493,18 +466,17 @@ function buildFallbackItem(rawTask, dateParts) {
 // ── fire-and-forget background queue ─────────────────────────────
 
 /**
- * Format the raw task with the LLM, then append it to the NEXT day's file
- * (background, serial). FocusMemory hard-gate context -> MAIN_LLM -> append.
- * Even on LLM failure, append the raw-text fallback so no task is lost.
+ * Format the raw task with the LLM, then INSERT it into udanax.todo_tasks
+ * (background, serial). FocusMemory hard-gate context -> MAIN_LLM -> INSERT.
+ * Even on LLM failure, insert the raw-text fallback so no task is lost.
  * @param {string} task - raw text
  */
 async function processTask(task) {
-    // Tasks are planned for the NEXT day (the 06:00 backlog run), not today.
+    // Tasks are planned for the NEXT day (the 02:00 runner on 123), not today.
     // The title suffix keeps the actual request date (today).
     const requestParts = todayDateParts();
     const targetParts = tomorrowDateParts();
     const dateParts = { ...targetParts, md: requestParts.md };
-    const fp = todosFilePath(dateParts.ymd);
 
     let item;
     let usedLlm = false;
@@ -514,7 +486,7 @@ async function processTask(task) {
     console.log(`[taskReceiver] business context ${context ? `loaded (${context.length} chars)` : 'none'}`);
 
     try {
-        const prompt = buildFormatPrompt(task, readTodosFile(fp), dateParts, context);
+        const prompt = buildFormatPrompt(task, null, dateParts, context);
         const { content, finishReason, usage } = await callLLM(prompt);
         const extracted = extractItemBlock(content);
         usedLlm = Boolean(extracted);
@@ -529,20 +501,22 @@ async function processTask(task) {
         item = buildFallbackItem(task, dateParts);
     }
 
-    if (!fs.existsSync(TODOS_DIR)) {
-        fs.mkdirSync(TODOS_DIR, { recursive: true });
-    }
-    // Re-read the latest content right before writing — another item may have been appended during the LLM call
-    const base = readTodosFile(fp) ?? `# ${dateParts.header}\n`;
-    fs.writeFileSync(fp, base.trimEnd() + '\n\n' + item + '\n', 'utf8');
+    // Title = first `## [ ]` line of the item, prefix stripped
+    const firstLine = (item.split('\n').find((l) => l.trim()) || '').trim();
+    const m = firstLine.match(/^##\s+\[[ x~!]\]\s*(.+)/);
+    const title = (m ? m[1] : firstLine).trim() || DOC_LANG.fallback.title;
 
-    console.log(`[taskReceiver] task appended: ${fp} (llm=${usedLlm}, item=${item.split('\n')[0]})`);
+    const { insertTask } = await import('./lib/taskdb.js');
+    const { id } = await insertTask({ title, content: item, rawText: task, source: 'admin', scheduledDate: targetParts.ymd });
+
+    console.log(`[taskReceiver] task inserted: id=${id} (llm=${usedLlm}, title=${title}, scheduled=${targetParts.ymd})`);
 }
 
 let taskQueue = Promise.resolve();
 
 /**
- * Enqueue a task into the background queue (serial processing — prevents concurrent writes to the same file).
+ * Enqueue a task into the background queue (serial processing — bounds LLM
+ * cost to one formatting call at a time).
  * @param {string} task - raw text
  */
 function enqueueTask(task) {
@@ -586,7 +560,7 @@ app.get('/ping', (req, res) => {
 /**
  * POST /receive — fire-and-forget
  * Enqueue the raw task and respond immediately.
- * FocusMemory context search + LLM formatting + append run in the background.
+ * FocusMemory context search + LLM formatting + DB insert run in the background.
  */
 app.post('/receive', receiverLimiter, (req, res) => {
     const task = typeof req.body?.task === 'string' ? req.body.task.trim() : '';
@@ -600,45 +574,23 @@ app.post('/receive', receiverLimiter, (req, res) => {
 
     enqueueTask(task);
 
-    // Target file = the NEXT day's todos file (matches processTask)
+    // Target date = the NEXT day's run (matches processTask)
     const dateParts = tomorrowDateParts();
     res.json({
         success: true,
         data: {
             date: dateParts.ymd,
-            file: `${dateParts.ymd}.md`,
             queued: true
         }
     });
 });
 
 /**
- * Extract the `## [ ]` header list from a todos file.
- * (Same parsing regex as the FocusMemory dashboard /api/todos/toc)
- * @param {string} fp - file path
- * @returns {Array<{status: string, title: string}>} status: ' '/'x'/'~'/'!'
+ * GET /toc — yesterday/today/tomorrow task queue TOC from udanax.todo_tasks
+ * (121 slave — tomorrow is included because task registration targets the
+ * next day's run)
  */
-function parseTodosHeaders(fp) {
-    const headers = [];
-    const content = readTodosFile(fp);
-    if (content == null) return headers;
-
-    for (const line of content.split('\n')) {
-        const m = line.match(/^##\s+(\[([ x~!])\])\s*(.+)/);
-        if (m) {
-            headers.push({ status: m[2] || ' ', title: m[3].trim() });
-        }
-    }
-    return headers;
-}
-
-/**
- * GET /toc — yesterday/today/tomorrow todos TOC
- * (Same shape as the FocusMemory dashboard /api/todos/toc —
- *  Yesterday→어제/Today→오늘/Tomorrow→내일 label; tomorrow is included
- *  because task registration targets the next day's file)
- */
-app.get('/toc', (req, res) => {
+app.get('/toc', async (req, res) => {
     const fmt = (d) =>
         `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     const today = new Date();
@@ -650,24 +602,34 @@ app.get('/toc', (req, res) => {
     tmrw.setDate(tmrw.getDate() + 1);
     const tmrwStr = fmt(tmrw);
 
-    const days = [];
-    for (const dateStr of [yestStr, todayStr, tmrwStr]) {
-        const fp = todosFilePath(dateStr);
-        if (!fs.existsSync(fp)) continue;
-
-        const headers = parseTodosHeaders(fp);
-        days.push({
-            date: dateStr,
-            label: dateStr === todayStr ? '오늘' : dateStr === yestStr ? '어제' : '내일',
-            total: headers.length,
-            done: headers.filter((h) => h.status === 'x').length,
-            headers
-        });
+    try {
+        const { listTasks } = await import('./lib/taskdb.js');
+        const days = [];
+        for (const dateStr of [yestStr, todayStr, tmrwStr]) {
+            const rows = await listTasks({ from: dateStr, to: dateStr });
+            days.push({
+                date: dateStr,
+                label: dateStr === todayStr ? '오늘' : dateStr === yestStr ? '어제' : '내일',
+                total: rows.length,
+                done: rows.filter((r) => r.status === 'done').length,
+                tasks: rows.map((r) => ({
+                    id: r.id,
+                    status: r.status,
+                    title: r.title,
+                    source: r.source,
+                    result_summary: r.result_summary,
+                    error: r.error,
+                    finished_at: r.finished_at
+                }))
+            });
+        }
+        res.json({ success: true, data: { days: days.reverse() } });
+    } catch (e) {
+        console.error('[taskReceiver] /toc failed:', e.message);
+        res.status(500).json({ success: false, error: `Failed to load the task queue: ${e.message}` });
     }
-
-    res.json({ success: true, data: { days: days.reverse() } });
 });
 
 app.listen(PORT, () => {
-    console.log(`[taskReceiver] task receiver running - port ${PORT}, todos: ${TODOS_DIR}, llm: ${LLM_API || '(MAIN_LLM not set!)'}, docs_lang: ${DOCS_LANGUAGE}`);
+    console.log(`[taskReceiver] task receiver running - port ${PORT}, queue: udanax.todo_tasks (master ${process.env.TASK_DB_HOST || '192.168.219.120'} / slave ${process.env.TASK_DB_SLAVE_HOST || process.env.TASK_DB_HOST || '192.168.219.120'}), llm: ${LLM_API || '(MAIN_LLM not set!)'}, docs_lang: ${DOCS_LANGUAGE}`);
 });

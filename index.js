@@ -20,6 +20,7 @@ import kvOffload from "./hooks/lib/kvoffload.js";
 import evictExtract from "./hooks/lib/evictextract.js";
 import { extractQueryFeatures, routeQuery, rerankMerged, pruneAndSummarize, filterRelevantItems, inferTopicKey, cosineSimilarity, resolveFilePath, isTrivialQuery } from "./lib/utils.js";
 import * as fmConfig from "./lib/config.js";
+import * as taskdb from "./lib/taskdb.js";
 
 // ── Past-session framing ──────────────────────────────────────────────
 // Cross-session memory entries are records of PAST work. Without framing,
@@ -1899,6 +1900,87 @@ server.registerTool(
     }
 
     return { content: [{ type: "text", text: formatFocusedPoint(matches[0], "code_chunks") }] };
+  }
+);
+
+// ─── TODO runner queue tools (udanax.todo_tasks — writes 120 master, reads 121 slave) ───
+
+server.registerTool(
+  "put_task",
+  {
+    title: "Put Task (Register Nightly TODO)",
+    description:
+      "Register a task into the 02:00 autonomous TODO runner queue (udanax.todo_tasks on the 120 master). " +
+      "Use when the user asks to register/queue a task for the nightly runner ('일감 등록해줘', '내일 할일로 넣어줘', 'TODO 등록'). " +
+      "The text is inserted directly (no LLM formatting) and executed by the 123 server's qwen agent at 02:00 KST on scheduled_date (default: tomorrow KST). " +
+      "Returns the new task id immediately.",
+    inputSchema: {
+      task: z.string().describe("Raw task text — what the nightly agent must do (requirement, current state, fix direction, verification). Korean or English."),
+      title: z.string().optional().describe("Short item title. Default: first line of the task text (truncated to 255 chars)."),
+      scheduled_date: z.string().optional().describe("Execution date YYYY-MM-DD (KST). Default: tomorrow."),
+    },
+  },
+  async ({ task, title, scheduled_date }) => {
+    const text = (task || "").trim();
+    if (!text) {
+      return { content: [{ type: "text", text: "put_task() needs non-empty task text." }], isError: true };
+    }
+    const finalTitle = (title || "").trim() || text.split("\n")[0].trim();
+    try {
+      const { id } = await taskdb.insertTask({ title: finalTitle, content: text, rawText: text, source: "mcp", scheduledDate: scheduled_date || null });
+      const row = await taskdb.getTask(id);
+      return {
+        content: [{
+          type: "text",
+          text: `Task registered: id=${id}, title="${finalTitle}", scheduled_date=${row.scheduled_date}, status=${row.status}. ` +
+            "It will run on the 123 server at 02:00 KST on that date (catch-up if overdue).",
+        }],
+      };
+    } catch (err) {
+      return { content: [{ type: "text", text: `put_task() insert failed: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "finish_task",
+  {
+    title: "Finish Task (Report TODO Outcome)",
+    description:
+      "Report the outcome of a running TODO task (udanax.todo_tasks on the 120 master) — the ONLY completion channel for the nightly runner agent. " +
+      "When executing a task assigned by the todo runner, call this EXACTLY ONCE at the end: " +
+      "status='done' with result_summary (PR URL, commit hash, verification output), or status='failed' with error " +
+      "(prefix 'BLOCKED: ' when the blocker is external, e.g. needs user approval — no auto-retry). " +
+      "Only accepts the given id while its status is 'running'; wrong id or duplicate report returns an error.",
+    inputSchema: {
+      task_id: z.number().describe("todo_tasks row id given in the task assignment prompt"),
+      status: z.enum(["done", "failed"]).describe("done = task completed AND verified; failed = could not complete"),
+      result_summary: z.string().optional().describe("REQUIRED with status=done — PR URL(s), commit hash(es), verification output (or how it was verified when no code changed)"),
+      error: z.string().optional().describe("REQUIRED with status=failed — what failed; prefix 'BLOCKED: ' when waiting on the user"),
+    },
+  },
+  async ({ task_id, status, result_summary, error }) => {
+    if (!Number.isInteger(task_id) || task_id <= 0) {
+      return { content: [{ type: "text", text: "finish_task() needs a positive integer task_id." }], isError: true };
+    }
+    if (status === "done" && !(result_summary || "").trim()) {
+      return { content: [{ type: "text", text: "finish_task(status='done') requires result_summary (PR URL / commit hash / verification output)." }], isError: true };
+    }
+    if (status === "failed" && !(error || "").trim()) {
+      return { content: [{ type: "text", text: "finish_task(status='failed') requires error (what failed; 'BLOCKED: ...' when waiting on the user)." }], isError: true };
+    }
+    try {
+      const res = await taskdb.finishTask(task_id, status, {
+        resultSummary: (result_summary || "").trim() || null,
+        error: (error || "").trim() || null,
+      });
+      if (!res.ok) {
+        return { content: [{ type: "text", text: `finish_task() rejected: ${res.message}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: `${res.message} — the nightly runner will see the final state.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `finish_task() update failed: ${err.message}` }], isError: true };
+    }
   }
 );
 
