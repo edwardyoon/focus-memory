@@ -51,14 +51,14 @@ It is also the durable backend for **lossless long-horizon context**: the kv-off
 | Concern | focus-llama · inference engine | FocusMemory · memory layer |
 |---------|-------------------------------|---------------------------|
 | **KV cache** | Decides which messages to evict, cuts their KV, re-prefills on focus | Dumb store — returns evicted text verbatim; no chunking, embedding, or search |
-| **Declarative attention** | `--da-prompt-scan` recovers the layout; re-prefills the recalled chunks | Emits `[[da:N]]` magic-chunk markers + the `focus` retrieval tool |
+| **Declarative attention** | `--da-auto` re-chunks the rendered prompt into magic chunks; re-prefills the focused ones | Emits `[[da:N]]` magic-chunk markers + the `focus` retrieval tool |
 | **Execution state (Σ)** | — stays in the engine's context | Extracts a structured state patch pre-compaction, re-injects it post-compaction |
 | **Project knowledge** | — | Qdrant + Meilisearch + tree-sitter AST graph — durable, context-window-independent |
 
 Launch the engine against it:
 
 ```
---fm-offload --kv-offload-holes --focus-memory-host http://<host>:3900
+--da-auto --kv-unified --fm-offload --kv-offload-holes --focus-memory-host http://<host>:3900
 ```
 
 ## Four pillars
@@ -67,8 +67,8 @@ Everything the engine needs to remember — four pillars cover the full memory c
 
 | # | Pillar | What it manages | Backend |
 |---|--------|-----------------|---------|
-| **01** | **Declarative attention** | Numbered `[[da:N]]` magic-chunk markers let the model name exactly which recalled chunks it wants in context — lossless recall by name, not re-derivation. | `[[da:N]]` markers + `focus` tool (server) · `--da-prompt-scan` (engine) |
-| **02** | **skill.state (Σ)** | Structured execution state extracted pre-compaction, re-injected post-compaction — the agent resumes from explicit state, not a lossy prose summary. | SKILL.state hooks + `work_memory` checkpoints |
+| **01** | **Declarative attention** | Magic-chunk attention — the model names exactly which chunks it wants in context (`<focus magic_chunks="N">`); evicted chunks come back verbatim, not re-derived. | `--da-auto` (engine) · `focus` tool + `[[da:N]]` marker injection (server, test path) |
+| **02** | **skill.state (Σ)** | Structured execution state extracted pre-compaction, re-injected post-compaction — the agent resumes from explicit state, not a lossy prose summary. | SKILL.state hooks + per-session Σ file |
 | **03** | **Memory management** | Durable project knowledge — semantic search, causal decision chains, code graph, task memory. Independent of the context window. | Qdrant + Meilisearch + tree-sitter AST graph |
 | **04** | **KV store** | A dumb per-session verbatim store for evicted context — the lossless-recall backend behind focus-llama's `--fm-offload`. | Per-session JSON store (`~/.qwen/tmp/focus-memory/kv-offload/`) |
 
@@ -92,26 +92,7 @@ Each session shares source code, work history, upcoming tasks, and live executio
 
 **The model names the chunk. The engine brings it back.** The bridge between the memory and KV-store pillars: a lossless-recall mechanism that lets the model pull back specific evicted chunks by name instead of re-deriving them.
 
-**Enable (server side — FocusMemory):**
-
-```bash
-# FocusMemory/.env
-FOCUSMEMORY_DA=on
-```
-
-Off by default — with the flag unset, search results are returned as plain text.
-
-**Server side — FocusMemory** wraps search results in numbered magic-chunk markers:
-
-| Marker | Role |
-|--------|------|
-| `[[da:N]]` | Numbered chunk marker (per-session monotonic) — one per recalled result block |
-| `[[da:filler]]` | Placeholder for a result not materialized as a chunk |
-| `[[da:layout:N]]` | Footer carrying the versioned layout signature the engine verifies against the rendered prompt |
-
-Cap: **5 chunks × 300 chars** per query.
-
-**Engine side — focus-llama** is launched with `--da-prompt-scan`: it recovers the layout from the rendered prompt (validating the versioned signature) and re-prefills the KV of whichever chunks the model focuses on. The model names them with a `<focus>` control tag:
+**Engine side — focus-llama** runs in `--da-auto` mode (the production path, requires `--kv-unified` — the reversible backend B): once the rendered prompt passes `--da-min-ctx`, the server re-chunks the *entire* prompt — system + history + tool I/O — into magic chunks by message boundary (~`--da-chunk-tokens`), and re-prefills the KV of whichever chunks the model focuses on. That is the path that produces physical KV read reduction over the whole conversation, not just an injected index. The model names the chunks with a `<focus>` control tag:
 
 ```
 <focus magic_chunks="N" />
@@ -129,6 +110,8 @@ Cap: **5 chunks × 300 chars** per query.
 - Attribute values always in double quotes
 - Tags always closed (`/>` or `</focus>`)
 - No partial tags in chain-of-thought
+
+**Marker path (test-only).** `FOCUSMEMORY_DA=on` (off by default) is the legacy marker path: FocusMemory wraps search results in `[[da:N]]` … `[[da:layout:N]]` markers (5 × 300 chars, appended at the prompt tail) and a server launched with `--da-prompt-scan` scans the rendered prompt to recover that layout (validating the versioned signature). The client chunks the memory index, not the conversation — DA scopes to the injected index only (the scanner tail-anchors to the last user-message boundary, so a marker block a compaction summary reproduces in history is ignored — fail-open), and it cannot reduce the conversation's KV. Without `--da-prompt-scan` the server does not scan the markers; production runs `--da-auto` alone, and when both are on the marker layout wins per request.
 
 <br>
 
@@ -219,8 +202,8 @@ Off by default — with the flag unset, all hooks return immediately (25–40 ms
 
 **How it works** (fail-open throughout — any failure leaves native compaction exactly as-is):
 
-- **Stop (every turn)** records bookkeeping fields in a locked read-modify-write — `last_input_tokens` (context size from the `contextUsage` field qwen-code provides on `Stop`), `turn_count`, `transcript_path` (used by the `recent_work` MCP tool to resolve the session), and `last_turn_completion_signal` (input to the UserPromptSubmit flip). No extraction, no worker spawn, no model-facing output.
-- **PreCompact** spawns the same worker as a final pass and exits in milliseconds — native compaction is never blocked. The worker reads the transcript tail (default 30k chars), calls the extraction LLM (SUMMARY_LLM → MAIN_LLM fallback) for a JSON state patch, merges it into Σ (`Σ_{t+1} = Σ_t ⊕ Δ`; null deletes a key), saves it, and dual-writes a `work_memory` checkpoint under a stable per-session point ID — one upserted point, not one per extraction.
+- **Stop (every turn)** records bookkeeping fields in a locked read-modify-write — `last_input_tokens` (context size from the `contextUsage` field qwen-code provides on `Stop`), `transcript_path` (used by the `recent_work` MCP tool to resolve the session), and `last_turn_completion_signal` (input to the UserPromptSubmit flip). No extraction, no worker spawn, no model-facing output.
+- **PreCompact** spawns the same worker as a final pass and exits in milliseconds — native compaction is never blocked. The worker reads the transcript tail (default 30k chars), calls the extraction LLM (SUMMARY_LLM → MAIN_LLM fallback) for a JSON state patch, merges it into Σ (`Σ_{t+1} = Σ_t ⊕ Δ`; null deletes a key), and saves it.
 - **UserPromptSubmit (every turn)** — mechanical maintenance only (no injection, no LLM): scrubs stale foreign refs from Σ, flips the completion signal (sets the `anchor_done_next` baseline), releases the B4 pin, and resets the current view. These keep the anchor lifecycle current so SessionStart re-injection and the turn-guard / ghost-gate / evict-extract gates stay correct. Mid-turn recall is handled by focus-llama's own Σ fetch (see the kv-offload section) — the hooks no longer inject Σ into the prompt.
 - **SessionStart** (`compact` only) loads Σ and injects it as `additionalContext`, preferred over the native prose summary for "where are we" questions.
 
@@ -235,11 +218,11 @@ Off by default — with the flag unset, all hooks return immediately (25–40 ms
 | `decisions` | union, capped at 50 |
 | `tests_status` | merge (`{ "<check>": "pass\|fail\|pending" }`) |
 
-Internal bookkeeping keys (owned by the hooks, never part of an extraction patch, excluded from the anchor): `last_input_tokens` (context size at the last Stop), `turn_count` (one increment per Stop, drives hypothesis aging), `transcript_path` (session transcript, used by the `recent_work` MCP tool), `last_turn_completion_signal` (input to the UserPromptSubmit flip), `last_extraction_transcript_bytes` (worker delta baseline — Stop-era files read the delta from the old offset, new sessions full-tail), `compact_count`.
+Internal bookkeeping keys (owned by the hooks, never part of an extraction patch, excluded from the anchor): `last_input_tokens` (context size at the last Stop), `transcript_path` (session transcript, used by the `recent_work` MCP tool), `last_turn_completion_signal` (input to the UserPromptSubmit flip), `last_extraction_transcript_bytes` (worker delta baseline — Stop-era files read the delta from the old offset, new sessions full-tail), `compact_count`.
 
 **Measured overhead:** ~9.8k input tokens (30k rendered tail) per extraction, plus the model's reasoning tokens — runs detached in parallel with native compaction, so it adds no user-facing latency. The extraction calls the chat completions API with `enable_thinking: true`: the model reasons in a separate `reasoning_content` field (discarded) and returns clean JSON in `content`. This replaced the earlier in-prompt `/no_think` token, which the 27B model intermittently ignored — leaking chain-of-thought into the JSON and breaking it (≈20% parse failures on normal tails, ≈100% on tails dominated by prompt-like content). Thinking makes the call slower (tens of seconds vs ~4s) but reliable; the detached worker absorbs the latency.
 
-Extraction can race the native compaction summary; if native compaction finishes first, that round's injection is skipped (fail-open) — Σ still lands for the next compaction and in `work_memory`. Σ files live separately from Hard Gate state (`~/.qwen/tmp/focus-memory/state/`) and are swept by `cleanup-session.js` on `SessionEnd` plus a 7-day stale sweep.
+Extraction can race the native compaction summary; if native compaction finishes first, that round's injection is skipped (fail-open) — Σ still lands for the next compaction. Σ files live separately from Hard Gate state (`~/.qwen/tmp/focus-memory/state/`) and are swept by `cleanup-session.js` on `SessionEnd` plus a 7-day stale sweep.
 
 **Observability:** the dashboard (`:8891`) has a dedicated **skill.state** page (sidebar) backed by `GET /api/skillstate` (also on `:3900`) — per-session Σ viewer (the exact injected anchor line, tests pass/fail/pending, full JSON), lifecycle activity counts (extraction success/failure, post-compact re-injections, mechanical anchor events), and a recent-event timeline. Read-only over the Σ files and the existing gate telemetry JSONL — no extra state, no new write path.
 
@@ -277,14 +260,30 @@ segment in the prompt).
 |--------|------|---------|
 | `PUT` | `/v1/kv-offload/chunk` | Store one evicted segment (`{session_id, key, text, tokens}`) |
 | `GET` | `/v1/kv-offload/chunk?session_id=&key=` | Fetch a segment's text back (get-on-focus) |
+| `GET` | `/v1/kv-offload/session?session_id=` | Eviction-plan state — reports `pin_released` (first-user-message pin) |
+| `GET` | `/v1/kv-offload/session/sigma?session_id=` | Mid-turn DA scaffold — Σ anchor + recent digest, fetched by the engine on every offloaded request |
 | `DELETE` | `/v1/kv-offload/session?session_id=` | Drop a session's stored segments |
 
 Segments are kept in per-session JSON files under `~/.qwen/tmp/focus-memory/kv-offload/`
 (atomic writes, lock-guarded), the same pattern as the session-state files.
 
+**Mid-turn DA scaffold (Σ anchor fetch).** While history is offloaded, the engine fetches
+`GET /v1/kv-offload/session/sigma` on **every request** and appends the session's Σ anchor to
+the offloaded-chunks note, so a long autonomous turn keeps its ground mid-turn — the
+Stop/UserPromptSubmit hooks only fire at turn boundaries. The engine caps the call at 200 ms
+and fails open (an empty anchor — no Σ yet, gate off, or error — means "nothing to inject").
+The response is the rendered anchor plus a `recent_digest` snapshot appended after it; the
+digest is refreshed **at eviction PUT time** (the moment history leaves the KV) from the last
+24 transcript events (≤1.6k chars), and the same PUT kicks a fire-and-forget worker
+(evict-extract) that distills the evicted segment into Σ itself. A snapshot (not a live read)
+keeps the scaffold stable across requests — the `recent_work` MCP tool is the live-reading
+counterpart. The Σ anchor is part of the engine's DA keep set (the union of the tag selection,
+the Σ anchor, and the `--da-tail-keep` tail floor), so the scaffold is never masked out of
+attention.
+
 **Engine-side requirement.** The routes are inert unless the inference server is built from
 focus-llama and launched with
-`--fm-offload --kv-offload-holes --focus-memory-host http://<this-host>:3900`
+`--da-auto --kv-unified --fm-offload --kv-offload-holes --focus-memory-host http://<this-host>:3900`
 (see the *kv-offload* section of the focus-llama README). Against a stock `llama.cpp` server
 these routes are simply unused.
 
@@ -356,7 +355,7 @@ Most of the system is self-cleaning: session state files are swept by `cleanup-s
 | Target | Rule | Why safe |
 |---|---|---|
 | `todos/YYYY-MM-DD.md` | older than `GC_TODOS_RETENTION_DAYS` → **moved** to `GC_ARCHIVE_DIR/YYYY-MM/` | todos/ is not under version control, so the move keeps it reversible; the archive dir is outside `TODOS_DIR` so autoIngest never re-indexes it, and its deleted-file detection drops the Meilisearch doc. todoRunner only scans the last 3 days. |
-| `work_memory` `type=state_checkpoint` | `timestamp` older than `GC_CHECKPOINT_RETENTION_DAYS` → deleted by explicit ID list | one upserted point per session (`checkpointId`); the Σ file on disk is already swept at 7 days, and no recovery path reads checkpoints older than a session's lifetime. |
+| `work_memory` `type=state_checkpoint` | `timestamp` older than `GC_CHECKPOINT_RETENTION_DAYS` → deleted by explicit ID list | legacy drain only — the per-session double-write was removed (the Σ file on disk is the source of truth, swept at 7 days), so no new points are created; this phase retires the points written before the removal. |
 | `~/.qwen/tmp` (entire tree) | file `mtime` older than `GC_SESSION_RETENTION_DAYS` → deleted, then directories that become empty are removed (bottom-up) | qwen-code accumulates per-session artifacts here (attachments, tool-results, background-shells, logs, skill state, kv-offload, tool-calls) and never cleans them up itself. Active sessions keep rewriting their files, so mtime is the liveness signal: anything written within the window is never deleted. |
 
 **Whitelist by construction — never age-pruned:** `decision`/`bug_resolved`/`todo` points and `decision_chains` (causal-chain integrity; `trace_decision_chain` walks `supersedes`/`superseded_by` links, so dropping a node severs the chain — recency decay in reranking already downranks old decisions), and the code index (freshness is managed by file-existence sync, not age).
