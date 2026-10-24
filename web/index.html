@@ -553,7 +553,7 @@
           </tr>
           <tr>
             <td>Declarative attention</td>
-            <td><code>--da-prompt-scan</code> recovers the layout; re-prefills the recalled chunks</td>
+            <td><code>--da-auto</code> re-chunks the rendered prompt into magic chunks; re-prefills the focused ones</td>
             <td>Emits <code>[[da:N]]</code> magic-chunk markers + the <code>focus</code> retrieval tool</td>
           </tr>
           <tr>
@@ -628,7 +628,7 @@
       <div class="card">
         <div class="card-icon">⚙</div>
         <h3>Engine side — focus-llama</h3>
-        <p>Launched with <code>--da-prompt-scan</code>, which recovers the layout from the rendered prompt. The model then emits <code>&lt;focus magic_chunks="N"&gt;</code> to restrict attention to, or recall, specific chunks.</p>
+        <p>Runs in <code>--da-auto</code> mode (with <code>--kv-unified</code>): the server re-chunks the entire rendered prompt into magic chunks by message boundary. The model then emits <code>&lt;focus magic_chunks="N"&gt;</code> to restrict attention to, or recall, specific chunks.</p>
       </div>
       <div class="card">
         <div class="card-icon">⌕</div>
@@ -868,7 +868,7 @@
   "softwareVersion": "1.0.0",
   "featureList": [
     "Memory + execution-state layer for AI coding agents — source code, work history, and task memory as a single shared context",
-    "Declarative attention — numbered magic-chunk markers ([[da:N]]) let the model name exactly which evicted chunks to recall; focus-llama --da-prompt-scan re-prefills them losslessly",
+    "Declarative attention — focus-llama --da-auto re-chunks the rendered prompt into magic chunks so the model can name exactly which chunks to attend to; evicted chunks re-prefill losslessly from the KV store",
     "KV store for focus-llama — dumb per-session verbatim store behind --fm-offload; lossless recall in ~1-2 s vs ~5.3 min lossy auto-compact",
     "skill.state (Σ) — structured execution state extracted pre-compaction and re-injected post-compaction; fail-open hooks, no user-facing latency",
     "Autonomous TODO execution — PM2-managed daily runner with progress tracking and auto-ingest",

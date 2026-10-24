@@ -1,12 +1,10 @@
 #!/usr/bin/env node
 // Stop hook — SKILL.state per-Stop bookkeeping.
 //
-// Records four fields into Σ on every Stop (gated by
+// Records three fields into Σ on every Stop (gated by
 // FOCUSMEMORY_SKILLSTATE=on). No extraction, no model-facing output, no
 // telemetry:
 //   - last_input_tokens — the current context size (dashboard token display).
-//   - turn_count — one increment per Stop (hypothesis aging is measured in
-//     these turns).
 //   - transcript_path — the recent_work MCP tool resolves its caller session
 //     from QWEN_CODE_SESSION_ID alone and reads the transcript path from
 //     here; the hook is the only component that sees event.transcript_path
@@ -34,7 +32,7 @@ const fs = require('fs');
 const ss = require('./lib/skillstate.js');
 
 /**
- * Stop hook entry — record the four per-Stop bookkeeping fields into Σ.
+ * Stop hook entry — record the three per-Stop bookkeeping fields into Σ.
  * No extraction, no model-facing output, no telemetry.
  * @returns {Promise<void>}
  */
@@ -61,11 +59,6 @@ async function main() {
   ss.mutateSigma(sessionId, (sigma) => {
     // Current context size (dashboard token display).
     sigma.last_input_tokens = inputTokens;
-
-    // Turn counter (drift-stamp bookkeeping): one increment per Stop. The
-    // hypothesis age stamps (hypo_stamps) are measured in these turns —
-    // hook-internal (never merged from a patch).
-    sigma.turn_count = (Number(sigma.turn_count) || 0) + 1;
 
     // Transcript path bookkeeping (recent_work MCP tool): the tool resolves
     // its caller session from QWEN_CODE_SESSION_ID alone and reads the

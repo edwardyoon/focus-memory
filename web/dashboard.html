@@ -333,6 +333,17 @@
   .info-key { color: var(--text-dim); }
   .info-val { color: var(--text); font-weight: 500; }
 
+  .cfg-mismatch {
+    margin-top: 16px;
+    padding: 12px 16px;
+    border: 1px solid rgba(248, 113, 113, 0.4);
+    border-radius: 8px;
+    background: rgba(248, 113, 113, 0.08);
+    font-size: 13px;
+  }
+
+  .cfg-mismatch-title { color: var(--red); font-weight: 600; margin-bottom: 8px; }
+
   /* Loading / error */
   .loading {
     text-align: center;
@@ -700,6 +711,14 @@
           <div class="loading"><div class="spinner"></div></div>
         </div>
       </div>
+
+      <div class="section-title">LLM Status</div>
+      <div class="system-info">
+        <div class="info-grid" id="llmStatus">
+          <div class="loading"><div class="spinner"></div></div>
+        </div>
+        <div id="cfgMismatch" class="cfg-mismatch" style="display:none"></div>
+      </div>
     </section>
 
     <!-- ── Page: skill.state ── -->
@@ -875,6 +894,7 @@ async function fetchStats() {
     renderQdrant(data.qdrant || {});
     renderMeili(data.meilisearch || {});
     renderSystemInfo(data.system || {});
+    renderLlmStatus(data.llm || {}, data.config_mismatch || []);
 
     const gateData = gateRes && gateRes.ok ? await gateRes.json() : null;
     renderCharts(data, gateData || {});
@@ -1011,6 +1031,29 @@ function renderSystemInfo(sys) {
       <span class="info-val">${esc(String(val))}</span>
     </div>
   `).join('');
+}
+
+function renderLlmStatus(llm, mismatch) {
+  const el = document.getElementById('llmStatus');
+  const rows = Object.entries(llm).map(([name, info]) => {
+    const chip = info.ok
+      ? `<span class="chip pass">ok · ${info.ms}ms · HTTP ${info.http}</span>`
+      : `<span class="chip fail">down · ${esc(String(info.error || 'timeout'))}</span>`;
+    return `<div class="info-item"><span class="info-key">${esc(name)}${info.shared ? ' (= summary)' : ''}</span><span class="info-val">${chip}</span></div>`;
+  });
+  el.innerHTML = rows.length ? rows.join('') : '<div class="loading">No LLM config</div>';
+
+  const box = document.getElementById('cfgMismatch');
+  if (!mismatch.length) {
+    box.style.display = 'none';
+    box.innerHTML = '';
+    return;
+  }
+  box.style.display = 'block';
+  box.innerHTML = '<div class="cfg-mismatch-title">.env 변경 미반영 — MCP 서버 재시작 필요 (qwen-code 세션)</div>' +
+    mismatch.map(m =>
+      `<div class="info-item"><span class="info-key">${esc(m.key)}</span><span class="info-val">${esc(m.file)} → ${esc(m.running)}${m.note ? ` <span style="color:var(--text-dim);font-weight:400">(${esc(m.note)})</span>` : ''}</span></div>`
+    ).join('');
 }
 
 function renderSkillState(data) {

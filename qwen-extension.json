@@ -113,7 +113,7 @@
         ]
       },
       {
-        "description": "SKILL.state — per-Stop bookkeeping: records last_input_tokens, turn_count, transcript_path, and last_turn_completion_signal in a locked read-modify-write (no extraction, no worker spawn). Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
+        "description": "SKILL.state — per-Stop bookkeeping: records last_input_tokens, transcript_path, and last_turn_completion_signal in a locked read-modify-write (no extraction, no worker spawn). Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
         "hooks": [
           {
             "type": "command",

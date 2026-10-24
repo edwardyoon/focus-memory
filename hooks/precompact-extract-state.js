@@ -9,8 +9,7 @@
 //   --worker <event>  — the detached child: transcript tail → SUMMARY_LLM
 //                       state-patch extraction (JSON only, no prose) →
 //                       null-deletion merge into
-//                       ~/.qwen/tmp/focus-memory/state/<sid>.json →
-//                       dual-write a work_memory "state_checkpoint" point.
+//                       ~/.qwen/tmp/focus-memory/state/<sid>.json.
 //
 // Why async: the transcript JSONL keeps its full raw history after
 // compaction (qwen only appends a `chat_compression` system record), so the
@@ -18,7 +17,7 @@
 // the Σ is ready by the time SessionStart(source=compact) re-injects it.
 // For small contexts the native summary can finish before the worker — in
 // that case the injection is simply skipped this round (fail-open); the Σ
-// still lands for the next compaction and in work_memory.
+// still lands for the next compaction.
 //
 // Feature gate: FOCUSMEMORY_SKILLSTATE=on — any other value / unset returns
 // immediately at the entry, so with the gate off the existing auto-recall +
@@ -144,18 +143,12 @@ async function runWorker(event) {
 
   // Merge inside one locked read-modify-write: the base Σ was loaded before
   // the LLM call, so a concurrent Stop hook may have updated bookkeeping
-  // keys (last_input_tokens, turn_count, transcript_path,
+  // keys (last_input_tokens, transcript_path,
   // last_turn_completion_signal) during that window. Merging against a fresh
   // read inside the lock is lost-update-safe without a post-hoc key re-copy.
-  // Drift measurement (2026-10-19): the pre-merge confirmed list (stale
-  // citation baseline) and the aged-hypothesis report are captured inside
-  // the same locked RMW as the merge.
-  let agedHypo = [];
-  let preConfirmed = [];
   let nextStripped = false;
   let anchorReleased = false;
   const written = ss.mutateSigma(sessionId, (current) => {
-    preConfirmed = Array.isArray(current.confirmed) ? current.confirmed : [];
     const wasDone = current.anchor_revoked === true || current.anchor_completed === true;
     let p = patch;
     // Anchor-done gate (2026-10-20 stale-anchor fix, same as evict-extract):
@@ -204,12 +197,9 @@ async function runWorker(event) {
       // Completed task's next = the gate's re-derivation baseline.
       next.anchor_done_next = Array.isArray(next.next) ? next.next.slice() : [];
     }
-    // Hypothesis age stamps (hook-internal bookkeeping, measurement only).
-    agedHypo = ss.updateHypoStamps(next, Number(current.turn_count) || 0);
     return next;
   });
   if (written) {
-    ss.recordCheckpoint(written, event.cwd, event.trigger).catch(() => {});
     // B4 pin release: mirror the sticky release flags into the kv-offload
     // store so the focus-llama engine can release the first-user-message pin
     // at its next eviction plan (GET /v1/kv-offload/session). Two triggers:
@@ -231,36 +221,6 @@ async function runWorker(event) {
           reason: res.reason,
         });
       }
-    }
-  }
-  // Drift base-rate telemetry (2026-10-19, measurement only — no item is
-  // dropped or rewritten, nothing is model-facing): (a) hypotheses that
-  // have aged 3+ turns without leaving the list, (b) NEW confirmed items
-  // citing files the segment's tool calls never touched, (c) EXISTING
-  // confirmed items whose cited file was edited in the segment. The base
-  // rates decide whether any of these becomes a real gate.
-  if (written) {
-    const { touched, edited } = ss.segmentCallFiles(transcriptText);
-    if (agedHypo.length) {
-      ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'drift', event: 'drift_hypo_aged', items: agedHypo });
-    }
-    const ghosts = [];
-    for (const item of Array.isArray(patch.confirmed) ? patch.confirmed : []) {
-      if (typeof item !== 'string' || !item || preConfirmed.includes(item)) continue;
-      const missing = ss.citedFiles(item).filter((c) => ![...touched].some((t) => ss.pathRefersTo(c, t)));
-      if (missing.length) ghosts.push({ item, refs: missing });
-    }
-    if (ghosts.length) {
-      ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'drift', event: 'drift_ghost_ref', items: ghosts });
-    }
-    const stale = [];
-    for (const item of preConfirmed) {
-      if (typeof item !== 'string' || !item) continue;
-      const hit = ss.citedFiles(item).filter((c) => [...edited].some((e) => ss.pathRefersTo(c, e)));
-      if (hit.length) stale.push({ item, files: hit });
-    }
-    if (stale.length) {
-      ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'drift', event: 'drift_stale_citation', items: stale });
     }
   }
   ss.appendTelemetry({

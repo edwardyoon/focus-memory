@@ -239,10 +239,6 @@ async function extractBatch(sessionId, batch) {
       if (!keys.includes(s.key)) keys.push(s.key);
     }
     next.evict_processed_keys = keys.slice(-MAX_KEYS_TRACKED);
-    // Keep the hypothesis age stamps consistent when evict extraction
-    // merges a patch that changes the hypothesis list (measurement-only
-    // bookkeeping — no drift telemetry here: the segments are OLD history).
-    ss.updateHypoStamps(next, Number(cur.turn_count) || 0);
     // One-shot context-switch marker (2026-10-20 stale-anchor fix): evict
     // extraction previously had NO reset-arming (only the turn-boundary
     // worker did), so an anchor_completed set HERE never wiped the finished
@@ -279,11 +275,6 @@ async function extractBatch(sessionId, batch) {
     // next_before/after as the record for it.
     ...(fresh.length >= 8 ? { evict_wave: true } : {}),
   });
-
-  // Best-effort work_memory dual-write (stable per-session point, upsert)
-  try {
-    await ss.recordCheckpoint(written, '', 'eviction');
-  } catch {}
 }
 
 module.exports = { kickEvictExtract };

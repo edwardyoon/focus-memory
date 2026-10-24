@@ -16,7 +16,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const { withLock, atomicWrite, appendTelemetry, STATE_DIR } = require('./state.js');
 // stripInjectedBlocks (kvoffload.js): removes client-appended context blocks
 // (user-prompt-submit context, system-reminder) before digesting transcript
@@ -775,109 +774,6 @@ function filterForeignSessionRefs(patch, sessionId) {
   return { patch, removed };
 }
 
-// ─── Drift telemetry (2026-10-19: stamping + base-rate measurement) ──────
-// The drift detectors (hypo-aging, ghost refs, stale citations) are
-// MEASUREMENT-ONLY: they stamp hook-internal bookkeeping (hypo_stamps,
-// turn_count — not in SCHEMA_KEYS, so an extraction patch never carries
-// them; not in CONTENT_KEYS, so the injection hash is unaffected) and emit
-// telemetry. Nothing is dropped, rewritten, or shown to the model. The
-// collected base rates decide whether a detector is worth promoting to a
-// real gate.
-const HYPO_PENDING_TURNS = 3; // a hypothesis still listed after this many turns is "aged"
-
-/**
- * File paths cited in a state item (`file:line` refs, the QWEN.md
- * citation convention — basename or project-relative paths).
- * @param {string} item
- * @returns {string[]} unique cited paths (empty when the item cites no file)
- */
-function citedFiles(item) {
-  if (typeof item !== 'string' || !item) return [];
-  const out = [];
-  for (const m of item.matchAll(/([A-Za-z0-9._\-/]+\.\w+):\d+/g)) {
-    if (!out.includes(m[1])) out.push(m[1]);
-  }
-  return out;
-}
-
-/**
- * Tool-call file activity in a rendered transcript segment: `touched` =
- * every file any [call] referenced, `edited` = files mutated by edit /
- * write_file calls. Parsed from the deterministic entryToText rendering
- * (`[call] <name> <args-json>`); the args window is scoped to the call's
- * own 500-char clip and bounded by the next token separator, so result
- * text cannot inflate the sets.
- * @param {string} text - rendered segment (extractTranscriptDelta/Tail output)
- * @returns {{touched: Set<string>, edited: Set<string>}}
- */
-function segmentCallFiles(text) {
-  const touched = new Set();
-  const edited = new Set();
-  if (typeof text !== 'string' || !text) return { touched, edited };
-  const callRe = /\[call\] (\S+) \{/g;
-  let m;
-  while ((m = callRe.exec(text))) {
-    const name = m[1];
-    const start = m.index + m[0].length; // just past the args' opening brace
-    let end = start + 500; // same clip as entryToText
-    for (const sep of [' | [call]', ' | [result', '\n']) {
-      const i = text.indexOf(sep, start);
-      if (i !== -1 && i < end) end = i;
-    }
-    const win = text.slice(start, end);
-    for (const f of win.matchAll(/"file_path"\s*:\s*"([^"\\]+)"/g)) {
-      touched.add(f[1]);
-      if (name === 'edit' || name === 'write_file') edited.add(f[1]);
-    }
-  }
-  return { touched, edited };
-}
-
-/**
- * True when a cited path (basename or project-relative, per the QWEN.md
- * citation convention) refers to an absolute tool-call path: exact match,
- * path-suffix, or basename match. The basename fallback keeps the ghost
- * detector conservative — an over-match under-flags, never false-flags.
- * @param {string} cited - the citation from a state item
- * @param {string} absPath - a tool-call file path
- * @returns {boolean}
- */
-function pathRefersTo(cited, absPath) {
-  if (!cited || !absPath) return false;
-  if (cited === absPath) return true;
-  if (absPath.endsWith('/' + cited)) return true;
-  return cited.split('/').pop() === absPath.split('/').pop();
-}
-
-/**
- * Update the hypothesis age stamps (sigma.hypo_stamps: item → first-seen
- * turn_count) after a merge and report the items that have now aged
- * HYPO_PENDING_TURNS turns without leaving the list — the mechanical proxy
- * for "repeatedly unverified". Stamps are hook-internal bookkeeping (same
- category as kv_state / evict_processed_keys). Must run inside the locked
- * read-modify-write (it mutates sigma in place).
- * @param {object} sigma - the merged Σ (mutated in place)
- * @param {number} turn - the current turn_count
- * @returns {Array<{item: string, pending_since: number, turns: number}>} the aged items
- */
-function updateHypoStamps(sigma, turn) {
-  const t = Number.isFinite(turn) ? turn : 0;
-  const list = Array.isArray(sigma.hypothesis) ? sigma.hypothesis : [];
-  const prev = (typeof sigma.hypo_stamps === 'object' && sigma.hypo_stamps !== null && !Array.isArray(sigma.hypo_stamps))
-    ? sigma.hypo_stamps : {};
-  const stamps = {};
-  const aged = [];
-  for (const item of list) {
-    if (typeof item !== 'string' || !item) continue;
-    const first = Number(prev[item]);
-    stamps[item] = Number.isFinite(first) ? first : t;
-    const turns = t - stamps[item];
-    if (turns >= HYPO_PENDING_TURNS) aged.push({ item, pending_since: stamps[item], turns });
-  }
-  sigma.hypo_stamps = stamps;
-  return aged;
-}
-
 /**
  * Scrub a loaded Σ's content sections of foreign-session state refs (in
  * place). Presentation-time gate: covers Σ files written before
@@ -1350,125 +1246,6 @@ function extractJsonPatch(text) {
   return null;
 }
 
-// ─── work_memory dual-write ───────────────────────────────────────────────
-
-/**
- * Deterministic point ID for a session's state_checkpoint — Qdrant accepts
- * only positive ints or UUIDs, so the sha256 of a session-scoped key is
- * formatted as a UUID (8-4-4-4-12). Per-Stop extraction would otherwise
- * create a fresh near-identical work_memory point every turn (flooding);
- * with a stable ID each session owns exactly one checkpoint point that is
- * upserted in place.
- * @param {string} sessionId
- * @returns {string} UUID-formatted point ID
- */
-function checkpointId(sessionId) {
-  const h = crypto.createHash('sha256').update(`state_checkpoint:${sessionId}`).digest('hex');
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
-}
-
-/**
- * Embed text via the local BGE server.
- * @param {string} text
- * @returns {Promise<number[]|null>}
- */
-async function embedText(text) {
-  const url = env('BGE_URL', 'http://127.0.0.1:8080/v1/embeddings');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'bge-m3', input: text }),
-      signal: controller.signal,
-    });
-    if (res.status !== 200) return null;
-    const data = await res.json();
-    if (data.data && Array.isArray(data.data) && data.data[0]) return data.data[0].embedding;
-    if (data.embedding) return data.embedding;
-    return null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Persist a Σ snapshot to the work_memory collection (type "state_checkpoint")
- * so future sessions can auto-recall the last known execution state.
- * Best-effort — any failure is swallowed (the Σ file is the source of truth).
- * @param {object} sigma
- * @param {string} [cwd]
- * @param {string} [trigger]
- * @returns {Promise<boolean>} true when the point was upserted
- */
-// One-line human summary of a Σ for the work_memory checkpoint. Prefers the
-// first outstanding step (the actionable part); falls back to a confirmed
-// fact, then the legacy task_summary.
-function checkpointSummaryLine(sigma) {
-  const next = Array.isArray(sigma.next) ? sigma.next.find((x) => typeof x === 'string' && x.trim()) : null;
-  if (next) return next;
-  const confirmed = Array.isArray(sigma.confirmed) ? sigma.confirmed.find((x) => typeof x === 'string' && x.trim()) : null;
-  if (confirmed) return confirmed;
-  return sigma.task_summary || '(no state)';
-}
-
-// Distinct file paths cited in Σ — file:line refs from confirmed items first
-// (the new schema), legacy files_touched as fallback.
-function checkpointRelatedFiles(sigma) {
-  const out = [];
-  const push = (f) => { if (f && !out.includes(f)) out.push(f); };
-  const refRe = /([A-Za-z0-9._\-/]+\.\w+):(\d+)/g;
-  for (const item of Array.isArray(sigma.confirmed) ? sigma.confirmed : []) {
-    for (const m of String(item).matchAll(refRe)) push(m[1]);
-  }
-  for (const f of Array.isArray(sigma.files_touched) ? sigma.files_touched : []) push(f);
-  return out.slice(-MAX_LIST_ITEMS);
-}
-
-async function recordCheckpoint(sigma, cwd, trigger) {
-  const qdrantUrl = env('QDRANT_URL', 'http://127.0.0.1:6333').replace(/\/$/, '');
-  const summary = `SKILL.state checkpoint [${trigger || 'compact'}]: ${checkpointSummaryLine(sigma)}`;
-  const vector = await embedText(summary);
-  if (!vector) return false;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
-  try {
-    // PUT, not POST: this Qdrant build treats POST /points as a different
-    // endpoint ("missing field `ids`"); PUT is the upsert method here.
-    const res = await fetch(`${qdrantUrl}/collections/work_memory/points`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        points: [
-          {
-            // Stable per-session ID: one upserted point, not one per extraction
-            id: sigma.session_id ? checkpointId(sigma.session_id) : crypto.randomUUID(),
-            vector,
-            payload: {
-              type: 'state_checkpoint',
-              project: cwd ? path.basename(cwd) : '',
-              summary_text: summary,
-              detail: JSON.stringify(sigma),
-              related_files: checkpointRelatedFiles(sigma),
-              status: 'open',
-              timestamp: new Date().toISOString(),
-            },
-          },
-        ],
-      }),
-      signal: controller.signal,
-    });
-    return res.status === 200 || res.status === 201 || res.status === 204;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 /**
  * Emit a hook JSON output on stdout.
  * @param {object} hookSpecificOutput
@@ -1580,20 +1357,14 @@ module.exports = {
   SCHEMA_KEYS,
   digestTranscript,
   renderAnchor,
-  checkpointId,
   extractTranscriptTail,
   extractTranscriptDelta,
   extractLastUserMessage,
   buildExtractionPrompt,
   callSummaryLLM,
   extractJsonPatch,
-  recordCheckpoint,
   emitHookOutput,
   appendTelemetry,
-  citedFiles,
-  segmentCallFiles,
-  pathRefersTo,
-  updateHypoStamps,
   anchorDoneGateAction,
   nextOverlapRatio,
 };

@@ -14,6 +14,7 @@ import fs from "fs/promises";
 import { createWriteStream } from "fs";
 import path from "path";
 import { randomUUID } from "node:crypto";
+import { execSync } from "node:child_process";
 import hookState from "./hooks/lib/state.js";
 import skillState from "./hooks/lib/skillstate.js";
 import kvOffload from "./hooks/lib/kvoffload.js";
@@ -53,6 +54,17 @@ function log(...args) {
   if (logStream) logStream.write(line);
 }
 const BGE_URL = process.env.BGE_URL || "http://127.0.0.1:8080/v1/embeddings";
+const SUMMARY_LLM_URL = process.env.SUMMARY_LLM_URL || "http://127.0.0.1:8081/v1/chat/completions";
+const MAIN_LLM_URL = process.env.MAIN_LLM || SUMMARY_LLM_URL;
+
+// Code hash — the git HEAD of this checkout, so the dashboard can show which
+// version of the code is serving. Fixed for the process lifetime; "unknown"
+// outside a git checkout.
+let CODE_HASH = "unknown";
+try {
+  CODE_HASH =
+    execSync("git rev-parse --short=8 HEAD", { cwd: __dirname, timeout: 2000, stdio: ["ignore", "pipe", "ignore"] }).toString().trim() || "unknown";
+} catch {}
 
 const QDRANT_TIMEOUT_MS = parseInt(process.env.QDRANT_TIMEOUT_MS || "10000", 10);
 const MEILI_TIMEOUT_MS = parseInt(process.env.MEILI_TIMEOUT_MS || "8000", 10);
@@ -60,6 +72,75 @@ const MEILI_TIMEOUT_MS = parseInt(process.env.MEILI_TIMEOUT_MS || "8000", 10);
 const qdrant = new QdrantClient({ url: QDRANT_URL, timeout: QDRANT_TIMEOUT_MS });
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Resolve a decision reference to a full UUID.
+ *
+ * Accepts, in order: a full UUID (normalized to lowercase), a hyphenless
+ * 32-hex UUID, a >=6-char hex prefix of a stored decision id, or a topic_key
+ * (newest active decision on that topic, else newest overall). Decision
+ * references are the input class that silently breaks the causal chain when
+ * truncated (a stored short id never matches its reverse link), so every
+ * single-id entry point (supersedes, forget, trace anchor) resolves through
+ * here instead of validating UUID shape only.
+ * @param {string} input raw reference from the caller
+ * @returns {Promise<{id:string, note:string, error:string}>} id: resolved UUID
+ *   ("" on failure), note: how a non-UUID input was resolved ("" when the
+ *   input was already a usable UUID), error: failure reason ("" when id set)
+ */
+async function resolveDecisionRef(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return { id: "", note: "", error: "empty reference" };
+  if (UUID_RE.test(raw)) return { id: raw.toLowerCase(), note: "", error: "" };
+  const compact = raw.replace(/-/g, "");
+  if (/^[0-9a-f]{32}$/i.test(compact)) {
+    return {
+      id: `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`,
+      note: "",
+      error: "",
+    };
+  }
+  const isHex = /^[0-9a-f]{6,}$/i.test(raw);
+  let points;
+  try {
+    points = [];
+    let offset = null;
+    do {
+      const req = { limit: 1000, with_payload: ["decision_id", "topic_key", "status", "created_at"] };
+      if (offset) req.offset = offset;
+      const res = await withTimeout(qdrant.scroll("decision_chains", req), QDRANT_TIMEOUT_MS, "decision_chains.scroll");
+      points.push(...res.points);
+      offset = res.next_page_offset ?? null;
+    } while (offset);
+  } catch (err) {
+    return { id: "", note: "", error: `lookup failed: ${err.message}` };
+  }
+  if (isHex) {
+    const pfx = raw.toLowerCase();
+    const hits = points.filter((p) => String(p.id).toLowerCase().startsWith(pfx));
+    if (hits.length === 1) return { id: String(hits[0].id), note: `resolved prefix "${raw}"`, error: "" };
+    if (hits.length > 1) {
+      return {
+        id: "",
+        note: "",
+        error: `prefix "${raw}" matches ${hits.length} decisions (${hits.map((h) => `${String(h.id).slice(0, 8)}: ${h.payload.topic_key || "?"}`).join(", ")}) — pass the full decision_id`,
+      };
+    }
+  }
+  const byTopic = points.filter((p) => p.payload.topic_key === raw);
+  if (byTopic.length) {
+    const active = byTopic.filter((p) => p.payload.status === "active");
+    const pool = (active.length ? active : byTopic).sort((a, b) =>
+      String(b.payload.created_at).localeCompare(String(a.payload.created_at))
+    );
+    return {
+      id: String(pool[0].id),
+      note: `resolved topic_key "${raw}" (newest ${active.length ? "active " : ""}of ${byTopic.length})`,
+      error: "",
+    };
+  }
+  return { id: "", note: "", error: `no decision matches "${raw}" (not a UUID, a known prefix, or a topic_key)` };
+}
 
 /**
  * Promise.race-based timeout wrapper.
@@ -832,13 +913,23 @@ server.registerTool(
       type: z.enum(["decision", "bug_resolved", "todo"]).default("decision"),
       related_files: z.array(z.string()).optional().default([]),
       topic_key: z.string().optional().default("").describe("Key that groups decisions on the same topic (e.g. discount_threshold). Auto-inferred if empty."),
-      supersedes: z.string().optional().default("").describe("decision_id of a previous decision this replaces"),
+      supersedes: z.string().optional().default("").describe("decision_id of a previous decision this replaces (full UUID, hex prefix, or topic_key)"),
       caused_by: z.array(z.string()).optional().default([]).describe("Decision IDs or event IDs that triggered this decision"),
     },
   },
   async ({ summary_text, detail, reasoning, project, type, related_files, topic_key, supersedes, caused_by }) => {
-    if (supersedes && !UUID_RE.test(supersedes)) {
-      return { content: [{ type: "text", text: `Invalid supersedes id "${supersedes}" — expected a full UUID. A truncated id would be stored and break the reverse link. Re-run with the full decision_id.` }], isError: true };
+    // Resolve supersedes (full UUID / hex prefix / topic_key) — a truncated
+    // id stored as-is would break the reverse link and the chain walk.
+    let supersedesNote = "";
+    if (supersedes) {
+      const res = await resolveDecisionRef(supersedes);
+      if (!res.id) {
+        return { content: [{ type: "text", text: `Invalid supersedes reference "${supersedes}": ${res.error}` }], isError: true };
+      }
+      if (res.id !== supersedes) {
+        supersedes = res.id;
+        supersedesNote = res.note ? ` [${res.note}]` : "";
+      }
     }
     // Save to work_memory (backward compatible)
     const vector = await embed(summary_text);
@@ -959,7 +1050,7 @@ server.registerTool(
       return { content: [{ type: "text", text: `Nothing saved: embedding unavailable for both summary and chain content — no records were written.` }], isError: true };
     }
     const autoNote = effectiveSupersedes && !supersedes ? ` (auto-superseded ${effectiveSupersedes.slice(0, 8)})` : "";
-    return { content: [{ type: "text", text: `Saved successfully. decision_id: ${decision_id}, topic_key: ${resolvedTopic}${autoNote}` }] };
+    return { content: [{ type: "text", text: `Saved successfully. decision_id: ${decision_id}, topic_key: ${resolvedTopic}${autoNote}${supersedesNote}` }] };
   }
 );
 
@@ -1060,13 +1151,22 @@ server.registerTool(
       "Reconstruct the full causal chain of decisions for a given topic or decision ID. Returns the timeline of how and why decisions evolved (no SUMMARY_LLM summarization — structure preserved as-is).",
     inputSchema: {
       query: z.string().optional().default("").describe("Natural language query, e.g. 'discount_threshold logic'"),
-      decision_id: z.string().optional().default("").describe("Start from a specific decision ID (alternative to query)"),
+      decision_id: z.string().optional().default("").describe("Start from a specific decision ID — full UUID, hex prefix, or topic_key (alternative to query)"),
       direction: z.enum(["backward", "forward", "both"]).default("both").describe("Traversal direction along the chain"),
     },
   },
   async ({ query, decision_id, direction }) => {
     // Find anchor node
     let anchor = decision_id || null;
+    // Resolve a non-UUID decision_id (hex prefix / topic_key) — a truncated
+    // id would silently match nothing and report "no decisions".
+    if (anchor && !UUID_RE.test(anchor)) {
+      const res = await resolveDecisionRef(anchor);
+      if (!res.id) {
+        return { content: [{ type: "text", text: `Invalid decision_id "${anchor}": ${res.error}` }], isError: true };
+      }
+      anchor = res.id;
+    }
 
     // 1) Exact topic_key match first — vector search alone misses when the query
     //    is the literal topic_key (e.g. "mysql_account_unification").
@@ -1117,23 +1217,32 @@ server.registerTool(
     description:
       "Delete a decision record by decision_id from decision_chains, and optionally the matching work_memory record(s) with identical summary text. Use to clean up duplicate or incorrect records.",
     inputSchema: {
-      decision_id: z.string().describe("Full UUID of the decision to delete"),
+      decision_id: z.string().describe("Decision to delete — full UUID, hex prefix, or topic_key"),
       work_memory_too: z.boolean().optional().default(true).describe("Also delete work_memory records with the identical summary text"),
     },
   },
   async ({ decision_id, work_memory_too }) => {
-    if (!UUID_RE.test(decision_id)) {
-      return { content: [{ type: "text", text: `Invalid decision_id "${decision_id}" — expected a full UUID.` }], isError: true };
+    // Resolve the reference (full UUID / hex prefix / topic_key) before the
+    // point lookup — a truncated id would match nothing.
+    let target = decision_id;
+    let resolveNote = "";
+    if (!UUID_RE.test(target)) {
+      const res = await resolveDecisionRef(target);
+      if (!res.id) {
+        return { content: [{ type: "text", text: `Invalid decision_id "${target}": ${res.error}` }], isError: true };
+      }
+      target = res.id;
+      resolveNote = res.note ? ` (${res.note})` : "";
     }
     const found = await qdrant.scroll("decision_chains", {
-      filter: { must: [{ key: "decision_id", match: { value: decision_id } }] },
+      filter: { must: [{ key: "decision_id", match: { value: target } }] },
       limit: 1,
       with_payload: ["content"],
     });
     if (!found.points.length) {
-      return { content: [{ type: "text", text: `No decision found with id ${decision_id}.` }] };
+      return { content: [{ type: "text", text: `No decision found with id ${target}.` }] };
     }
-    await qdrant.delete("decision_chains", { points: [decision_id] });
+    await qdrant.delete("decision_chains", { points: [target] });
     let wmDeleted = 0;
     if (work_memory_too) {
       const summary = found.points[0].payload.content || "";
@@ -1149,8 +1258,8 @@ server.registerTool(
         }
       }
     }
-    log(`[forget_decision] deleted ${decision_id} (+${wmDeleted} work_memory)`);
-    return { content: [{ type: "text", text: `Deleted decision ${decision_id} (+${wmDeleted} work_memory record(s)).` }] };
+    log(`[forget_decision] deleted ${target} (+${wmDeleted} work_memory)`);
+    return { content: [{ type: "text", text: `Deleted decision ${target} (+${wmDeleted} work_memory record(s)).${resolveNote}` }] };
   }
 );
 
@@ -2098,9 +2207,11 @@ function getTitleFromPayload(payload) {
 // ─── DA (Declarative Attention) marker injection ────────────────────────────
 // Gate: FOCUSMEMORY_DA=on. With 2+ search entries, the top entries are
 // wrapped in [[da:N]] markers + a [[da:filler]] instruction + a
-// [[da:layout:N]] footer, appended at the prompt tail so the llama.cpp server
-// (--da-prompt-scan) recovers the chunk layout from the rendered prompt and
-// the model's <focus magic_chunks="N"> tag drives the attention restriction.
+// [[da:layout:N]] footer, appended at the prompt tail for the marker path —
+// the llama.cpp server scans them only with --da-prompt-scan (test-only;
+// production runs --da-auto, where the server re-chunks the prompt itself
+// and these markers pass through unscanned). The model's
+// <focus magic_chunks="N"> tag drives the attention restriction.
 // Square brackets, not angle brackets: the hook text passes through
 // markdown/HTML escaping before it reaches the server, which mangles
 // <da:N> (DA then fails open). The server accepts both forms.
@@ -2271,8 +2382,9 @@ httpApp.post("/v1/context/search", async (c) => {
     log(`[Hook /v1/context/search] turn state stamp failed: ${err.message}`);
   }
 
-  // DA marker block: gate + 2+ entries. Appended at the prompt tail so the
-  // server's --da-prompt-scan sees it as the current turn's layout block.
+  // DA marker block: gate + 2+ entries. Appended at the prompt tail for the
+  // marker path (scanned only by a server running --da-prompt-scan, test-only;
+  // production runs --da-auto, which re-chunks the prompt itself).
   if (DA_ENABLED && allResults.length >= 2) {
     try {
       const entries = sliced.slice(0, DA_MAX_ENTRIES);
@@ -2534,6 +2646,28 @@ async function collectDashboardStats() {
 
   stats.system.node_version = process.version;
   stats.system.uptime = `${Math.floor(process.uptime() / 60)}m`;
+  stats.system.code_hash = CODE_HASH;
+
+  // LLM reachability — cheap GET /models probe, parallel, 4s cap. The dashboard
+  // auto-refreshes /api/stats every 30s, so this must stay far lighter than the
+  // generation ping in testConnections. Any HTTP answer = the process is up.
+  const probeLlm = async (url) => {
+    const modelsUrl = url.replace(/\/(chat\/)?completions$/, "/models");
+    const t0 = Date.now();
+    try {
+      const res = await fetch(modelsUrl, { signal: AbortSignal.timeout(4000) });
+      return { ok: true, ms: Date.now() - t0, http: res.status, url: modelsUrl };
+    } catch (err) {
+      return { ok: false, ms: Date.now() - t0, error: err.message, url: modelsUrl };
+    }
+  };
+  const llmTargets = [["summary", SUMMARY_LLM_URL]];
+  if (MAIN_LLM_URL !== SUMMARY_LLM_URL) llmTargets.push(["main", MAIN_LLM_URL]);
+  stats.llm = Object.fromEntries(await Promise.all(llmTargets.map(async ([name, url]) => [name, await probeLlm(url)])));
+  if (MAIN_LLM_URL === SUMMARY_LLM_URL) stats.llm.main = { ...stats.llm.summary, shared: true };
+
+  // Config mismatch — .env edited after MCP start (restart fields still stale).
+  stats.config_mismatch = await fmConfig.getEnvMismatch();
 
   return stats;
 }
