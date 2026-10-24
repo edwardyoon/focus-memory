@@ -2587,7 +2587,6 @@ httpApp.get("/api/gate-stats", async (c) => {
 // ─── Dashboard API: /api/skillstate (SKILL.state Σ viewer) ───
 
 const SKILLSTATE_TELEMETRY_HOOKS = new Set([
-  "stop-checkpoint-state",
   "precompact-extract-state",
   "userprompt-inject-state",
   "sessionstart-inject-state",
@@ -2635,11 +2634,9 @@ async function readSkillStateStats() {
 
   // Telemetry — same JSONL as gate-stats, filtered to the skillstate hooks
   const activity = {
-    checkpoints: { "state-change": 0, "context-growth": 0, no_trigger: 0 },
     extracted: 0,
     extract_failed: 0,
     worker_error: 0,
-    anchor_injected: 0,
     reinjected: 0,
     last_event_ts: null,
   };
@@ -2652,32 +2649,22 @@ async function readSkillStateStats() {
         try { e = JSON.parse(line); } catch { continue; }
         if (!SKILLSTATE_TELEMETRY_HOOKS.has(e.hook)) continue;
         if (!activity.last_event_ts || e.ts > activity.last_event_ts) activity.last_event_ts = e.ts;
-        if (e.hook === "stop-checkpoint-state") {
-          if (e.event === "checkpoint") {
-            activity.checkpoints[e.trigger === "context-growth" ? "context-growth" : "state-change"]++;
-          } else if (e.event === "no_trigger") {
-            activity.checkpoints.no_trigger++;
-          }
-        } else if (e.hook === "precompact-extract-state") {
+        if (e.hook === "precompact-extract-state") {
           if (e.event === "extracted") activity.extracted++;
           else if (e.event === "extract_failed") activity.extract_failed++;
           else if (e.event === "worker_error") activity.worker_error++;
-        } else if (e.hook === "userprompt-inject-state") {
-          if (e.event === "anchor_injected") activity.anchor_injected++;
         } else if (e.hook === "sessionstart-inject-state") {
           if (e.event === "injected") activity.reinjected++;
         }
         const kTokens = Math.round((e.input_tokens || 0) / 1000);
         const detail =
-          e.hook === "stop-checkpoint-state"
-            ? `${e.event === "checkpoint" ? `trigger=${e.trigger}` : ""}${e.input_tokens ? `, ${kTokens}k tokens` : ""}`.replace(/^, /, "")
-            : e.hook === "precompact-extract-state"
-              ? e.event === "extracted"
-                ? `trigger=${e.trigger}, keys=${(e.keys || []).length}`
-                : e.error || e.trigger || ""
-              : e.hook === "sessionstart-inject-state"
-                ? `compact_count=${e.compact_count}`
-                : e.input_tokens ? `${kTokens}k tokens` : "";
+          e.hook === "precompact-extract-state"
+            ? e.event === "extracted"
+              ? `trigger=${e.trigger}, keys=${(e.keys || []).length}`
+              : e.error || e.trigger || ""
+            : e.hook === "sessionstart-inject-state"
+              ? `compact_count=${e.compact_count}`
+              : e.input_tokens ? `${kTokens}k tokens` : "";
         recentEvents.push({ ts: e.ts, session: e.session_id ? String(e.session_id).slice(0, 8) : "", event: e.event, detail });
       }
     }

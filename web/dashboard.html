@@ -1021,37 +1021,12 @@ function renderSkillState(data) {
   }
 
   const a = data.activity || {};
-  const ck = a.checkpoints || {};
   const sessions = data.sessions || [];
   const lastTs = a.last_event_ts ? new Date(a.last_event_ts).toLocaleString() : '-';
   const redIf = (n) => (n ? ' style="color:var(--red)"' : '');
 
   let html = `
   <div class="grid" style="margin-bottom:16px">
-    <div class="card">
-      <div class="card-header">
-        <span class="card-name">Checkpoints (Stop)</span>
-        <span class="card-tag vector">Σ</span>
-      </div>
-      <div class="card-stats">
-        <div class="stat">
-          <div class="stat-label">State-change</div>
-          <div class="stat-value accent">${ck['state-change'] || 0}</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">Context-growth</div>
-          <div class="stat-value">${ck['context-growth'] || 0}</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">No Trigger</div>
-          <div class="stat-value">${ck.no_trigger || 0}</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">Last Event</div>
-          <div class="stat-value" style="font-size:13px">${esc(lastTs)}</div>
-        </div>
-      </div>
-    </div>
     <div class="card">
       <div class="card-header">
         <span class="card-name">Extraction (LLM)</span>
@@ -1074,18 +1049,18 @@ function renderSkillState(data) {
           <div class="stat-label">Re-injected</div>
           <div class="stat-value">${a.reinjected || 0}</div>
         </div>
+        <div class="stat">
+          <div class="stat-label">Last Event</div>
+          <div class="stat-value" style="font-size:13px">${esc(lastTs)}</div>
+        </div>
       </div>
     </div>
     <div class="card">
       <div class="card-header">
-        <span class="card-name">Anchor Injection</span>
-        <span class="card-tag fulltext">Per-turn</span>
+        <span class="card-name">Σ Sessions</span>
+        <span class="card-tag vector">Σ</span>
       </div>
       <div class="card-stats">
-        <div class="stat">
-          <div class="stat-label">Anchors Injected</div>
-          <div class="stat-value accent">${a.anchor_injected || 0}</div>
-        </div>
         <div class="stat">
           <div class="stat-label">Active Sessions</div>
           <div class="stat-value">${sessions.length}</div>

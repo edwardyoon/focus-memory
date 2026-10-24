@@ -46,44 +46,8 @@ const TAIL_MAX_CHARS = Math.max(BUDGET_CHARS, parseInt(process.env.FOCUSMEMORY_S
 const TAIL_MIN_USER = Math.max(1, parseInt(process.env.FOCUSMEMORY_SKILLSTATE_TAIL_MIN_USER || '2', 10) || 2);
 
 /**
- * Re-arm the Stop hook's extraction trigger after a failed or stale-skipped
- * extraction. The Stop hook CONSUMES the trigger before spawning (the
- * re-entrancy guard), so a worker that never merges would otherwise leave
- * the trigger permanently consumed: Σ freezes until the next mutating call
- * or user message — observed 2026-10-09, one successful extraction then
- * silence for the rest of the session while stale skips kept eating the
- * re-fired triggers.
- *
- * Restore the pre-spawn offsets ONLY if no newer Stop has re-consumed them
- * since this spawn (otherwise that newer worker already covers the retry).
- * PreCompact spawns carry no consumed offsets → no-op there.
- * @param {string} sessionId
- * @param {object} event - the spawn event (Stop spawns carry prev and consumed offset fields)
- */
-function rearmTrigger(sessionId, event) {
-  if (event.consumed_log_bytes === undefined || event.consumed_transcript_bytes === undefined) return;
-  try {
-    ss.mutateSigma(sessionId, (cur) => {
-      if (!cur) return cur;
-      if (Number(cur.last_extraction_log_bytes) !== Number(event.consumed_log_bytes) ||
-          Number(cur.last_extraction_transcript_bytes) !== Number(event.consumed_transcript_bytes)) {
-        return cur; // a newer Stop already re-consumed — its worker covers the retry
-      }
-      cur.last_extraction_log_bytes = event.prev_log_bytes;
-      cur.last_extraction_transcript_bytes = event.prev_transcript_bytes;
-      if (event.prev_checkpoint_tokens !== undefined) {
-        cur.last_checkpoint_tokens = event.prev_checkpoint_tokens;
-      }
-      return cur;
-    });
-  } catch {
-    // fail-open — worst case the trigger stays consumed (old behavior)
-  }
-}
-
-/**
  * Worker mode — the actual extraction (runs detached, no hook timeout).
- * @param {object} event - PreCompact/Stop event JSON
+ * @param {object} event - PreCompact event JSON
  * @returns {Promise<void>}
  */
 async function runWorker(event) {
@@ -91,23 +55,12 @@ async function runWorker(event) {
   if (!sessionId) return;
 
   // Delta extraction: send only the transcript content since the last
-  // extraction (usually one turn — seconds of prefill, not the 40-60s
-  // whole-tail calls that collided with the next user message and lost the
-  // trigger to the stale guard). Stop spawns carry the pre-spawn offset in
-  // the event; PreCompact spawns fall back to the state file's last
-  // offset. No offset at all (fresh session, first compaction) → full-tail
-  // read with the user-message guarantee.
+  // extraction — seconds of prefill, not the 40-60s whole-tail calls. The
+  // offset is the state file's last_extraction_transcript_bytes (written by
+  // the previous extraction's merge). No offset at all (fresh session,
+  // first compaction) → full-tail read with the user-message guarantee.
   const sigma = ss.loadSigma(sessionId);
-  // Stop spawns carry the pre-consumption offset explicitly — a fresh
-  // session's first Stop carries 0, which must mean "full-tail read". The
-  // old `Number(prev) || stateFile` chain treated 0 as absent and fell back
-  // to the state file, which the Stop hook had ALREADY consumed to the
-  // post-spawn offset → empty window → silent no-op (2026-10-09: every new
-  // session's first extraction was lost). PreCompact spawns omit the field
-  // → the state-file fallback stays for them.
-  const fromBytes = event.prev_transcript_bytes !== undefined
-    ? (Number(event.prev_transcript_bytes) || 0)
-    : (Number(sigma.last_extraction_transcript_bytes) || 0);
+  const fromBytes = Number(sigma.last_extraction_transcript_bytes) || 0;
   const sizeAtRead = (() => {
     try { return fs.statSync(event.transcript_path).size; } catch { return 0; }
   })();
@@ -129,11 +82,11 @@ async function runWorker(event) {
     return; // empty window or unreadable transcript — nothing to extract
   }
 
-  // Stale-worker guard: the transcript only grows after a Stop when the user
-  // starts the next turn. If it grew during the LLM call, a fresher worker
-  // will run on that next turn's Stop — merging this one-turn-old patch
+  // Stale-worker guard: the transcript grows when the user starts a new
+  // turn. If it grew during the LLM call, the next extraction (the next
+  // compaction) will see the newer content — merging this stale patch
   // (confirmed / next / anchor_revoked) would clobber the newer state, so
-  // skip the merge (and hand the trigger back — rearmTrigger below).
+  // skip the merge.
 
   const rawOutput = await ss.callSummaryLLM(ss.buildExtractionPrompt(sigma, transcriptText, sessionId), LLM_TIMEOUT_MS);
 
@@ -147,14 +100,12 @@ async function runWorker(event) {
       event: 'extract_stale_skipped',
       trigger: event.trigger,
     });
-    rearmTrigger(sessionId, event); // trigger was consumed before spawn — hand it back
     return;
   }
 
   const rawPatch = ss.extractJsonPatch(rawOutput);
   if (!rawPatch || Object.keys(rawPatch).length === 0) {
     ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'extract_failed', trigger: event.trigger });
-    rearmTrigger(sessionId, event); // LLM failure — retry on the next Stop
     return; // fail-open — compaction proceeds without state
   }
 
@@ -193,9 +144,9 @@ async function runWorker(event) {
 
   // Merge inside one locked read-modify-write: the base Σ was loaded before
   // the LLM call, so a concurrent Stop hook may have updated bookkeeping
-  // keys (last_input_tokens, last_checkpoint_tokens, last_extraction_log
-  // bytes) during that window. Merging against a fresh read inside the lock
-  // is lost-update-safe without a post-hoc key re-copy.
+  // keys (last_input_tokens, turn_count, transcript_path,
+  // last_turn_completion_signal) during that window. Merging against a fresh
+  // read inside the lock is lost-update-safe without a post-hoc key re-copy.
   // Drift measurement (2026-10-19): the pre-merge confirmed list (stale
   // citation baseline) and the aged-hypothesis report are captured inside
   // the same locked RMW as the merge.
@@ -361,7 +312,6 @@ function main() {
         event: 'worker_error',
         error: String((err && err.message) || err),
       });
-      rearmTrigger(event.session_id || '', event);
     });
     return;
   }

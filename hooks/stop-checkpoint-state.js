@@ -1,158 +1,41 @@
 #!/usr/bin/env node
-// Stop hook — SKILL.state per-Stop state-change detection + context-growth
-// fallback checkpoint.
+// Stop hook — SKILL.state per-Stop bookkeeping.
 //
-// Runs at the end of every turn. Three independent extraction triggers:
-//   1. state change (primary): a mutating tool call (edit / write_file /
-//      remember_decision) was logged since the last extraction.
-//   2. context growth (fallback): input_tokens grew INTERVAL (default 50k)
-//      past the last extraction — covers semantic drift that involves no
-//      file change (decisions made in prose only).
-//   3. new user message (B2): a REAL user message (transcript entry type
-//      "user" with a text part; tool results are a separate entry type)
-//      arrived since the last extraction. Triggers 1-2 both miss prose-only
-//      turns — which is exactly where task changes and CANCELLATIONS arrive.
-//      2026-09-28 incident: the cancellation turn was prose-only, so Σ (and
-//      the pin-release flag derived from it) went stale while the pinned
-//      cancelled request kept steering the model. Cost: one detached
-//      extraction call per user message (no user-visible latency).
+// Records four fields into Σ on every Stop (gated by
+// FOCUSMEMORY_SKILLSTATE=on). No extraction, no model-facing output, no
+// telemetry:
+//   - last_input_tokens — the current context size (dashboard token display).
+//   - turn_count — one increment per Stop (hypothesis aging is measured in
+//     these turns).
+//   - transcript_path — the recent_work MCP tool resolves its caller session
+//     from QWEN_CODE_SESSION_ID alone and reads the transcript path from
+//     here; the hook is the only component that sees event.transcript_path
+//     reliably.
+//   - last_turn_completion_signal — whether this turn ended with a
+//     completion signal; the UserPromptSubmit hook flips anchor_completed
+//     mechanically on the next user message when this flag is set.
 //
-// Either trigger spawns the SAME detached Σ extraction worker PreCompact
-// uses (precompact-extract-state.js --worker) — zero user-facing latency,
-// warm checkpoints (a crash mid-session leaves a recent Σ on disk).
-//
-// Regardless of trigger, last_input_tokens is recorded every turn: the
-// UserPromptSubmit anchor hook (userprompt-inject-state.js) reads it as its
-// injection threshold, so it must track the current context size even on
-// turns where nothing is extracted.
+// The LLM extraction triggers (state change / context growth / new user
+// message), the server KV-state fetch, the offset management, and the
+// detached worker spawn were removed 2026-10-24. The per-Stop triggers
+// re-presented a lossy mid-work snapshot into Σ and fed the stale-anchor
+// loop. Extraction now runs only at the PreCompact boundary (the shared
+// detached worker) and on eviction PUTs (evictextract.js).
 //
 // Why Stop: it is the only existing qwen-code hook whose payload carries
-// contextUsage (input_tokens / context_limit / context_usage) — the token
-// signal needed to gate on context growth.
-//
-// Loop guard: when a trigger fires, last_checkpoint_tokens is set to the
-// current input_tokens (re-gating the growth trigger) and
-// last_extraction_log_bytes to the current tool-log size (re-basing the
-// state-change trigger), so a re-entrant Stop (or a stop-hook "continue"
-// loop) cannot re-fire on work that was already counted. We do NOT gate on
-// stop_hook_active (that field is hard-coded true on the messageBus Stop
-// path, so gating on it would disable the hook entirely).
+// contextUsage (input_tokens) — the token signal needed for the bookkeeping
+// above.
 //
 // Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, zero
 // behavior change). Fail-open: any error → silent exit 0; the session is
 // unaffected. Emits no hook output (non-interfering: does not block or steer).
-//
-// FOCUSMEMORY_STOP_EXTRACT=off (2026-10-23): kill-switch for the Stop hook's
-// LLM extraction ONLY. When a trigger fires, the detached worker is NOT
-// spawned and the trigger offsets are NOT consumed — so the trigger re-arms
-// when extraction is re-enabled (same consume-once-spawn invariant as the
-// 2026-10-09 re-arm fix; consuming here would freeze the trigger). The
-// per-turn bookkeeping (last_input_tokens, turn_count, kv_state,
-// last_turn_completion_signal) keeps running: the UserPromptSubmit anchor
-// threshold and the completion-signal flip depend on it. Default on — unset
-// or any other value = current behavior.
 
 const fs = require('fs');
-const path = require('path');
-const { spawn } = require('child_process');
 const ss = require('./lib/skillstate.js');
-const { STATE_DIR } = require('./lib/state.js');
-
-// Growth (tokens) since the last extraction that triggers the fallback.
-const INTERVAL = Math.max(1000, parseInt(process.env.FOCUSMEMORY_SKILLSTATE_CHECKPOINT_INTERVAL || '50000', 10) || 50000);
-
-// Kill-switch for the Stop hook's LLM extraction (header note): when true,
-// a fired trigger neither spawns the worker nor consumes its offsets.
-const STOP_EXTRACT_OFF = (process.env.FOCUSMEMORY_STOP_EXTRACT || '').trim().toLowerCase() === 'off';
 
 /**
- * Current size of the session's tool-call JSONL (0 when absent).
- * @param {string} sessionId
- * @returns {number}
- */
-function toolLogSize(sessionId) {
-  try {
-    return fs.statSync(path.join(STATE_DIR, `${sessionId}.jsonl`)).size;
-  } catch {
-    return 0;
-  }
-}
-
-/**
- * Current size of the session's transcript JSONL (0 when absent).
- * @param {string} transcriptPath
- * @returns {number}
- */
-function transcriptSize(transcriptPath) {
-  try {
-    return fs.statSync(transcriptPath).size;
-  } catch {
-    return 0;
-  }
-}
-
-// ─── Per-session KV state (focus-llama GET /kv_state) ────────────────────
-// The server exposes the session's KV accounting (logical/resident/offloaded/
-// evictions/buffer). We record it into Σ as HOOK-INTERNAL bookkeeping
-// (sigma.kv_state) — deliberately NOT a model-facing Σ schema field (it is not
-// in SCHEMA_KEYS, so the extraction worker's mergeSigma never touches it). It
-// feeds two later consumers: the injection block's `ctx:` line and the
-// "evictions increased" re-injection trigger.
-
-/**
- * Base URL of the focus-llama server hosting GET /kv_state: derived from
- * MAIN_LLM (strip the /v1/chat/completions or /v1/completions suffix) — the
- * session is served by that same server, so its per-session KV state lives
- * there. No separate config key.
- * @returns {string} base URL (no trailing slash) or '' when MAIN_LLM is unset
- */
-function kvStateBaseUrl() {
-  const main = (ss.env('MAIN_LLM', '') || '').trim();
-  if (!main) return '';
-  return main
-    .replace(/\/v1\/chat\/completions$/, '')
-    .replace(/\/v1\/completions$/, '')
-    .replace(/\/+$/, '');
-}
-
-/**
- * Fetch the server's per-session KV state. Returns the numeric fields
- * {logical, resident, offloaded, evictions, buffer} or null (fail-open): no
- * server configured, network error, timeout, non-200 (e.g. 404 unknown
- * session), or an unparseable / empty body. Never throws.
- * @param {string} sessionId - the hook event's session_id (== server `session=`)
- * @returns {Promise<Object<string,number>|null>}
- */
-async function fetchKvState(sessionId) {
-  const base = kvStateBaseUrl();
-  if (!base) return null;
-  const url = `${base}/kv_state?session=${encodeURIComponent(sessionId)}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 1500);
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    if (!res.ok) return null; // 404 (unknown session) or other — fail-open
-    const body = await res.json();
-    if (!body || typeof body !== 'object') return null;
-    const out = {};
-    for (const k of ['logical', 'resident', 'offloaded', 'evictions', 'buffer']) {
-      const v = Number(body[k]);
-      if (Number.isFinite(v)) out[k] = v;
-    }
-    return Object.keys(out).length ? out : null;
-  } catch {
-    return null; // network error / timeout — fail-open
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Stop hook entry — record last_input_tokens every turn; extract when a
- * state change was logged, the context grew INTERVAL past the last
- * extraction, or a real user message arrived since the last extraction.
- * Also records the server's per-session KV state (sigma.kv_state). Spawns the
- * shared detached worker and returns immediately.
+ * Stop hook entry — record the four per-Stop bookkeeping fields into Σ.
+ * No extraction, no model-facing output, no telemetry.
  * @returns {Promise<void>}
  */
 async function main() {
@@ -170,162 +53,37 @@ async function main() {
   const inputTokens = Number(event.input_tokens);
   if (!sessionId || !Number.isFinite(inputTokens) || inputTokens <= 0) return;
 
-  // Per-session KV state from the focus-llama server (fail-open, 1.5s cap).
-  // Recorded into Σ below as hook-internal bookkeeping (sigma.kv_state).
-  const kvState = await fetchKvState(sessionId);
-
-  // Token bookkeeping + trigger detection/consumption as ONE locked
-  // read-modify-write: this hook and the other Stop hooks (ghost-gate,
-  // turn-guard) run concurrently on the same event, and the old
-  // load→modify→save sequence let same-second saves clobber each other
-  // (lost update — observed 2026-09-28 disabling the ghost-gate loop guard).
-  let stateChanged = false;
-  let intervalHit = false;
-  let newUserMsg = false;
-  // Pre-consumption trigger offsets, handed to the worker so a failed or
-  // stale-skipped extraction can RE-ARM the trigger (the consume-before-
-  // spawn guard below made a lost trigger permanent — Σ froze for the rest
-  // of the session, observed 2026-10-09).
-  let prevLogBytes = 0;
-  let prevTranscriptBytes = 0;
-  let prevCheckpointTokens = 0;
-  let consumedLogBytes = 0;
-  let consumedTranscriptBytes = 0;
-
+  // Per-Stop bookkeeping as ONE locked read-modify-write: this hook and the
+  // other Stop hooks (ghost-gate, turn-guard) run concurrently on the same
+  // event, and the old load→modify→save sequence let same-second saves
+  // clobber each other (lost update — observed 2026-09-28 disabling the
+  // ghost-gate loop guard).
   ss.mutateSigma(sessionId, (sigma) => {
-    // Always: persist the current context size (anchor threshold input).
+    // Current context size (dashboard token display).
     sigma.last_input_tokens = inputTokens;
 
     // Turn counter (drift-stamp bookkeeping): one increment per Stop. The
     // hypothesis age stamps (hypo_stamps) are measured in these turns —
-    // hook-internal, like last_input_tokens (never merged from a patch).
+    // hook-internal (never merged from a patch).
     sigma.turn_count = (Number(sigma.turn_count) || 0) + 1;
 
-    // Transcript path bookkeeping (2026-10-23, recent_work MCP tool): the
-    // tool resolves its caller session from QWEN_CODE_SESSION_ID alone (no
-    // mtime fallback) and reads the transcript path from HERE — the hook is
-    // the only component that sees event.transcript_path reliably. Runs on
-    // every Stop like the other bookkeeping above (not gated by
-    // FOCUSMEMORY_STOP_EXTRACT; that gate only skips the worker spawn).
+    // Transcript path bookkeeping (recent_work MCP tool): the tool resolves
+    // its caller session from QWEN_CODE_SESSION_ID alone and reads the
+    // transcript path from here — the hook is the only component that sees
+    // event.transcript_path reliably.
     if (typeof event.transcript_path === 'string' && event.transcript_path) {
       sigma.transcript_path = event.transcript_path;
     }
 
-    // Hook-internal KV bookkeeping (separate from the model-facing Σ schema —
-    // not in SCHEMA_KEYS, so the extraction worker's merge never touches it).
-    // A failed/absent fetch leaves the previous snapshot untouched (fail-open).
-    if (kvState) sigma.kv_state = { ...kvState, ts: new Date().toISOString() };
-
-    // Completion-signal flag (2026-10-15 stale-anchor incident): the LLM
-    // anchor rule is one turn late — the FIRST turn after a completion runs
-    // with the stale anchor (the incident: a committed/pushed task resumed
-    // from a mid-turn re-presentation). Record whether THIS turn ended with
-    // a completion signal in the final assistant message; the UserPromptSubmit
-    // hook flips anchor_completed mechanically on the next user message when
-    // this flag is set. Every Stop rewrites the flag (false clears a stale
-    // one), so no separate consumption is needed here.
+    // Completion-signal flag (2026-10-15 stale-anchor incident): record
+    // whether THIS turn ended with a completion signal in the final
+    // assistant message; the UserPromptSubmit hook flips anchor_completed
+    // mechanically on the next user message when this flag is set. Every
+    // Stop rewrites the flag (false clears a stale one), so no separate
+    // consumption is needed here.
     sigma.last_turn_completion_signal = ss.completionSignal(String(event.last_assistant_message || ''));
 
-    // Pre-consumption offsets (for the worker's re-arm on failure).
-    prevLogBytes = Number(sigma.last_extraction_log_bytes) || 0;
-    prevTranscriptBytes = Number(sigma.last_extraction_transcript_bytes) || 0;
-    prevCheckpointTokens = Number(sigma.last_checkpoint_tokens) || 0;
-
-    // Trigger 1 — mechanical state change since the last extraction.
-    const lastOffset = prevLogBytes;
-    stateChanged = ss.hasMutatingCallsSince(sessionId, lastOffset);
-
-    // Trigger 2 — context growth fallback. Re-baseline when the context
-    // shrank (a compaction happened since), so the interval counts fresh.
-    let last = Number(sigma.last_checkpoint_tokens);
-    if (!Number.isFinite(last) || last < 0) last = 0;
-    if (inputTokens < last) last = inputTokens;
-    intervalHit = inputTokens - last >= INTERVAL;
-
-    // Trigger 3 — a real user message arrived since the last extraction
-    // (prose-only task changes / cancellations).
-    newUserMsg = ss.hasNewUserMessageSince(event.transcript_path, prevTranscriptBytes);
-
-    if ((stateChanged || intervalHit || newUserMsg) && !STOP_EXTRACT_OFF) {
-      // Consume the triggers before spawning (persist first) so a
-      // re-entrant Stop cannot re-fire: growth is re-gated by
-      // last_checkpoint_tokens, state change by the tool-log byte offset,
-      // user messages by the transcript byte offset. The worker gets both
-      // the prev and consumed values so it can hand the trigger back if it
-      // fails or is stale-skipped (re-arm). When STOP_EXTRACT_OFF the
-      // offsets are left untouched, so the trigger re-arms on re-enable.
-      sigma.last_checkpoint_tokens = inputTokens;
-      sigma.last_extraction_log_bytes = toolLogSize(sessionId);
-      sigma.last_extraction_transcript_bytes = transcriptSize(event.transcript_path);
-      consumedLogBytes = sigma.last_extraction_log_bytes;
-      consumedTranscriptBytes = sigma.last_extraction_transcript_bytes;
-    }
     return sigma;
-  });
-
-  if (!stateChanged && !intervalHit && !newUserMsg) {
-    ss.appendTelemetry({
-      ts: Date.now(),
-      session_id: sessionId,
-      hook: 'stop-checkpoint-state',
-      event: 'no_trigger',
-      input_tokens: inputTokens,
-    });
-    return;
-  }
-
-  if (STOP_EXTRACT_OFF) {
-    // A trigger fired but FOCUSMEMORY_STOP_EXTRACT=off: skip the spawn. The
-    // offsets were NOT consumed above, so the trigger re-arms when extraction
-    // is re-enabled (consuming here would freeze it — the 2026-10-09 bug).
-    // Bookkeeping (last_input_tokens, turn_count, kv_state, completion
-    // signal) already persisted in the locked RMW above.
-    ss.appendTelemetry({
-      ts: Date.now(),
-      session_id: sessionId,
-      hook: 'stop-checkpoint-state',
-      event: 'extract_skipped',
-      reason: 'flag',
-      trigger: stateChanged ? 'state-change' : intervalHit ? 'context-growth' : 'user-message',
-      input_tokens: inputTokens,
-    });
-    return;
-  }
-
-  try {
-    const child = spawn(
-      process.execPath,
-      [
-        path.join(__dirname, 'precompact-extract-state.js'),
-        '--worker',
-        JSON.stringify({
-          session_id: sessionId,
-          transcript_path: event.transcript_path,
-          cwd: event.cwd,
-          trigger: stateChanged ? 'stop-state-change' : 'stop-checkpoint',
-          // Delta extraction window + re-arm bookkeeping (see rearmTrigger
-          // in precompact-extract-state.js).
-          prev_log_bytes: prevLogBytes,
-          prev_transcript_bytes: prevTranscriptBytes,
-          prev_checkpoint_tokens: prevCheckpointTokens,
-          consumed_log_bytes: consumedLogBytes,
-          consumed_transcript_bytes: consumedTranscriptBytes,
-        }),
-      ],
-      { detached: true, stdio: 'ignore', env: process.env },
-    );
-    child.unref();
-  } catch (err) {
-    console.error(`[skillstate] checkpoint worker spawn failed: ${err.message}`);
-  }
-
-  ss.appendTelemetry({
-    ts: Date.now(),
-    session_id: sessionId,
-    hook: 'stop-checkpoint-state',
-    event: 'checkpoint',
-    trigger: stateChanged ? 'state-change' : intervalHit ? 'context-growth' : 'user-message',
-    input_tokens: inputTokens,
   });
 }
 

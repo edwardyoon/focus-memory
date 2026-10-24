@@ -339,104 +339,7 @@ function sweepSigma(maxAgeMs, prefix = null) {
   return removed;
 }
 
-// ─── Per-Stop state-change detection + anchor rendering ─────────────────
-
-// Tool calls that mechanically change execution state — their presence in
-// the tool-call JSONL since the last extraction is the primary per-Stop
-// trigger (prose-only turns rarely move state and must not pay an LLM call).
-const MUTATING_TOOLS = new Set(['edit', 'write_file', 'remember_decision']);
-
-/**
- * True when the session's tool-call JSONL (lib/state.js STATE_DIR) has a
- * mutating tool call appended after `fromBytes` bytes. The log is
- * append-only per session and rotated in place once over 512KB — a file
- * smaller than `fromBytes` was rotated, so the whole file counts as fresh.
- * A slice starting mid-line (concurrent append between stat and read) just
- * fails JSON.parse on that fragment and is skipped (fail-open: the 50k
- * context-growth fallback still fires when it matters).
- * @param {string} sessionId
- * @param {number} [fromBytes=0] byte offset of the last extraction
- * @returns {boolean}
- */
-function hasMutatingCallsSince(sessionId, fromBytes = 0) {
-  const file = path.join(STATE_DIR, `${sessionId}.jsonl`);
-  try {
-    const size = fs.statSync(file).size;
-    const offset = size < fromBytes ? 0 : fromBytes;
-    if (size <= offset) return false;
-    const len = Math.min(size - offset, 256 * 1024); // cap the per-Stop scan
-    const fd = fs.openSync(file, 'r');
-    try {
-      const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, size - len);
-      return buf.toString('utf8').split('\n').some((line) => {
-        if (!line) return false;
-        try {
-          return MUTATING_TOOLS.has(JSON.parse(line).tool);
-        } catch {
-          return false;
-        }
-      });
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Detect a new REAL user message in the transcript since the last extraction
- * (trigger 3 for the Stop hook). The transcript JSONL is append-only and keeps
- * its full history across compactions (qwen only appends a `chat_compression`
- * record), so a byte offset is a stable "since" marker. Real user messages are
- * entries with type "user" and a text part; tool results are a separate entry
- * type ("tool_result" with functionResponse parts), so they never count.
- *
- * Why: triggers 1 (mutating tool call) and 2 (50k context growth) both miss
- * prose-only turns — which is exactly where task changes and CANCELLATIONS
- * arrive. 2026-09-28 incident: the cancellation turn ("복구하라고 한적이
- * 없다") was prose-only, so Σ — and the pin-release flag derived from it —
- * went stale while the pinned cancelled request kept steering the model.
- * @param {string} transcriptPath
- * @param {number} [fromBytes=0] byte offset of the last extraction
- * @returns {boolean}
- */
-function hasNewUserMessageSince(transcriptPath, fromBytes = 0) {
-  if (!transcriptPath) return false;
-  try {
-    const size = fs.statSync(transcriptPath).size;
-    const offset = size < fromBytes ? 0 : fromBytes;
-    if (size <= offset) return false;
-    // Read the ENTIRE new region, not a tail window: the transcript is
-    // chronological, so the new user message sits at the START of the region
-    // (hasMutatingCallsSince may tail-scan because a mutation anywhere in the
-    // window counts — here only the head matters). The region is one turn:
-    // the offset re-baselines at every firing Stop, and every turn begins
-    // with a user message.
-    const len = size - offset;
-    const fd = fs.openSync(transcriptPath, 'r');
-    try {
-      const buf = Buffer.alloc(len);
-      fs.readSync(fd, buf, 0, len, offset);
-      return buf.toString('utf8').split('\n').some((line) => {
-        if (!line) return false;
-        try {
-          const e = JSON.parse(line);
-          if (e.type !== 'user') return false;
-          return Array.isArray(e.message && e.message.parts) &&
-            e.message.parts.some((p) => typeof p.text === 'string' && p.text.length > 0);
-        } catch {
-          return false;
-        }
-      });
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    return false;
-  }
-}
+// ─── Anchor rendering + transcript digest ──────────────────────────────
 
 /**
  * Rule-based digest of the recent transcript entries (recent_work MCP tool +
@@ -1675,8 +1578,6 @@ module.exports = {
   filterForeignSessionRefs,
   scrubSigmaForeignRefs,
   SCHEMA_KEYS,
-  hasMutatingCallsSince,
-  hasNewUserMessageSince,
   digestTranscript,
   renderAnchor,
   checkpointId,

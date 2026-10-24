@@ -32,7 +32,7 @@
         ]
       },
       {
-        "description": "SKILL.state — per-turn state anchor: when the context has grown past the token threshold, inject a compact one-line Σ 'where are we' reminder (no LLM call, millisecond-scale). Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
+        "description": "SKILL.state — per-prompt mechanical bookkeeping (no injection): scrubs foreign-session refs from Σ, flips the completion signal on task completion, releases the B4 pin, and resets the current view. No LLM call, millisecond-scale. Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
         "hooks": [
           {
             "type": "command",
@@ -113,7 +113,7 @@
         ]
       },
       {
-        "description": "SKILL.state — per-Stop checkpoint: records last_input_tokens every turn and spawns the detached Σ extraction worker when (1) a mutating tool call (edit/write_file/remember_decision) was logged since the last extraction, or (2) the context grew 50k+ past it (prose-only drift fallback). Warm checkpoints: fault tolerance + fresher state before compaction. Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
+        "description": "SKILL.state — per-Stop bookkeeping: records last_input_tokens, turn_count, transcript_path, and last_turn_completion_signal in a locked read-modify-write (no extraction, no worker spawn). Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
         "hooks": [
           {
             "type": "command",
@@ -152,7 +152,7 @@
         ]
       },
       {
-        "description": "SKILL.state — bump Σ.compact_count on every real compaction so the post-compaction anchor window (userprompt-inject-state.js) opens on the first turn after compaction. The SessionStart(source=compact) hook remains a deduped fallback (30s window in bumpCompactCount). Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
+        "description": "SKILL.state — bump Σ.compact_count on every real compaction (compaction bookkeeping; the SessionStart(source=compact) hook is the post-compaction Σ re-injection path, deduped via a 30s window in bumpCompactCount). Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
         "matcher": "*",
         "hooks": [
           {
