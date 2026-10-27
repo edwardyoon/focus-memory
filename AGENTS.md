@@ -152,7 +152,7 @@ Question received
 | `trace_decision_chain` | Full causal history of a decision | "Why was X built this way?" | search_work_memory + manual chain walk |
 | `search_work_memory` | Search past-session memory | "What did we do last time?" | — |
 | `search_project_facts` | Search docs/plans | "What's in the schema?" | — |
-| `remember_decision` | Write a decision to memory | Task complete with tests passing | — |
+| `remember_decision` | Write a decision/todo to memory | Task complete with tests passing; also: register & update multi-step task checklists (`type="todo"` + `topic_key` + `supersedes` — see Part E) | — |
 | `search_web` | Web search via local server | External knowledge needed | — |
 | `recent_work` | Live digest of the most recent actions in this session's transcript | You are unsure what you just did, or about to re-read a file you already examined | Re-reading files / re-running finished checks |
 
@@ -232,10 +232,31 @@ Call **once per completed task** when:
 - A bug root cause is identified and fixed
 - An architectural decision is made
 
-Do NOT call it on every file edit or intermediate step. Intermediate findings go in the Σ state (next/confirmed sections).
+Do NOT call it on every file edit or intermediate step. Intermediate findings go in the Σ state (next/confirmed sections). Todo-chain progress updates (Part E, `type="todo"`) are a separate mechanism and are exempt from this rule.
 
 Parameters:
 - `summary_text`: what was decided
 - `reasoning`: why (this is what makes chains useful)
 - `topic_key`: leave empty for auto-inference
 - `supersedes`: omit, auto-detection handles it
+
+---
+
+# Part E. Task Checklists (todo chain)
+
+Multi-step work (3+ steps) is tracked as a **decision chain**, not in a plans file or in conversation context. Conversation context dies with compaction; the chain does not. Losing the sequence mid-task is the classic failure this prevents.
+
+## Protocol
+
+1. **Register** when the plan is set:
+   `remember_decision(type="todo", topic_key="<task-slug, kebab-case>", summary_text="<task name>", detail="<full checklist>")`
+   Checklist format: `- [ ] step — verification (command / DB check)`. Every step names how it will be verified.
+2. **Update** on each completed item: a **new record** with the same `topic_key`, `supersedes=<previous record id>`, and the detail re-marked `- [x]` with the verification evidence (row counts, command output).
+3. **Current state** = the **latest record** for the topic_key. After compaction or in a new session, recover it via `search_work_memory` before acting.
+4. **Close**: when every item is `[x]`, register the final record, then write back per the Write-back rule (`decision` / `bug_resolved`).
+5. **Exception — plans file**: only when (a) the user explicitly asks for a plans file, (b) the work spans 3+ compaction segments, or (c) the planning document itself is a deliverable. Then keep the file's `[x]` current as you progress.
+
+## Red flags
+
+- Never keep the checklist in conversation context alone — it dies with compaction and sequence management is lost.
+- Never register an update record when nothing changed (no item completed).
