@@ -146,7 +146,8 @@ Question received
 │  → search_project_facts(query)
 │
 ├─ "What work was done last session?" / "Any open todos?"
-│  → search_work_memory(query)
+│  → search_work_memory(query)  (discovery: find a topic_key or past work)
+│  └─ topic_key known + need current chain state → trace_decision_chain(decision_id="<topic_key>")
 │
 └─ General question, no clear category
    → search_memory(query) (optional, auto-routes to the best backend)
@@ -162,8 +163,8 @@ Question received
 | `search_file_structure` | File name/path/keyword → filepath | You need to locate a file by name or path | glob + grep |
 | `get_context_bundle` | File + chunks + callers in one call | You're about to read_file + search separately | read_file + search_code + query_graph |
 | `trace_references` | Multi-hop caller/callee trace | You need dependency chains | Repeated query_graph calls |
-| `trace_decision_chain` | Full causal history of a decision | "Why was X built this way?" | search_work_memory + manual chain walk |
-| `search_work_memory` | Search past-session memory | "What did we do last time?" | — |
+| `trace_decision_chain` | Ordered decision chain with `superseded` / `← current` markers — **sole authority for "which record is latest" / current chain state** | "Why was X built this way?" / "What's the current state of task X's chain?" | search_work_memory + manual chain walk |
+| `search_work_memory` | Semantic search over past-session records — **discovery only** (find a topic_key, project/status filters, non-chain history). No current marker, equal scores → never for "latest record" | "What did we do last time?" / "Does a chain for X exist?" | — |
 | `search_project_facts` | Search docs/plans | "What's in the schema?" | — |
 | `remember_decision` | Write a decision/todo to memory | Task complete with tests passing; also: register & update multi-step task checklists (`type="todo"` + `topic_key` + `supersedes` — see Part E) | — |
 | `search_web` | Web search via local server | External knowledge needed | — |
