@@ -252,7 +252,9 @@ Multi-step work (3+ steps) is tracked as a **decision chain**, not in a plans fi
    `remember_decision(type="todo", topic_key="<task-slug, kebab-case>", summary_text="<task name>", detail="<full checklist>")`
    Checklist format: `- [ ] step — verification (command / DB check)`. Every step names how it will be verified.
 2. **Update** on each completed item: a **new record** with the same `topic_key`, `supersedes=<previous record id>`, and the detail re-marked `- [x]` with the verification evidence (row counts, command output).
-3. **Current state** = the **latest record** for the topic_key. After compaction or in a new session, recover it via `search_work_memory` before acting.
+3. **Current state** = the record `trace_decision_chain` marks `← current` for the topic_key. After compaction or in a new session, recover it via `trace_decision_chain(decision_id="<topic_key>")` **before acting** — it returns the full ordered chain with `superseded` / `← current` markers, so the latest record is unambiguous.
+   - `search_work_memory` is only a **discovery** fallback (find the topic_key, or confirm a chain exists). It ranks every record of a topic at equal score and carries **no current marker**, so never judge "which record is latest" from it.
+   - `recent_work` is a **different concern** — a live digest of this session's most recent actions, not a record of the chain's state. Do not substitute it for `trace_decision_chain` here.
 4. **Close**: when every item is `[x]`, register the final record, then write back per the Write-back rule (`decision` / `bug_resolved`).
 5. **Exception — plans file**: only when (a) the user explicitly asks for a plans file, (b) the work spans 3+ compaction segments, or (c) the planning document itself is a deliverable. Then keep the file's `[x]` current as you progress.
 
@@ -260,3 +262,4 @@ Multi-step work (3+ steps) is tracked as a **decision chain**, not in a plans fi
 
 - Never keep the checklist in conversation context alone — it dies with compaction and sequence management is lost.
 - Never register an update record when nothing changed (no item completed).
+- Never judge a todo chain's current state from `search_work_memory` (equal scores, no current marker) or `recent_work` (live digest, not chain state) — `trace_decision_chain` is the only authority for "which record is latest".
