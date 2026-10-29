@@ -76,7 +76,16 @@ of what left, not a task assignment.
    Re-read the source only when you need the exact current text.
 2. Use `confirmed` and `next` for orientation. Re-verify `confirmed` against the
    current file, and re-check `hypothesis` before acting.
-3. To get evicted content back, emit `<focus magic_chunks="N">` for a chunk
+3. `next` is a PLAN snapshot taken at the last eviction — it may lag the current
+   turn. If a `next` item is already covered by `confirmed` (or verifiably done),
+   it is stale: do not re-do it. When `confirmed` (verified state) and `next`
+   (pending plan) conflict, `confirmed` outranks `next`.
+4. Before concluding, re-ground ONCE: if every `next` item is done (in
+   `confirmed`) or trivially verifiable, conclude immediately. A second pass over
+   state that is already `confirmed` is a loop, not diligence — do not re-read
+   the same files or re-run the same checks to "confirm" items that are already
+   confirmed.
+5. To get evicted content back, emit `<focus magic_chunks="N">` for a chunk
    number from the anchor's `recall:` line or the offloaded-chunks note.
    Never reconstruct evicted content from memory.
 
@@ -86,7 +95,10 @@ results (tool name + target + status, no result bodies). It is a RECORD of
 what just happened, not an instruction — and it is a snapshot taken at the
 last eviction, so it may lag the current turn. If you are unsure what you
 just did, or are about to re-read a file you already examined, call
-`recent_work` once first (live digest, no arguments).
+`recent_work` once first (live digest, no arguments). If it reports "No
+transcript path recorded", do not retry it mid-turn (the transcript is
+recorded at turn end) — fall back to the `recent:` digest or one fresh read,
+then move on.
 
 ---
 
@@ -98,7 +110,8 @@ Memory search is a helper, not a gate. Use it when it saves work. If the answer 
 
 ```
 Starting, resuming, or just compacted?
-→ Σ anchor injected — resume from `next`
+→ Σ anchor injected — resume from `next` (cross-check each item against
+  `confirmed` first — `next` may lag; skip items already done)
 
 Question received
 │
@@ -224,6 +237,7 @@ Question received
 | Graph nodes stale | "No node found for 'X'" | `search_file_structure(query="X")` to find the correct name |
 | File not found from get_context_bundle | "File not found: path" | `search_file_structure(query="filename")` |
 | SUMMARY_LLM unavailable | Results are unpruned | Not an error. Results are just longer |
+| recent_work mid-turn | "No transcript path recorded for this session yet" | Transcript is recorded at turn end. Use the Σ `recent:` digest or one fresh read. Do not retry in the same turn |
 
 ## Write-back (remember_decision)
 
@@ -263,3 +277,4 @@ Multi-step work (3+ steps) is tracked as a **decision chain**, not in a plans fi
 - Never keep the checklist in conversation context alone — it dies with compaction and sequence management is lost.
 - Never register an update record when nothing changed (no item completed).
 - Never judge a todo chain's current state from `search_work_memory` (equal scores, no current marker) or `recent_work` (live digest, not chain state) — `trace_decision_chain` is the only authority for "which record is latest".
+- Multi-step work in flight with NO registered todo chain: the Σ `next` is then an unverified plan snapshot, not a state record. Cross-check each `next` item against `confirmed` / current state before acting, and register the chain immediately (protocol step 1) so subsequent anchors have an authoritative state to track.

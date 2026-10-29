@@ -45,6 +45,29 @@ const TAIL_MAX_CHARS = Math.max(BUDGET_CHARS, parseInt(process.env.FOCUSMEMORY_S
 const TAIL_MIN_USER = Math.max(1, parseInt(process.env.FOCUSMEMORY_SKILLSTATE_TAIL_MIN_USER || '2', 10) || 2);
 
 /**
+ * Topic scoping for the chain-derived next (2026-10-29 stale-next fix):
+ * the topic_keys this session ACTIVELY maintains — i.e. appears in its own
+ * remember_decision calls (the tool-call lines), not in search results or
+ * prose (a passive mention of another session's chain must not steer this
+ * one's Σ). Full-file scan: the worker is detached (no hook timeout) and
+ * transcripts stay in the low-MB range.
+ * @param {string} transcriptPath - the session transcript JSONL
+ * @returns {Set<string>} topic_keys (empty when the transcript is unreadable
+ *   or holds no remember_decision calls)
+ */
+function scanTranscriptTopics(transcriptPath) {
+  const topics = new Set();
+  try {
+    const raw = fs.readFileSync(transcriptPath, 'utf8');
+    for (const line of raw.split('\n')) {
+      if (!line.includes('remember_decision') || !line.includes('topic_key')) continue;
+      for (const m of line.matchAll(/"topic_key"\s*:\s*"([a-zA-Z0-9_-]+)"/g)) topics.add(m[1]);
+    }
+  } catch { /* unreadable transcript → no scoping → no chain override */ }
+  return topics;
+}
+
+/**
  * Worker mode — the actual extraction (runs detached, no hook timeout).
  * @param {object} event - PreCompact event JSON
  * @returns {Promise<void>}
@@ -87,7 +110,20 @@ async function runWorker(event) {
   // (confirmed / next / anchor_revoked) would clobber the newer state, so
   // skip the merge.
 
-  const rawOutput = await ss.callSummaryLLM(ss.buildExtractionPrompt(sigma, transcriptText, sessionId), LLM_TIMEOUT_MS);
+  // Chain-derived next (2026-10-29 stale-next fix): the DB checklist is the
+  // authoritative source for outstanding steps — fetch it BEFORE the LLM
+  // call so (1) the extractor prompt shows the real state and (2) the merge
+  // can override the LLM's re-derived `next` with the deterministic list
+  // even when the LLM output is empty or bad. Scoped to this session's own
+  // remember_decision topics; fail-open to [] (the LLM-derived next stands).
+  let todoChains = [];
+  try {
+    const topics = scanTranscriptTopics(event.transcript_path);
+    if (topics.size) todoChains = await ss.fetchOpenTodoChains([...topics]);
+  } catch { /* fail-open — LLM-derived next stands */ }
+
+  const rawOutput = await ss.callSummaryLLM(
+    ss.buildExtractionPrompt(sigma, transcriptText, sessionId, todoChains), LLM_TIMEOUT_MS);
 
   let sizeNow = 0;
   try { sizeNow = fs.statSync(event.transcript_path).size; } catch {}
@@ -104,15 +140,22 @@ async function runWorker(event) {
 
   const rawPatch = ss.extractJsonPatch(rawOutput);
   if (!rawPatch || Object.keys(rawPatch).length === 0) {
-    ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'extract_failed', trigger: event.trigger });
-    return; // fail-open — compaction proceeds without state
+    if (!todoChains.length) {
+      ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'extract_failed', trigger: event.trigger });
+      return; // fail-open — compaction proceeds without state
+    }
+    // LLM extraction failed but the chains are deterministic — land the
+    // chain-derived next alone (the stale-next fix must not depend on the
+    // LLM being up).
+    ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'extract_failed_chain_only', trigger: event.trigger });
   }
 
   // Anti-confabulation propagation gate: drop new items citing dated todos
   // files that do not exist on disk (2026-09-26 incident — a ghost citation
   // in assistant prose became a Σ pending item re-injected into later
   // sessions). Runs before the merge; existing Σ content is untouched.
-  const { patch, removed: ghostRemoved } = ss.filterGhostRefs(rawPatch, event.cwd);
+  // (rawPatch may be null when only the deterministic chain next is landing.)
+  const { patch, removed: ghostRemoved } = ss.filterGhostRefs(rawPatch || {}, event.cwd);
   if (ghostRemoved.length) {
     ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'ghost_refs_filtered', trigger: event.trigger, removed: ghostRemoved });
   }
@@ -123,6 +166,18 @@ async function runWorker(event) {
   const foreign = ss.filterForeignSessionRefs(patch, sessionId);
   if (foreign.removed.length) {
     ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'foreign_refs_filtered', trigger: event.trigger, removed: foreign.removed });
+  }
+  // Deterministic next (2026-10-29 stale-next fix): chains grounded in THIS
+  // transcript override the LLM's re-derivation — the incident was a
+  // finished task's steps lingering in Σ and re-latching the model after
+  // compaction. Unchecked steps in chain order; when every chain is done,
+  // next is cleared so the finished task's steps cannot linger. No grounded
+  // chains → the LLM's next stands (fail-open).
+  if (todoChains.length) {
+    const derived = [];
+    for (const t of todoChains) for (const step of t.unchecked) derived.push(step);
+    patch.next = derived.slice(0, 10);
+    ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'next_from_chains', trigger: event.trigger, chains: todoChains.length, steps: derived.length });
   }
   if (Object.keys(patch).length === 0) {
     ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'extract_empty_after_filter', trigger: event.trigger });
@@ -232,6 +287,7 @@ async function runWorker(event) {
     keys: Object.keys(patch),
     ...(nextStripped ? { next_stripped_anchor_done: true } : {}),
     ...(anchorReleased ? { anchor_released_new_task: true } : {}),
+    ...(todoChains.length ? { next_from_chains: todoChains.length } : {}),
   });
 }
 

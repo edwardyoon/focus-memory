@@ -2547,6 +2547,82 @@ httpApp.get("/v1/kv-offload/session", async (c) => {
   return c.json({ ok: true, session_id: sessionId, pin_released: pinReleased });
 });
 
+// Open todo chains for the precompact state worker (2026-10-29 stale-next
+// fix): Σ's `next` is derived DETERMINISTICALLY from the DB checklist instead
+// of the extractor LLM's re-derivation (incident: a finished task's steps
+// lingered in Σ and re-latched the model after compaction). Storage split:
+// work_memory holds the checklist detail (type=todo); decision_chains holds
+// the topic_key (content = summary_text is the join key — both records come
+// from the same remember_decision call). Per topic, the newest checklist
+// record wins. The caller scopes with ?topics= (topic_keys seen in THIS
+// session's transcript) so another session's chains never steer this one.
+httpApp.get("/v1/todo-chains", async (c) => {
+  const denied = kvAuth(c);
+  if (denied) return denied;
+  if (!skillState.skillStateEnabled()) return c.json({ error: "skillstate disabled" }, 404);
+  const topicsParam = c.req.query("topics") || "";
+  const topicSet = topicsParam ? new Set(topicsParam.split(",").map((t) => t.trim()).filter(Boolean)) : null;
+  try {
+    const todos = await qdrant.scroll("work_memory", {
+      filter: { must: [{ key: "type", match: { value: "todo" } }] },
+      limit: 100,
+      with_payload: ["summary_text", "detail", "timestamp"],
+    });
+    const chains = await qdrant.scroll("decision_chains", {
+      filter: { must: [{ key: "status", match: { value: "active" }}] },
+      limit: 500,
+      with_payload: ["content", "topic_key", "created_at"],
+    });
+    // content(=summary_text) -> topic (newest record wins on duplicates)
+    const topicByContent = new Map();
+    for (const pt of chains.points) {
+      const content = pt.payload.content;
+      const topic = pt.payload.topic_key;
+      if (!content || !topic) continue;
+      const prev = topicByContent.get(content);
+      if (!prev || String(pt.payload.created_at || "") >= String(prev.created_at)) {
+        topicByContent.set(content, { topic, created_at: pt.payload.created_at });
+      }
+    }
+    // newest work_memory record per summary_text, then per topic — the
+    // protocol's updates keep the task name (summary_text) stable, but a
+    // drifted name would otherwise double-count one chain's steps.
+    const latestBySummary = new Map();
+    for (const pt of todos.points) {
+      const summary = pt.payload.summary_text;
+      if (!summary) continue;
+      const prev = latestBySummary.get(summary);
+      if (!prev || String(pt.payload.timestamp || "") >= String(prev.timestamp)) {
+        latestBySummary.set(summary, pt.payload);
+      }
+    }
+    const byTopic = new Map(); // topic -> { ts, summary, unchecked, all_done }
+    for (const [summary, payload] of latestBySummary) {
+      const chain = topicByContent.get(summary);
+      if (!chain) continue; // no topic -> unjoinable, skip (scoping needs a topic)
+      if (topicSet && !topicSet.has(chain.topic)) continue;
+      const detail = typeof payload.detail === "string" ? payload.detail : "";
+      if (!/^\s*-\s*\[( |x)\]/m.test(detail)) continue; // not a checklist record
+      const unchecked = [];
+      for (const line of detail.split("\n")) {
+        const m = line.match(/^\s*-\s*\[\s\]\s*(.+)$/);
+        if (m) unchecked.push(m[1].trim());
+      }
+      const ts = String(payload.timestamp || "");
+      const cur = byTopic.get(chain.topic);
+      if (!cur || ts >= cur.ts) byTopic.set(chain.topic, { ts, summary, unchecked, all_done: unchecked.length === 0 });
+    }
+    const out = [...byTopic.entries()]
+      .map(([topic, v]) => ({ topic_key: topic, summary: v.summary, timestamp: v.ts || null, unchecked: v.unchecked, all_done: v.all_done }))
+      .sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || ""));
+    log(`[todo-chains] GET topics=${topicSet ? [...topicSet].join(",") : "all"} n=${out.length}`);
+    return c.json({ ok: true, todos: out });
+  } catch (err) {
+    log(`[todo-chains] GET failed: ${err.message}`);
+    return c.json({ error: err.message }, 500);
+  }
+});
+
 // Session Σ anchor for the engine's DA scaffold (2026-10-09): the llama-server
 // fetches this on every request while history is offloaded and appends the
 // anchor to the offloaded-chunks note, so a long autonomous turn keeps its

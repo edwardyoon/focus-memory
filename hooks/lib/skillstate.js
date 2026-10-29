@@ -1045,9 +1045,12 @@ function extractLastUserMessage(transcriptPath, maxChars = 400) {
  * @param {object} sigma - current Σ (may be {})
  * @param {string} transcriptText - compact transcript tail
  * @param {string} [sessionId] - the current session's id (cross-session isolation rule)
+ * @param {Array<{topic_key: string, unchecked: string[]}>} [todoChains] - open todo
+ *   chains grounded in this session (from the DB; the authoritative source for the
+ *   next list — see fetchOpenTodoChains)
  * @returns {string}
  */
-function buildExtractionPrompt(sigma, transcriptText, sessionId) {
+function buildExtractionPrompt(sigma, transcriptText, sessionId, todoChains) {
   // Show the model only the content-relevant keys (the three sections + the
   // sticky anchor flags) — bookkeeping (token counts, offsets, kv_state) and
   // the mechanical recall_pointers are noise for the extractor.
@@ -1065,6 +1068,7 @@ ${current}
 
 [Recent Conversation]:
 ${transcriptText}
+${todoChains && todoChains.length ? `\n[Open Todo Chains (authoritative, from focus-memory DB — this session's own checklist records)]:\n${todoChains.map((t) => `- ${t.topic_key}: ${t.unchecked.length ? t.unchecked.join(' | ') : '(all steps done)'}`).join('\n')}` : ''}
 
 [Output Schema] — a state patch; omit keys that did not change, set a key to null to delete it:
 {
@@ -1081,6 +1085,7 @@ ${transcriptText}
 - confirmed: facts VERIFIED by a tool call in this segment or the current state (an edit/write that succeeded, a test run, a file read). EVERY item MUST end with a \`file:line\` citation of where the fact lives (for test/verification facts, the test or script file). If the conversation shows a previously confirmed fact is now stale (the code changed), drop or rewrite it.
 - hypothesis: beliefs NOT yet verified by a tool call — suspected causes, expected-but-untested outcomes, open questions. No speculation beyond what the conversation suggests.
 - next: steps still to be done, in execution order, each self-contained (a future reader must understand it without the chain-of-thought, which is NOT preserved after compaction). If the recent conversation shows the task CHANGED — a new user request, a pivot, or the previous task COMPLETED — you MUST output the updated next list: a finished or superseded task that lingers in Σ gets re-injected as the next turn's anchor and the model resumes it instead of the user's new message. Omit only when you are confident nothing changed; when in doubt, output the updated list.
+- next (chain override): when [Open Todo Chains] is present it is AUTHORITATIVE — list each chain's unchecked steps exactly as shown, in the order shown (a merge step enforces this mechanically; your list is the fallback). Do NOT add steps the chains do not show, and do NOT carry forward steps the chains mark done. When every chain shows (all steps done), next is empty.
 - blocked: currently active blockers — actions that must NOT be retried until the condition clears (e.g. 'apachectl restart — user approval required', 'test suite failing: X — fix before deploy'). Format: \`<what> — <condition>\`. Omit or empty when nothing is blocked. At most 3 items, each at most 12 words.
 - BUDGET: the whole patch must fit in about 800 tokens. confirmed at most 10 items, hypothesis at most 5, next at most 5, blocked at most 3; each item at most 20 words. When over budget, keep the most actionable items.
 - anchor_revoked: set true ONLY when the user explicitly cancels, rejects, or supersedes the session's ORIGINAL first request in the recent conversation (e.g. "I never asked you to restore that — delete it again"). A follow-up, refinement, or new sub-task within the same task is NOT a revocation. It is sticky: if the current state is already true, keep it true. Omit it when unchanged.
@@ -1148,6 +1153,44 @@ async function callSummaryLLM(prompt, timeoutMs = 120000) {
   } catch (err) {
     console.error(`[skillstate] LLM error: ${err.name === 'AbortError' ? `timeout (${timeoutMs}ms)` : err.message}`);
     return '';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Fetch this session's open todo chains from the local server
+ * (GET /v1/todo-chains, 2026-10-29 stale-next fix). The DB checklist is the
+ * authoritative source for outstanding steps: the server joins work_memory
+ * (type=todo — the checklist detail) with decision_chains (the topic_key)
+ * and returns, per topic, the newest checklist record's unchecked items.
+ * Topic scoping is the caller's job — pass only the topic_keys this
+ * session's transcript shows it actively maintaining (its own
+ * remember_decision calls), so another session's chains never steer this
+ * one's Σ.
+ * @param {string[]} topics - topic_keys grounded in this session's transcript
+ * @param {number} [timeoutMs=3000]
+ * @returns {Promise<Array<{topic_key: string, summary: string, timestamp: (string|null), unchecked: string[], all_done: boolean}>>}
+ *   [] on any failure (fail-open — the LLM-derived next stands).
+ */
+async function fetchOpenTodoChains(topics, timeoutMs = 3000) {
+  if (!Array.isArray(topics) || !topics.length) return [];
+  const port = env('HTTP_PORT', '3900');
+  const token = env('CONTEXT_API_TOKEN', 'focus-memory-local');
+  const url = `http://127.0.0.1:${port}/v1/todo-chains?topics=${encodeURIComponent(topics.join(','))}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { headers: { 'x-api-auth': token }, signal: controller.signal });
+    if (res.status !== 200) {
+      console.error(`[skillstate] todo-chains HTTP ${res.status}`);
+      return [];
+    }
+    const data = await res.json();
+    return Array.isArray(data.todos) ? data.todos : [];
+  } catch (err) {
+    console.error(`[skillstate] todo-chains fetch failed: ${err.message}`);
+    return [];
   } finally {
     clearTimeout(timer);
   }
@@ -1375,6 +1418,7 @@ module.exports = {
   extractLastUserMessage,
   buildExtractionPrompt,
   callSummaryLLM,
+  fetchOpenTodoChains,
   extractJsonPatch,
   emitHookOutput,
   appendTelemetry,
