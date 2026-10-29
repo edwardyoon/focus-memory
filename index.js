@@ -1099,8 +1099,12 @@ server.registerTool(
 // snapshot) lags the current turn by design (scaffold cache stability);
 // this tool reads the transcript tail LIVE, so it is fresher — use it when
 // unsure what was just done or before re-reading a file. Session resolves
-// from QWEN_CODE_SESSION_ID ONLY (the exact caller identity — no stamp/mtime
-// fallback, so another session's transcript can never be read).
+// from QWEN_CODE_SESSION_ID first (the exact caller identity); only when
+// that session's Σ state is absent or stale (a long-lived daemon/ACP MCP
+// server reused across sessions) does it fall back to the freshest live Σ
+// file (15-min TTL) — the hooks rewrite the running session's Σ every turn,
+// so the fallback can never read another session's transcript while the env
+// session still has fresh state.
 server.registerTool(
   "recent_work",
   {
@@ -1117,10 +1121,37 @@ server.registerTool(
         isError: true,
       };
     }
-    let tp = "";
+    let sigma = {};
     try {
-      tp = skillState.loadSigma(sid).transcript_path;
+      sigma = skillState.loadSigma(sid);
     } catch {}
+    // Daemon/ACP hosts keep one long-lived MCP server across sessions, so the
+    // env session id can be stale (its Σ absent, or not rewritten for 15+
+    // minutes). The Stop/UserPromptSubmit hooks rewrite the running session's
+    // Σ every turn with the real session id from the hook payload — fall back
+    // to the freshest live Σ file (15-min TTL) only when the env session is
+    // not the live one, so another session's transcript can never be read
+    // while the env session still has fresh state.
+    let via = "env";
+    let activeSid = sid;
+    let envActive = true;
+    try {
+      const st = await fs.stat(skillState.sigmaFile(sid));
+      envActive = Date.now() - st.mtimeMs < 15 * 60 * 1000; // matches ACTIVE_SESSION_TTL_MS
+    } catch {
+      envActive = false; // no Σ file for the env session
+    }
+    if (!envActive) {
+      const fresh = skillState.freshestSigmaSession();
+      if (fresh && fresh.session_id !== sid) {
+        activeSid = fresh.session_id;
+        via = "freshest-sigma";
+        try {
+          sigma = skillState.loadSigma(activeSid);
+        } catch {}
+      }
+    }
+    const tp = sigma.transcript_path;
     if (typeof tp !== "string" || !tp) {
       return {
         content: [{ type: "text", text: "No transcript path recorded for this session yet — the Stop hook records it at the end of each turn. Re-ground on the Σ anchor instead." }],
@@ -1131,7 +1162,7 @@ server.registerTool(
     try {
       digest = skillState.digestTranscript(tp, { events: 24, maxChars: 2400 });
     } catch {}
-    log(`[MCP recent_work] session=${sid.slice(0, 8)} chars=${digest.length}`);
+    log(`[MCP recent_work] session=${activeSid.slice(0, 8)} via=${via} chars=${digest.length}`);
     if (!digest) {
       return {
         content: [{ type: "text", text: "Transcript digest is empty (no recent parseable entries in the tail)." }],

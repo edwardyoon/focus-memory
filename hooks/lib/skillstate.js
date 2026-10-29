@@ -261,6 +261,18 @@ function resolveActiveSession() {
       if (best) return best;
     }
   } catch { /* no stamp file */ }
+  return freshestSigmaSession();
+}
+
+/**
+ * The freshest per-session Σ state file under the 15-min TTL (the layer-3
+ * liveness signal, standalone). The Stop/UserPromptSubmit hooks rewrite the
+ * running session's Σ every turn with the real session id from the hook
+ * payload, so the freshest mtime identifies the live session.
+ * @returns {{session_id: string, ts: number, source: string}|null}
+ */
+function freshestSigmaSession() {
+  const cutoff = Date.now() - ACTIVE_SESSION_TTL_MS;
   try {
     let best = null;
     for (const f of fs.readdirSync(SIGMA_DIR)) {
@@ -1346,6 +1358,7 @@ module.exports = {
   setSigmaNote,
   stampActiveSession,
   resolveActiveSession,
+  freshestSigmaSession,
   bumpCompactCount,
   sweepSigma,
   mergeSigma,
