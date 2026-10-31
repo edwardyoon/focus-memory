@@ -292,6 +292,62 @@ function freshestSigmaSession() {
 }
 
 /**
+ * Derive this session's transcript path from the fixed qwen layout
+ * (~/.qwen/projects/<cwd /→->/chats/<session-id>.jsonl), scanning all
+ * project dirs when the cwd-mapped one misses (session UUIDs are unique,
+ * so the scan is unambiguous). Pure function of session_id — the Stop hook
+ * was the only writer of Σ.transcript_path, but it does not fire on hosts
+ * that don't run extension hooks (e.g. the ACP host), so this is the
+ * self-sufficient counterpart.
+ * @param {string} sessionId
+ * @returns {string} absolute transcript path, or '' when not found
+ */
+function deriveTranscriptPath(sessionId) {
+  if (!sessionId || !SESSION_UUID_RE.test(sessionId)) return '';
+  const fileName = `${sessionId}.jsonl`;
+  const projectsDir = path.join(HOME, '.qwen', 'projects');
+  try {
+    const direct = path.join(projectsDir, process.cwd().replace(/\//g, '-'), 'chats', fileName);
+    if (fs.existsSync(direct)) return direct;
+    for (const dir of fs.readdirSync(projectsDir)) {
+      const candidate = path.join(projectsDir, dir, 'chats', fileName);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  } catch {}
+  return '';
+}
+
+/**
+ * Derive + persist Σ.transcript_path lazily (locked read-modify-write) and
+ * return the path. The first engine contact of a session (kv-offload sigma
+ * GET / eviction PUT) secures it for every consumer — recent_digest,
+ * recent_work, the extraction workers — on hook-less hosts. Never overwrites
+ * an existing value (lost-update guard inside the lock). Fail-open: '' on
+ * any error or when the transcript cannot be derived.
+ * @param {string} sessionId
+ * @returns {string} the (persisted or pre-existing) transcript path, or ''
+ */
+function ensureTranscriptPath(sessionId) {
+  try {
+    if (!sessionId) return '';
+    const existing = loadSigma(sessionId);
+    if (typeof existing.transcript_path === 'string' && existing.transcript_path) {
+      return existing.transcript_path;
+    }
+    const derived = deriveTranscriptPath(sessionId);
+    if (!derived) return '';
+    mutateSigma(sessionId, (s) => {
+      if (typeof s.transcript_path === 'string' && s.transcript_path) return s; // already set
+      s.transcript_path = derived;
+      return s;
+    });
+    return derived;
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Bump Σ.compact_count (locked read-modify-write) with a 30s dedup window so a
  * single compaction firing both PostCompact and SessionStart counts once, while
  * distinct compactions (minutes apart) each count. Stores last bump ts for the
@@ -518,6 +574,14 @@ function renderAnchor(sigma, opts = {}) {
   if (sigma.anchor_revoked === true) parts.push('original-task-anchor: REVOKED by user');
   if (sigma.anchor_completed === true) parts.push('original-task-anchor: COMPLETED');
 
+  // Current-task identity (2026-11-01): the latest user request as the
+  // extractor restated it — re-presents WHAT the work is mid-turn, so an
+  // evicted old task's framing cannot re-latch the model onto the wrong
+  // request after its messages leave the KV.
+  if (typeof sigma.latest_request === 'string' && sigma.latest_request.trim()) {
+    parts.push(`current-task (latest user request — defines the work): ${sigma.latest_request}`);
+  }
+
   // Model-owned verbatim notes (2026-10-20): re-injected exactly as the model
   // wrote them (no re-derivation). They take precedence over the extracted
   // sections below when they conflict — the model wrote them mid-task, so they
@@ -594,6 +658,9 @@ const KEY_RULES = {
   confirmed: 'replace',
   hypothesis: 'replace',
   next: 'replace',
+  // One-line current-task identity from the latest user message (2026-11-01):
+  // a current-view snapshot, so it replaces rather than accumulates.
+  latest_request: 'replace',
   // Active blockers (migrated from session notes' blocked status, 2026-10-15):
   // a current-view snapshot of what must NOT be retried until it clears.
   blocked: 'replace',
@@ -1048,9 +1115,11 @@ function extractLastUserMessage(transcriptPath, maxChars = 400) {
  * @param {Array<{topic_key: string, unchecked: string[]}>} [todoChains] - open todo
  *   chains grounded in this session (from the DB; the authoritative source for the
  *   next list — see fetchOpenTodoChains)
+ * @param {string} [latestUser] - the LATEST user message, verbatim (live ground
+ *   truth for the current task — newer than the evicted transcript text)
  * @returns {string}
  */
-function buildExtractionPrompt(sigma, transcriptText, sessionId, todoChains) {
+function buildExtractionPrompt(sigma, transcriptText, sessionId, todoChains, latestUser) {
   // Show the model only the content-relevant keys (the three sections + the
   // sticky anchor flags) — bookkeeping (token counts, offsets, kv_state) and
   // the mechanical recall_pointers are noise for the extractor.
@@ -1069,6 +1138,7 @@ ${current}
 [Recent Conversation]:
 ${transcriptText}
 ${todoChains && todoChains.length ? `\n[Open Todo Chains (authoritative, from focus-memory DB — this session's own checklist records)]:\n${todoChains.map((t) => `- ${t.topic_key}: ${t.unchecked.length ? t.unchecked.join(' | ') : '(all steps done)'}`).join('\n')}` : ''}
+${latestUser ? `\n[Current Task — the LATEST user message, verbatim; NEWER than [Recent Conversation], which is OLD evicted history]:\n${latestUser}` : ''}
 
 [Output Schema] — a state patch; omit keys that did not change, set a key to null to delete it:
 {
@@ -1076,6 +1146,7 @@ ${todoChains && todoChains.length ? `\n[Open Todo Chains (authoritative, from fo
   "hypothesis": ["unverified belief or open question"],
   "next": ["outstanding step, in execution order"],
   "blocked": ["currently active blocker — condition"],
+  "latest_request": "one line — the current task as the latest user message defines it",
   "anchor_revoked": "boolean — see the anchor_revoked rule",
   "anchor_completed": "boolean — see the anchor_completed rule"
 }
@@ -1087,11 +1158,12 @@ ${todoChains && todoChains.length ? `\n[Open Todo Chains (authoritative, from fo
 - next: steps still to be done, in execution order, each self-contained (a future reader must understand it without the chain-of-thought, which is NOT preserved after compaction). If the recent conversation shows the task CHANGED — a new user request, a pivot, or the previous task COMPLETED — you MUST output the updated next list: a finished or superseded task that lingers in Σ gets re-injected as the next turn's anchor and the model resumes it instead of the user's new message. Omit only when you are confident nothing changed; when in doubt, output the updated list.
 - next (chain override): when [Open Todo Chains] is present it is AUTHORITATIVE — list each chain's unchecked steps exactly as shown, in the order shown (a merge step enforces this mechanically; your list is the fallback). Do NOT add steps the chains do not show, and do NOT carry forward steps the chains mark done. When every chain shows (all steps done), next is empty.
 - blocked: currently active blockers — actions that must NOT be retried until the condition clears (e.g. 'apachectl restart — user approval required', 'test suite failing: X — fix before deploy'). Format: \`<what> — <condition>\`. Omit or empty when nothing is blocked. At most 3 items, each at most 12 words.
-- BUDGET: the whole patch must fit in about 800 tokens. confirmed at most 10 items, hypothesis at most 5, next at most 5, blocked at most 3; each item at most 20 words. When over budget, keep the most actionable items.
+- BUDGET: the whole patch must fit in about 800 tokens. confirmed at most 10 items, hypothesis at most 5, next at most 5, blocked at most 3; each item at most 20 words. latest_request is one line, at most 25 words. When over budget, keep the most actionable items.
 - anchor_revoked: set true ONLY when the user explicitly cancels, rejects, or supersedes the session's ORIGINAL first request in the recent conversation (e.g. "I never asked you to restore that — delete it again"). A follow-up, refinement, or new sub-task within the same task is NOT a revocation. It is sticky: if the current state is already true, keep it true. Omit it when unchanged.
 - anchor_completed: set true when the recent conversation shows the session's ORIGINAL first request is FULLY COMPLETED — the work the user originally asked for is done (the deliverable exists, the tests pass, or the user has visibly moved on). It does NOT require a new task to have started: once the original work is done, the first-user-message pin has served its purpose and is released. A task that is only PARTIALLY done or still being actively worked on is NOT anchor_completed. It is sticky: if the current state is already true, keep it true. Omit it when unchanged.
 - anchor-done next guard: if the current state or the recent conversation shows the ORIGINAL task is already completed or revoked (anchor_completed / anchor_revoked true), the \`next\` list must NOT re-list steps of that finished task — those belong in \`confirmed\` (as verified outcomes) only. If a NEW task is underway, \`next\` lists only the new task's steps; if nothing new is underway, omit \`next\` entirely.
-- Latest-request alignment: the LATEST user message in the recent conversation defines the current task. If it starts or changes the task, \`next\` lists only that task's outstanding steps — steps of an older task that linger in the current state are dropped from \`next\` (verified outcomes of a finished task belong in \`confirmed\`).
+- Promotion on completion: when you drop a \`next\` item because it is DONE, you MUST also promote it to \`confirmed\` in the same patch — phrased as a verified outcome carrying its evidence (the file:line that now exists, the command that passed, the row count). A completed step that vanishes from both \`next\` and \`confirmed\` is lost state: after compaction the model cannot tell the work is done and may redo it. If the segment shows NO tool evidence for the completion, keep the item in \`next\` (or move it to \`hypothesis\`) — never a silent drop.
+- Latest-request alignment: the LATEST user message defines the current task — the [Current Task] section when present, otherwise the last user message in the recent conversation. When [Current Task] is present it OVERRIDES the framing of [Recent Conversation] (old evicted history): \`next\` lists only the current task's outstanding steps, and \`latest_request\` restates the current task in one line. Steps of an older task that linger in the current state are dropped from \`next\` (verified outcomes of a finished task belong in \`confirmed\`).
 - Cross-session isolation: this session is \`${sessionId || 'unknown'}\`. A path like \`state/<session-id>.json\` whose id does not match it cites ANOTHER session's state — omit any confirmed / hypothesis / next item that cites such a foreign file or whose only support is that file's content.
 - Use only facts present in the conversation. No speculation.
 - Grounding (anti-confabulation): an assistant message can CLAIM work it never did — citing files that no [call]/[result] line in this segment touched, or items "carried over from a previous session" with no tool-call evidence. A fact is confirmed only when a tool call in this segment (or the current state) shows it. Omit any confirmed / hypothesis / next item whose only support is such an unsupported claim.
@@ -1233,7 +1305,7 @@ function completionSignal(message) {
   return COMPLETION_SIGNAL_PATTERNS.some((p) => p.test(message));
 }
 
-const SCHEMA_KEYS = ['confirmed', 'hypothesis', 'next', 'blocked', 'anchor_revoked', 'anchor_completed'];
+const SCHEMA_KEYS = ['confirmed', 'hypothesis', 'next', 'blocked', 'anchor_revoked', 'anchor_completed', 'latest_request'];
 
 /**
  * Unwrap a {"state_patch": {...}} envelope if present.
@@ -1402,6 +1474,8 @@ module.exports = {
   stampActiveSession,
   resolveActiveSession,
   freshestSigmaSession,
+  deriveTranscriptPath,
+  ensureTranscriptPath,
   bumpCompactCount,
   sweepSigma,
   mergeSigma,

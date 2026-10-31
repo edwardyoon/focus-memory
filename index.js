@@ -1151,10 +1151,19 @@ server.registerTool(
         } catch {}
       }
     }
-    const tp = sigma.transcript_path;
+    let tp = sigma.transcript_path;
+    let viaTp = "sigma";
+    if (typeof tp !== "string" || !tp) {
+      // The Stop hook — the only Σ writer of transcript_path — does not fire
+      // on hook-less hosts (ACP). Derive on demand from the fixed layout
+      // (read-only: no Σ write from a tool; the engine-facing handlers
+      // persist it via ensureTranscriptPath).
+      tp = skillState.deriveTranscriptPath(activeSid);
+      viaTp = "derived";
+    }
     if (typeof tp !== "string" || !tp) {
       return {
-        content: [{ type: "text", text: "No transcript path recorded for this session yet — the Stop hook records it at the end of each turn. Re-ground on the Σ anchor instead." }],
+        content: [{ type: "text", text: "No transcript path recorded or derivable for this session (no Σ bookkeeping and no <session-id>.jsonl under ~/.qwen/projects). Re-ground on the Σ anchor instead." }],
         isError: true,
       };
     }
@@ -1162,7 +1171,7 @@ server.registerTool(
     try {
       digest = skillState.digestTranscript(tp, { events: 24, maxChars: 2400 });
     } catch {}
-    log(`[MCP recent_work] session=${activeSid.slice(0, 8)} via=${via} chars=${digest.length}`);
+    log(`[MCP recent_work] session=${activeSid.slice(0, 8)} via=${via} tp=${viaTp} chars=${digest.length}`);
     if (!digest) {
       return {
         content: [{ type: "text", text: "Transcript digest is empty (no recent parseable entries in the tail)." }],
@@ -2484,7 +2493,10 @@ httpApp.put("/v1/kv-offload/chunk", async (c) => {
   // (same as kv_state / transcript_path).
   try {
     if (skillState.skillStateEnabled()) {
-      const tp = skillState.loadSigma(sessionId).transcript_path;
+      // Lazy transcript_path securing (2026-11-01): the Stop hook — the only
+      // Σ writer of transcript_path — does not fire on hook-less hosts (ACP);
+      // the first eviction contact derives + persists it instead.
+      const tp = skillState.ensureTranscriptPath(sessionId);
       const digest = skillState.digestTranscript(typeof tp === "string" ? tp : "", { events: 24, maxChars: 1600 });
       if (digest) {
         skillState.mutateSigma(sessionId, (s) => {
@@ -2639,6 +2651,10 @@ httpApp.get("/v1/kv-offload/session/sigma", async (c) => {
   let digest = "";
   try {
     if (skillState.skillStateEnabled()) {
+      // Lazy transcript_path securing (2026-11-01): the engine's first sigma
+      // fetch of a session persists the derived path for hook-less hosts
+      // (ensureTranscriptPath) — millisecond-scale, once per session.
+      skillState.ensureTranscriptPath(sessionId);
       const sigma = skillState.loadSigma(sessionId);
       anchor = skillState.renderAnchor(sigma);
       // recent_digest snapshot (refreshed at eviction PUT, 2026-10-23):

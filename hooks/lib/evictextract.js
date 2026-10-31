@@ -140,9 +140,21 @@ async function extractBatch(sessionId, batch) {
   // the segments are simply not distilled this round (they stay recallable in
   // the store; the turn-boundary extraction still covers the session). No
   // retry loop — the engine re-PUTs a key only after an engine restart.
+  // Current-task ground truth (2026-11-01): the evicted segments are OLD
+  // history — the live latest user message (the actual current task) is not
+  // in them. Read it verbatim from the transcript so the extractor aligns
+  // `next`/`latest_request` with the real task instead of re-deriving the
+  // evicted one. Fail-open: no path / no user message → the extractor runs
+  // on the evicted text alone (previous behavior).
+  let latestUser = '';
+  try {
+    const tp = ss.ensureTranscriptPath(sessionId);
+    if (tp) latestUser = ss.extractLastUserMessage(tp, 400) || '';
+  } catch {}
+
   let raw;
   try {
-    raw = await ss.callSummaryLLM(ss.buildExtractionPrompt(sigma, text, sessionId), LLM_TIMEOUT_MS);
+    raw = await ss.callSummaryLLM(ss.buildExtractionPrompt(sigma, text, sessionId, null, latestUser), LLM_TIMEOUT_MS);
   } catch (err) {
     raw = '';
   }
