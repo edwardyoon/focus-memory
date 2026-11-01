@@ -2607,6 +2607,21 @@ httpApp.get("/v1/kv-offload/session/sigma", async (c) => {
   if (!kvOffload.kvOffloadEnabled()) return c.json({ error: "kv-offload disabled" }, 404);
   const sessionId = c.req.query("session_id") || "";
   if (!sessionId) return c.json({ error: "session_id required" }, 400);
+  // Default-OFF gate (2026-11-01, see incidents/2026-11-01-stale-sigma-anchor-contamination.md):
+  // unless FOCUSMEMORY_SIGMA_FETCH is explicitly on (on/1/true), return an empty
+  // anchor — the engine's fail-open then injects nothing. Tests whether
+  // suppressing the offload-time fetch removes the stale-anchor reinjection (H1).
+  // Transcript path securing stays on (independent of anchor injection).
+  const sigmaFetchOn = ["on", "1", "true"].includes(
+    (process.env.FOCUSMEMORY_SIGMA_FETCH || "").toLowerCase()
+  );
+  if (!sigmaFetchOn) {
+    try {
+      skillState.ensureTranscriptPath(sessionId);
+    } catch {}
+    log(`[kv-offload] SIGMA session=${sessionId} sigma_fetch=off anchor_chars=0`);
+    return c.json({ ok: true, session_id: sessionId, anchor: "" });
+  }
   let anchor = "";
   let digest = "";
   try {
