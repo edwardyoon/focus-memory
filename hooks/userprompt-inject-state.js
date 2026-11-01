@@ -3,7 +3,7 @@
 //
 // No model-facing output. Four mechanical features run on every user prompt
 // (gated by FOCUSMEMORY_SKILLSTATE=on); they keep the anchor lifecycle
-// current so the SessionStart(compact) re-injection and the Stop guards'
+// current so the SessionStart(compact) re-injection and the Stop gate's
 // anchor window stay correct:
 //   1. foreign-session scrub — Σ files written before the merge-time gate (or
 //      via a leak it missed) may carry another session's state-file citation;

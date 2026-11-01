@@ -21,9 +21,9 @@
 // gate telemetry so the scope can be widened later if the class recurs in
 // other directories.
 //
-// Loop guard (same discipline as stop-turn-guard.js — stop_hook_active is
-// hard-coded true on the messageBus Stop path and unusable): Σ-managed —
-// identical missing-path set → skip, at most MAX_BLOCKS within STREAK_WINDOW.
+// Loop guard (stop_hook_active is hard-coded true on the messageBus Stop
+// path and unusable): Σ-managed — identical missing-path set → skip, at most
+// MAX_BLOCKS within STREAK_WINDOW.
 // Keyed on the missing set, not the full message: a rephrased correction
 // turn that re-cites the same ghost file is the same loop (the full-message
 // hash let rephrasing dodge the guard and burn all MAX_BLOCKS — observed

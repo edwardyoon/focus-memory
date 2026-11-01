@@ -107,7 +107,7 @@ async function main() {
   const inputTokens = Number(event.input_tokens ?? event.contextUsage?.input_tokens);
 
   // Per-Stop bookkeeping as ONE locked read-modify-write: this hook and the
-  // other Stop hooks (ghost-gate, turn-guard) run concurrently on the same
+  // other Stop hook (ghost-gate) run concurrently on the same
   // event, and the old load→modify→save sequence let same-second saves
   // clobber each other (lost update — observed 2026-09-28 disabling the
   // ghost-gate loop guard).

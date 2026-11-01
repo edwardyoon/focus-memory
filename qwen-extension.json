@@ -80,17 +80,6 @@
     ],
     "Stop": [
       {
-        "description": "Turn-end guard — block stop when the turn result is a session-summary claiming no active task while a work anchor (Σ state / in-progress todos) exists; re-injects the anchor as the continuation prompt so the model resumes work instead of parking in a 'waiting' state. Self-limits via Σ (max 3 blocks / 30 min window, identical-message loop skip). Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node ${extensionPath}${/}hooks${/}stop-turn-guard.js",
-            "name": "stop-turn-guard",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
         "description": "Ghost file citation gate — block stop when the turn's final message cites a dated todos file (todos/YYYY-MM-DD.md, relative or absolute) that does not exist on disk (2026-09-26 confabulation class: a ghost file citation anchored a fabricated work narrative); re-injects a correction prompt forcing disk re-verification. Self-limits via Σ (max 3 blocks / 30 min window, identical-message loop skip). Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
         "hooks": [
           {

@@ -443,7 +443,7 @@ function digestTranscript(transcriptPath, opts = {}) {
  *   completed/superseded task instead of answering the user's new message
  *   (2026-10-02 incident: mid-investigation jump back to a finished
  *   re-apply task). false (default): directive framing, for callers that
- *   resume the work (stop-turn-guard).
+ *   resume the work.
  * @returns {string} compact anchor text (empty string when Σ has no content)
  */
 function renderAnchor(sigma, opts = {}) {
