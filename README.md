@@ -204,7 +204,7 @@ Off by default — with the flag unset, all hooks return immediately (25–40 ms
 
 - **Stop (every turn)** records bookkeeping fields in a locked read-modify-write — `last_input_tokens` (context size from the `contextUsage` field qwen-code provides on `Stop`), `transcript_path` (used by the `recent_work` MCP tool to resolve the session), and `last_turn_completion_signal` (input to the UserPromptSubmit flip). No extraction, no worker spawn, no model-facing output.
 - **PreCompact** spawns the same worker as a final pass and exits in milliseconds — native compaction is never blocked. The worker reads the transcript tail (default 30k chars), calls the extraction LLM (SUMMARY_LLM → MAIN_LLM fallback) for a JSON state patch, merges it into Σ (`Σ_{t+1} = Σ_t ⊕ Δ`; null deletes a key), and saves it.
-- **UserPromptSubmit (every turn)** — mechanical maintenance only (no injection, no LLM): scrubs stale foreign refs from Σ, flips the completion signal (sets the `anchor_done_next` baseline), releases the B4 pin, and resets the current view. These keep the anchor lifecycle current so SessionStart re-injection and the turn-guard / ghost-gate / evict-extract gates stay correct. Mid-turn recall is handled by focus-llama's own Σ fetch (see the kv-offload section) — the hooks no longer inject Σ into the prompt.
+- **UserPromptSubmit (every turn)** — mechanical maintenance only (no injection, no LLM): scrubs stale foreign refs from Σ, flips the completion signal (sets the `anchor_done_next` baseline), releases the B4 pin, and resets the current view. These keep the anchor lifecycle current so SessionStart re-injection and the turn-guard / ghost-gate / evict-extract gates stay correct. Mid-turn Σ re-presentation is an opt-in beta feature of focus-llama's own Σ fetch (see the kv-offload section — off by default) — the hooks no longer inject Σ into the prompt.
 - **SessionStart** (`compact` only) loads Σ and injects it as `additionalContext`, preferred over the native prose summary for "where are we" questions.
 
 **Σ schema:**
@@ -249,6 +249,8 @@ compaction. Production-verified end to end (qwen3.8-27B on the production GPU no
 FOCUSMEMORY_KVOFFLOAD=on
 # the store auth token (the engine sends it as a Bearer header)
 CONTEXT_API_TOKEN=focus-memory-local
+# beta: mid-turn Σ scaffold (off by default — also needs the engine's --sigma-fetch)
+# FOCUSMEMORY_SIGMA_FETCH=on
 ```
 Off by default — with the flag unset the routes return 404 (fail-open, the engine keeps the
 segment in the prompt).
@@ -261,31 +263,41 @@ segment in the prompt).
 | `PUT` | `/v1/kv-offload/chunk` | Store one evicted segment (`{session_id, key, text, tokens}`) |
 | `GET` | `/v1/kv-offload/chunk?session_id=&key=` | Fetch a segment's text back (get-on-focus) |
 | `GET` | `/v1/kv-offload/session?session_id=` | Eviction-plan state — reports `pin_released` (first-user-message pin) |
-| `GET` | `/v1/kv-offload/session/sigma?session_id=` | Mid-turn DA scaffold — Σ anchor + recent digest, fetched by the engine on every offloaded request |
+| `GET` | `/v1/kv-offload/session/sigma?session_id=` | Mid-turn DA scaffold (**beta, off by default**) — Σ anchor + recent digest, fetched by the engine on every offloaded request only when both gates are on |
 | `DELETE` | `/v1/kv-offload/session?session_id=` | Drop a session's stored segments |
 
 Segments are kept in per-session JSON files under `~/.qwen/tmp/focus-memory/kv-offload/`
 (atomic writes, lock-guarded), the same pattern as the session-state files.
 
-**Mid-turn DA scaffold (Σ anchor fetch).** While history is offloaded, the engine fetches
-`GET /v1/kv-offload/session/sigma` on **every request** and appends the session's Σ anchor to
-the offloaded-chunks note, so a long autonomous turn keeps its ground mid-turn — the
-Stop/UserPromptSubmit hooks only fire at turn boundaries. The engine caps the call at 200 ms
-and fails open (an empty anchor — no Σ yet, gate off, or error — means "nothing to inject").
-The response is the rendered anchor plus a `recent_digest` snapshot appended after it; the
-digest is refreshed **at eviction PUT time** (the moment history leaves the KV) from the last
-24 transcript events (≤1.6k chars), and the same PUT kicks a fire-and-forget worker
-(evict-extract) that distills the evicted segment into Σ itself. A snapshot (not a live read)
-keeps the scaffold stable across requests — the `recent_work` MCP tool is the live-reading
-counterpart. The Σ anchor is part of the engine's DA keep set (the union of the tag selection,
-the Σ anchor, and the `--da-tail-keep` tail floor), so the scaffold is never masked out of
-attention.
+**Mid-turn DA scaffold (Σ anchor fetch) — beta, off by default.** While history is offloaded,
+the engine can fetch `GET /v1/kv-offload/session/sigma` on **every request** and append the
+session's Σ anchor to the offloaded-chunks note, so a long autonomous turn keeps its ground
+mid-turn — the Stop/UserPromptSubmit hooks only fire at turn boundaries. It is a beta-test
+feature, **disabled by default**: it requires both gates on — the store-side
+`FOCUSMEMORY_SIGMA_FETCH=on` (FocusMemory/.env; off → the route answers an empty anchor) and
+the engine-side `--sigma-fetch` flag (focus-llama; off → the engine never calls the route).
+The default came from observation: with the gate off the session ran cleaner — the anchor is
+a snapshot refreshed only at eviction PUT time, so it lags the live tail, and a stale
+`current-task` line injected next to the model's own recent context re-latched long sessions
+onto already-finished work (incident 2026-11-01). When both gates are on, the engine caps the
+call at 200 ms and fails open (an empty anchor — no Σ yet, or error — means "nothing to
+inject"). The response is the rendered anchor plus a `recent_digest` snapshot appended after
+it; the digest is refreshed **at eviction PUT time** (the moment history leaves the KV) from
+the last 24 transcript events (≤1.6k chars), and the same PUT kicks a fire-and-forget worker
+(evict-extract) that distills the evicted segment into Σ itself — the worker runs under the
+same `FOCUSMEMORY_SIGMA_FETCH` gate, so with the scaffold off there is no mid-turn extraction
+cost (the compaction-time extraction still covers the post-compaction injection). A snapshot
+(not a live read) keeps the scaffold stable across requests — the `recent_work` MCP tool is
+the live-reading counterpart. The Σ anchor is part of the engine's DA keep set (the union of
+the tag selection, the Σ anchor, and the `--da-tail-keep` tail floor), so the scaffold is
+never masked out of attention.
 
 **Engine-side requirement.** The routes are inert unless the inference server is built from
 focus-llama and launched with
 `--da-auto --kv-unified --fm-offload --kv-offload-holes --focus-memory-host http://<this-host>:3900`
 (see the *kv-offload* section of the focus-llama README). Against a stock `llama.cpp` server
-these routes are simply unused.
+these routes are simply unused. (The beta mid-turn Σ scaffold additionally requires the
+`--sigma-fetch` engine flag — off by default.)
 
 **Client-side requirement (session keying).** The engine keys store files per session,
 resolving the session id per request in this order: the `X-Session-Id` header, the OpenAI
