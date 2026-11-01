@@ -15,7 +15,7 @@
 //   3. B4 pin release — rule-based, no LLM: release the kv-offload pin when
 //      the on-disk Σ already marks the original task revoked or complete.
 //   4. current-view reset — on the first user message after a completion,
-//      wipe the current-view keys (confirmed/hypothesis/next/notes/legacy) so
+//      wipe the current-view keys (confirmed/hypothesis/next/legacy) so
 //      the finished task's view does not re-latch the model.
 //
 // The per-turn Σ injection (anchor/ctx block, offloaded instruction ledger,

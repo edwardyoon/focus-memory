@@ -10,7 +10,6 @@
 const fs = require('fs');
 const path = require('path');
 const { updateState, appendTelemetry, rotateJsonl, STATE_DIR } = require('./lib/state.js');
-const { stampActiveSession } = require('./lib/skillstate.js');
 
 function main() {
   const raw = fs.readFileSync(0, 'utf8');
@@ -21,13 +20,6 @@ function main() {
 
   const sessionId = event.session_id;
   if (!sessionId) returnAllow();
-
-  // Stamp this session as the freshest active caller — a FALLBACK resolution
-  // channel for the sigma_note MCP tool: primary since 2026-10-21 is
-  // QWEN_CODE_SESSION_ID (qwen-code sets it in the per-session MCP server's
-  // env). The ACP/VS Code host never fires PreToolUse, so on that host this
-  // stamp never refreshes. Fail-open: a stamp error must never block the tool.
-  stampActiveSession(sessionId, 'hook');
 
   const toolName = event.tool_name || 'unknown';
   const logFile = path.join(STATE_DIR, `${sessionId}.jsonl`);

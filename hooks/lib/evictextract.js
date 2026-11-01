@@ -234,7 +234,6 @@ async function extractBatch(sessionId, batch) {
       delete cur.confirmed;
       delete cur.hypothesis;
       delete cur.next;
-      delete cur.notes;
       delete cur.task_summary;
       delete cur.current_step;
       delete cur.pending_checks;

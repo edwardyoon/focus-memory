@@ -224,7 +224,6 @@ async function runWorker(event) {
       delete current.confirmed;
       delete current.hypothesis;
       delete current.next;
-      delete current.notes;
       delete current.task_summary;
       delete current.current_step;
       delete current.pending_checks;

@@ -1054,47 +1054,7 @@ server.registerTool(
   }
 );
 
-// --- Tool 3a: model-owned verbatim session notes (sigma_note) ---
-// The model writes these mid-task (e.g. "the fix that actually worked") and they
-// are re-injected verbatim every turn — the extraction LLM never touches them
-// (mergeSigma drops `notes` in a patch). They survive KV eviction because they
-// live in the same Σ file as the anchor, and are wiped on task completion. The
-// tool resolves its caller session from QWEN_CODE_SESSION_ID (qwen-code sets it
-// in the per-session MCP server's env — the exact caller identity), falling
-// back to the active-session stamp / Σ state-file mtime — see
-// resolveActiveSession.
-server.registerTool(
-  "sigma_note",
-  {
-    title: "Sigma Note (Model-Owned Verbatim)",
-    description:
-      "Save a short verbatim note into this session's Σ anchor. Use it to record work evidence you want to survive context compaction exactly as written — e.g. 'the fix that actually worked', a verified file:line, a threshold you settled on. Unlike memory search, this is your own scratchpad: it is re-injected verbatim on every turn (no re-derivation), takes precedence over the extracted sections when they conflict, and is wiped on task completion. Keep each note to facts (max 500 chars, 8 keys).",
-    inputSchema: {
-      key: z.string().describe("Short lowercase key: a-z, 0-9, '.', '_', '-' (max 64). e.g. 'fix_applied', 'tuition_v3'"),
-      text: z.string().describe("The verbatim note text (max 500 chars). Facts only."),
-      mode: z.enum(["set", "append"]).default("set").describe("'set' replaces the key, 'append' adds a line to it"),
-    },
-  },
-  async ({ key, text, mode }) => {
-    const session = skillState.resolveActiveSession();
-    if (!session) {
-      return {
-        content: [{ type: "text", text: "No active session found (QWEN_CODE_SESSION_ID unset, no fresh active-session stamp or state-file signal within 15 min). The note was not saved." }],
-        isError: true,
-      };
-    }
-    const res = skillState.setSigmaNote(session.session_id, key, text, mode);
-    if (!res.ok) {
-      return { content: [{ type: "text", text: res.error }], isError: true };
-    }
-    log(`[MCP sigma_note] session=${session.session_id.slice(0, 8)} (via ${session.source}), key="${key}", mode=${mode}, len=${res.note.text.length}`);
-    return {
-      content: [{ type: "text", text: `Note saved under "${key}" — it will be re-injected verbatim every turn and survives compaction. Current: ${res.note.text}` }],
-    };
-  },
-);
-
-// --- Tool 3a-bis: live recent-activity digest (recent_work) ---
+// --- Tool 3a: live recent-activity digest (recent_work) ---
 // Read-only, no arguments. The auto-injected recent_digest (eviction-PUT
 // snapshot) lags the current turn by design (scaffold cache stability);
 // this tool reads the transcript tail LIVE, so it is fresher — use it when
