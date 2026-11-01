@@ -29,6 +29,15 @@
 // worker error → telemetry, the segments stay in the kv-offload store
 // (recallable via <focus>), and the turn-boundary extraction (Stop/
 // PreCompact) still covers the session.
+//
+// Sigma-fetch gate (2026-11-01, incidents/2026-11-01-stale-sigma-anchor-
+// contamination.md): this extraction exists to keep the ④ anchor (GET
+// /v1/kv-offload/session/sigma) fresh for mid-turn re-presentation. With
+// FOCUSMEMORY_SIGMA_FETCH off (the default — the same process.env check the
+// ④ route applies) nothing re-presents the mid-turn state, so the extraction
+// is pure SUMMARY_LLM cost with no consumer and is skipped. The
+// compaction-time extraction (precompact-extract-state.js) still covers the
+// post-compaction injection.
 
 const ss = require('./skillstate.js');
 const kv = require('./kvoffload.js');
@@ -43,10 +52,15 @@ const MAX_KEYS_TRACKED = 256;    // Σ.evict_processed_keys ledger cap
 // still covers the session.
 const queues = new Map();   // sessionId -> Array<{key, text}>
 const inflight = new Set(); // sessionIds with a running worker
+// SessionIds that already logged the sigma-fetch gate skip — once per
+// session, not per kick (a single eviction wave carries dozens of segments).
+const gateSkippedLogged = new Set();
 
 /**
  * Enqueue one evicted segment for Σ extraction. Fire-and-forget: returns
  * immediately; the worker runs in the server process (setImmediate).
+ * No-op while FOCUSMEMORY_SIGMA_FETCH is not explicitly on (the ④ anchor is
+ * not re-presented mid-turn, so there is no consumer for the freshness).
  * @param {string} sessionId
  * @param {string} key - the engine's content-hash segment key
  * @param {string} text - the evicted segment's raw text
@@ -55,6 +69,15 @@ function kickEvictExtract(sessionId, key, text) {
   try {
     if (!ss.skillStateEnabled()) return;
     if (!sessionId || !key || typeof text !== 'string' || !text) return;
+    // Sigma-fetch gate: mirror the ④ route's process.env check (index.js) so
+    // extraction and injection always agree on one process view.
+    if (!["on", "1", "true"].includes((process.env.FOCUSMEMORY_SIGMA_FETCH || "").toLowerCase())) {
+      if (!gateSkippedLogged.has(sessionId)) {
+        gateSkippedLogged.add(sessionId);
+        ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'evict-extract', event: 'sigma_fetch_gate_off' });
+      }
+      return;
+    }
     if (!queues.has(sessionId)) queues.set(sessionId, []);
     queues.get(sessionId).push({ key, text });
     startWorker(sessionId);
