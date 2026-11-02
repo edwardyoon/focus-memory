@@ -1049,6 +1049,22 @@ server.registerTool(
     if (!vector && !chainVector) {
       return { content: [{ type: "text", text: `Nothing saved: embedding unavailable for both summary and chain content — no records were written.` }], isError: true };
     }
+    // (b) completion write-back pin release (2026-11-03): the hook path is
+    // dead on hook-less hosts, so the server releases the first-user-message
+    // pin directly when a completion record is written. decision/bug_resolved
+    // are the completion types (`todo` is a checklist, not a completion).
+    // Fail-open: a failed release never blocks the save.
+    if (type === "decision" || type === "bug_resolved") {
+      const sid = (process.env.QWEN_CODE_SESSION_ID || "").trim();
+      if (sid) {
+        try {
+          const res = kvOffload.setPinReleased(sid);
+          if (res.ok) log(`[pin-release] session=${sid} completion write-back (type=${type}) -> pin_released=true`);
+        } catch (err) {
+          log(`[pin-release] session=${sid} write-back release failed: ${err.message}`);
+        }
+      }
+    }
     const autoNote = effectiveSupersedes && !supersedes ? ` (auto-superseded ${effectiveSupersedes.slice(0, 8)})` : "";
     return { content: [{ type: "text", text: `Saved successfully. decision_id: ${decision_id}, topic_key: ${resolvedTopic}${autoNote}${supersedesNote}` }] };
   }
@@ -2502,19 +2518,160 @@ httpApp.get("/v1/kv-offload/chunks", async (c) => {
   return c.json({ ok: true, session_id: sessionId, chunks });
 });
 
+// ─── Server-side pin release (2026-11-03) ────────────────────────────────
+// The B4 pin flag is normally set by the qwen hook path (PreCompact /
+// UserPromptSubmit state workers). When that path is dead (extension not
+// installed, hook crash) the pin is held forever and the finished task's
+// first user message keeps steering the model (re-latch). These server-side
+// releasers run in THIS process, so the release no longer depends on the hook
+// path; both write the same sticky flag the engine already polls.
+//   (a) chain closure — the session's own todo chains are all done
+//   (b) completion write-back — remember_decision(decision/bug_resolved)
+// Fail-open: any error keeps the current (pinned) behavior.
+
+// Negative cache for the (a) chain-closure check: the engine polls this
+// endpoint on every eviction plan, so an "not closed" verdict is memoized for
+// 10s to bound Qdrant load. A "closed" verdict persists via the sticky flag,
+// so only negatives re-run.
+const PIN_CHAIN_CHECK_TTL_MS = 10000;
+const pinChainCheckCache = new Map(); // sessionId -> { at, closed }
+
+/**
+ * Topic_keys this session actively maintains (its own remember_decision calls
+ * in the transcript) — same scoping as the PreCompact worker, so another
+ * session's chains never steer this one's pin.
+ * @param {string} transcriptPath - the session transcript JSONL
+ * @returns {Promise<Set<string>>} topic_keys (empty when unreadable/none)
+ */
+async function scanSessionTopics(transcriptPath) {
+  const topics = new Set();
+  try {
+    const raw = await fs.readFile(transcriptPath, "utf8");
+    for (const line of raw.split("\n")) {
+      if (!line.includes("remember_decision") || !line.includes("topic_key")) continue;
+      for (const m of line.matchAll(/"topic_key"\s*:\s*"([a-zA-Z0-9_-]+)"/g)) topics.add(m[1]);
+    }
+  } catch { /* unreadable transcript → no scoping → no chain closure */ }
+  return topics;
+}
+
+/**
+ * Compute the open/closed state of todo chains, optionally scoped to a set of
+ * topic_keys. Shared by the /v1/todo-chains endpoint and the server-side pin
+ * release (a). Pure Qdrant read; throws on error (callers handle it).
+ * @param {Set<string>|null} topicSet - restrict to these topics, or null for all
+ * @returns {Promise<Array<{topic_key: string, summary: string, timestamp: string|null, unchecked: string[], all_done: boolean}>>}
+ */
+async function fetchTodoChainState(topicSet) {
+  const todos = await qdrant.scroll("work_memory", {
+    filter: { must: [{ key: "type", match: { value: "todo" } }] },
+    limit: 100,
+    with_payload: ["summary_text", "detail", "timestamp"],
+  });
+  const chains = await qdrant.scroll("decision_chains", {
+    filter: { must: [{ key: "status", match: { value: "active" } }] },
+    limit: 500,
+    with_payload: ["content", "topic_key", "created_at"],
+  });
+  // content(=summary_text) -> topic (newest record wins on duplicates)
+  const topicByContent = new Map();
+  for (const pt of chains.points) {
+    const content = pt.payload.content;
+    const topic = pt.payload.topic_key;
+    if (!content || !topic) continue;
+    const prev = topicByContent.get(content);
+    if (!prev || String(pt.payload.created_at || "") >= String(prev.created_at)) {
+      topicByContent.set(content, { topic, created_at: pt.payload.created_at });
+    }
+  }
+  // newest work_memory record per summary_text, then per topic — the
+  // protocol's updates keep the task name (summary_text) stable, but a
+  // drifted name would otherwise double-count one chain's steps.
+  const latestBySummary = new Map();
+  for (const pt of todos.points) {
+    const summary = pt.payload.summary_text;
+    if (!summary) continue;
+    const prev = latestBySummary.get(summary);
+    if (!prev || String(pt.payload.timestamp || "") >= String(prev.timestamp)) {
+      latestBySummary.set(summary, pt.payload);
+    }
+  }
+  const byTopic = new Map(); // topic -> { ts, summary, unchecked, all_done }
+  for (const [summary, payload] of latestBySummary) {
+    const chain = topicByContent.get(summary);
+    if (!chain) continue; // no topic -> unjoinable, skip (scoping needs a topic)
+    if (topicSet && !topicSet.has(chain.topic)) continue;
+    const detail = typeof payload.detail === "string" ? payload.detail : "";
+    if (!/^\s*-\s*\[( |x)\]/m.test(detail)) continue; // not a checklist record
+    const unchecked = [];
+    for (const line of detail.split("\n")) {
+      const m = line.match(/^\s*-\s*\[\s\]\s*(.+)$/);
+      if (m) unchecked.push(m[1].trim());
+    }
+    const ts = String(payload.timestamp || "");
+    const cur = byTopic.get(chain.topic);
+    if (!cur || ts >= cur.ts) byTopic.set(chain.topic, { ts, summary, unchecked, all_done: unchecked.length === 0 });
+  }
+  return [...byTopic.entries()]
+    .map(([topic, v]) => ({ topic_key: topic, summary: v.summary, timestamp: v.ts || null, unchecked: v.unchecked, all_done: v.all_done }))
+    .sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || ""));
+}
+
+/**
+ * (a) Chain-closure check: true when the session has todo chains AND every one
+ * of its newest checklist records is fully done. Returns false (fail-open)
+ * when there is no transcript, no topics, or no checklist records — those are
+ * "not verifiable", not "closed".
+ * @param {string} sessionId
+ * @returns {Promise<boolean>}
+ */
+async function sessionTodoChainsClosed(sessionId) {
+  const now = Date.now();
+  const cached = pinChainCheckCache.get(sessionId);
+  if (cached && now - cached.at < PIN_CHAIN_CHECK_TTL_MS) return cached.closed;
+  let closed = false;
+  try {
+    const transcriptPath = skillState.ensureTranscriptPath(sessionId);
+    if (transcriptPath) {
+      const topics = await scanSessionTopics(transcriptPath);
+      if (topics.size) {
+        const out = await fetchTodoChainState(topics);
+        closed = out.length > 0 && out.every((t) => t.all_done);
+      }
+    }
+  } catch (err) {
+    log(`[pin-release] chain check failed session=${sessionId}: ${err.message}`);
+  }
+  pinChainCheckCache.set(sessionId, { at: now, closed });
+  return closed;
+}
+
 // Session-level pin-released flag (B4): the engine queries it at each
 // eviction plan. Set by the FocusMemory state worker when the user has
 // revoked the session's original first task; while true the engine's
 // first-user-message pin is released and that message becomes a normal
 // evictable middle message. Absent/corrupt -> pin_released false (the
 // engine's fail-open default keeps the pin).
+// Server-side release (2026-11-03): when the stored flag is false, also check
+// the session's todo-chain closure (a) — the hook-independent path that
+// releases the pin when the task is verifiably done.
 httpApp.get("/v1/kv-offload/session", async (c) => {
   const denied = kvAuth(c);
   if (denied) return denied;
   if (!kvOffload.kvOffloadEnabled()) return c.json({ error: "kv-offload disabled" }, 404);
   const sessionId = c.req.query("session_id") || "";
   if (!sessionId) return c.json({ error: "session_id required" }, 400);
-  const pinReleased = kvOffload.getPinReleased(sessionId);
+  let pinReleased = kvOffload.getPinReleased(sessionId);
+  if (!pinReleased) {
+    const closed = await sessionTodoChainsClosed(sessionId);
+    if (closed) {
+      const res = kvOffload.setPinReleased(sessionId);
+      if (res.ok) {
+        pinReleased = true;
+        log(`[pin-release] session=${sessionId} todo-chains closed -> pin_released=true`);
+      }
+    }
+  }
   log(`[kv-offload] SESSION session=${sessionId} pin_released=${pinReleased}`);
   return c.json({ ok: true, session_id: sessionId, pin_released: pinReleased });
 });
@@ -2535,58 +2692,7 @@ httpApp.get("/v1/todo-chains", async (c) => {
   const topicsParam = c.req.query("topics") || "";
   const topicSet = topicsParam ? new Set(topicsParam.split(",").map((t) => t.trim()).filter(Boolean)) : null;
   try {
-    const todos = await qdrant.scroll("work_memory", {
-      filter: { must: [{ key: "type", match: { value: "todo" } }] },
-      limit: 100,
-      with_payload: ["summary_text", "detail", "timestamp"],
-    });
-    const chains = await qdrant.scroll("decision_chains", {
-      filter: { must: [{ key: "status", match: { value: "active" }}] },
-      limit: 500,
-      with_payload: ["content", "topic_key", "created_at"],
-    });
-    // content(=summary_text) -> topic (newest record wins on duplicates)
-    const topicByContent = new Map();
-    for (const pt of chains.points) {
-      const content = pt.payload.content;
-      const topic = pt.payload.topic_key;
-      if (!content || !topic) continue;
-      const prev = topicByContent.get(content);
-      if (!prev || String(pt.payload.created_at || "") >= String(prev.created_at)) {
-        topicByContent.set(content, { topic, created_at: pt.payload.created_at });
-      }
-    }
-    // newest work_memory record per summary_text, then per topic — the
-    // protocol's updates keep the task name (summary_text) stable, but a
-    // drifted name would otherwise double-count one chain's steps.
-    const latestBySummary = new Map();
-    for (const pt of todos.points) {
-      const summary = pt.payload.summary_text;
-      if (!summary) continue;
-      const prev = latestBySummary.get(summary);
-      if (!prev || String(pt.payload.timestamp || "") >= String(prev.timestamp)) {
-        latestBySummary.set(summary, pt.payload);
-      }
-    }
-    const byTopic = new Map(); // topic -> { ts, summary, unchecked, all_done }
-    for (const [summary, payload] of latestBySummary) {
-      const chain = topicByContent.get(summary);
-      if (!chain) continue; // no topic -> unjoinable, skip (scoping needs a topic)
-      if (topicSet && !topicSet.has(chain.topic)) continue;
-      const detail = typeof payload.detail === "string" ? payload.detail : "";
-      if (!/^\s*-\s*\[( |x)\]/m.test(detail)) continue; // not a checklist record
-      const unchecked = [];
-      for (const line of detail.split("\n")) {
-        const m = line.match(/^\s*-\s*\[\s\]\s*(.+)$/);
-        if (m) unchecked.push(m[1].trim());
-      }
-      const ts = String(payload.timestamp || "");
-      const cur = byTopic.get(chain.topic);
-      if (!cur || ts >= cur.ts) byTopic.set(chain.topic, { ts, summary, unchecked, all_done: unchecked.length === 0 });
-    }
-    const out = [...byTopic.entries()]
-      .map(([topic, v]) => ({ topic_key: topic, summary: v.summary, timestamp: v.ts || null, unchecked: v.unchecked, all_done: v.all_done }))
-      .sort((a, b) => (a.timestamp || "").localeCompare(b.timestamp || ""));
+    const out = await fetchTodoChainState(topicSet);
     log(`[todo-chains] GET topics=${topicSet ? [...topicSet].join(",") : "all"} n=${out.length}`);
     return c.json({ ok: true, todos: out });
   } catch (err) {
