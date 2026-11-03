@@ -32,13 +32,13 @@
         ]
       },
       {
-        "description": "SKILL.state — per-prompt mechanical bookkeeping (no injection): scrubs foreign-session refs from Σ, flips the completion signal on task completion, releases the B4 pin, and resets the current view. No LLM call, millisecond-scale. Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
+        "description": "SKILL.state — per-prompt mechanical bookkeeping + one-shot boundary compensation: scrubs foreign-session refs from Σ, flips the completion signal on task completion, releases the B4 pin, resets the current view, and — when the Stop hook armed the compressFast boundary (context ≥ FOCUSMEMORY_BOUNDARY_PCT) and this is the first prompt after — synchronously reconstructs the stripped state via the main LLM (MAIN_LLM, 30s cap, one retry) and injects it once as additionalContext. Steady state: no LLM call, millisecond-scale. Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
         "hooks": [
           {
             "type": "command",
             "command": "node ${extensionPath}${/}hooks${/}userprompt-inject-state.js",
             "name": "userprompt-inject-state",
-            "timeout": 3000
+            "timeout": 40000
           }
         ]
       }
@@ -102,7 +102,7 @@
         ]
       },
       {
-        "description": "SKILL.state — per-Stop bookkeeping: records last_input_tokens, transcript_path, and last_turn_completion_signal in a locked read-modify-write (no extraction, no worker spawn). Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
+        "description": "SKILL.state — per-Stop bookkeeping + boundary detection: records last_input_tokens, context_usage/context_limit, transcript_path, and last_turn_completion_signal in a locked read-modify-write; spawns the detached Σ extraction worker (SUMMARY_LLM) on token delta (FOCUSMEMORY_EXTRACT_DELTA_TOKENS) and arms the compressFast boundary at the crossing (FOCUSMEMORY_BOUNDARY_PCT, sticky, one-shot non-blocking systemMessage + final delta extraction). Gated by FOCUSMEMORY_SKILLSTATE=on (off/unset → immediate no-op, fail-open)",
         "hooks": [
           {
             "type": "command",

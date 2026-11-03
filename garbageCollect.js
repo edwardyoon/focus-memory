@@ -4,15 +4,14 @@
 // integrity and code-index freshness are managed elsewhere (recency decay,
 // file-existence sync).
 //
-//   Phase A — todos/YYYY-MM-DD.md older than GC_TODOS_RETENTION_DAYS are
-//             MOVED (not deleted; todos/ is not under version control) to
-//             GC_ARCHIVE_DIR/YYYY-MM/. The archive dir lives outside TODOS_DIR
-//             so autoIngest never re-indexes it; autoIngest's deleted-file
-//             detection drops the Meilisearch doc on the next cycle.
-//   Phase B — work_memory points with type=state_checkpoint and
+//   The todo queue is DB-based (udanax.todo_tasks, lib/taskdb.js) — the old
+//   file-archive phase (todos/YYYY-MM-DD.md → todos_archive/) was removed
+//   with the file-based todos; DB rows have no retention.
+//
+//   Phase A — work_memory points with type=state_checkpoint and
 //             timestamp < cutoff are deleted by explicit ID list (narrow
 //             filter + ID delete; no broad filter delete against work_memory).
-//   Phase C — the ENTIRE ~/.qwen/tmp tree: files with mtime older than
+//   Phase B — the ENTIRE ~/.qwen/tmp tree: files with mtime older than
 //             GC_SESSION_RETENTION_DAYS are deleted, then directories that
 //             become empty are removed (bottom-up). qwen-code never cleans
 //             this tree itself (per-session attachments, tool-results,
@@ -39,13 +38,10 @@ dotenv.config({
   path: path.join(path.dirname(fileURLToPath(import.meta.url)), ".env"),
 });
 
-const TODOS_DIR = process.env.TODOS_DIR || path.join(process.cwd(), "..", "todos");
-const GC_ARCHIVE_DIR =
-  process.env.GC_ARCHIVE_DIR || path.join(path.dirname(TODOS_DIR), "todos_archive");
 const QDRANT_URL = process.env.QDRANT_URL || "http://127.0.0.1:6333";
 const GC_LOG_FILE = "/tmp/focus-memory/gc.log";
 
-// Phase C — sweep root (see header): the whole tree under this dir is
+// Phase B — sweep root (see header): the whole tree under this dir is
 // age-pruned by file mtime.
 const QWEN_TMP = path.join(os.homedir(), ".qwen", "tmp");
 
@@ -117,59 +113,7 @@ async function releaseLock() {
 }
 
 /**
- * Local-time YYYY-MM-DD string N days before today (ISO dates compare
- * correctly lexicographically, so string comparison is the date comparison).
- * @param {number} days
- * @returns {string}
- */
-function cutoffDateString(days) {
-  const d = new Date();
-  d.setDate(d.getDate() - days);
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
-/**
- * Phase A — archive todo files older than the retention window.
- * @param {number} retentionDays
- * @returns {Promise<{archived: string[], skipped: number}>} archived file
- *   names (non-matching entries are counted in `skipped`, never touched)
- */
-async function gcTodos(retentionDays) {
-  const archived = [];
-  let skipped = 0;
-  let entries;
-  try {
-    entries = await fs.readdir(TODOS_DIR);
-  } catch {
-    return { archived, skipped };
-  }
-  const cutoffStr = cutoffDateString(retentionDays);
-  for (const name of entries) {
-    const m = name.match(/^(\d{4}-\d{2}-\d{2})\.md$/);
-    if (!m) {
-      skipped++;
-      continue;
-    }
-    const dateStr = m[1];
-    if (dateStr >= cutoffStr) continue;
-    const src = path.join(TODOS_DIR, name);
-    const monthDir = path.join(GC_ARCHIVE_DIR, dateStr.slice(0, 7));
-    try {
-      if (!DRY_RUN) {
-        await fs.mkdir(monthDir, { recursive: true });
-        await fs.rename(src, path.join(monthDir, name));
-      }
-      archived.push(name);
-    } catch (err) {
-      console.error(`  ✗ todos: ${name} — ${err.message}`);
-    }
-  }
-  return { archived, skipped };
-}
-
-/**
- * Phase B — delete work_memory state_checkpoint points older than the
+ * Phase A — delete work_memory state_checkpoint points older than the
  * retention window. Only point IDs collected under the narrow
  * (type=state_checkpoint AND timestamp < cutoff) filter are deleted.
  * @param {QdrantClient} qdrant
@@ -208,7 +152,7 @@ async function gcCheckpoints(qdrant, retentionDays) {
 }
 
 /**
- * Phase C — sweep the entire ~/.qwen/tmp tree: delete files whose mtime is
+ * Phase B — sweep the entire ~/.qwen/tmp tree: delete files whose mtime is
  * older than the retention window, then remove directories that become empty
  * (bottom-up). A file written within the window (an active session) is never
  * deleted; mtime is the liveness signal. Symlinks and special entries are
@@ -274,9 +218,9 @@ async function gcQwenTmp(retentionDays) {
 }
 
 /**
- * GC entry point: runs Phase A (todos archive), Phase B (checkpoint
- * retention) and Phase C (~/.qwen/tmp tree retention) when GC_ENABLED=on,
- * logging a one-line summary to gc.log.
+ * GC entry point: runs Phase A (checkpoint retention) and Phase B
+ * (~/.qwen/tmp tree retention) when GC_ENABLED=on, logging a one-line
+ * summary to gc.log.
  * @returns {Promise<void>}
  */
 async function main() {
@@ -289,27 +233,16 @@ async function main() {
   }
 
   await acquireLock();
-  const todosDays = daysToNumber(process.env.GC_TODOS_RETENTION_DAYS, 30);
   const checkpointDays = daysToNumber(process.env.GC_CHECKPOINT_RETENTION_DAYS, 30);
   const sessionDays = daysToNumber(process.env.GC_SESSION_RETENTION_DAYS, 7);
   console.log(
-    `[config] todos retention ${todosDays}d, checkpoint retention ${checkpointDays}d, ` +
-      `qwen-tmp retention ${sessionDays}d, archive ${GC_ARCHIVE_DIR}`
+    `[config] checkpoint retention ${checkpointDays}d, ` +
+      `qwen-tmp retention ${sessionDays}d`
   );
 
   try {
-    // ── Phase A: todos retention ─────────────────────────────────
-    console.log(`--- Phase A: todos retention (${todosDays}d) ---`);
-    const { archived, skipped } = await gcTodos(todosDays);
-    console.log(
-      `  ${DRY_RUN ? "would archive" : "archived"} ${archived.length} todo file(s) [skipped ${skipped} non-date file(s)]`
-    );
-    for (const name of archived) {
-      console.log(`  [archive] ${name} → ${GC_ARCHIVE_DIR}/${name.slice(0, 7)}/`);
-    }
-
-    // ── Phase B: state_checkpoint retention ──────────────────────
-    console.log(`--- Phase B: state_checkpoint retention (${checkpointDays}d) ---`);
+    // ── Phase A: state_checkpoint retention ──────────────────────
+    console.log(`--- Phase A: state_checkpoint retention (${checkpointDays}d) ---`);
     const qdrant = new QdrantClient({ url: QDRANT_URL });
     let removed = 0;
     try {
@@ -319,8 +252,8 @@ async function main() {
     }
     console.log(`  ${DRY_RUN ? "would delete" : "deleted"} ${removed} state_checkpoint point(s)`);
 
-    // ── Phase C: ~/.qwen/tmp tree retention ──────────────────────
-    console.log(`--- Phase C: ~/.qwen/tmp tree retention (${sessionDays}d) ---`);
+    // ── Phase B: ~/.qwen/tmp tree retention ──────────────────────
+    console.log(`--- Phase B: ~/.qwen/tmp tree retention (${sessionDays}d) ---`);
     const { removed: tmpRemoved, dirsRemoved } = await gcQwenTmp(sessionDays);
     console.log(
       `  ${DRY_RUN ? "would delete" : "deleted"} ${tmpRemoved.length} file(s) + ${dirsRemoved} emptied dir(s) under ~/.qwen/tmp`
@@ -330,9 +263,8 @@ async function main() {
     }
 
     await gcLog(
-      `gc ${DRY_RUN ? "dry-run" : "run"} todos_archived=${archived.length} ` +
-        `checkpoints_removed=${removed} tmp_removed=${tmpRemoved.length} ` +
-        `tmp_dirs_removed=${dirsRemoved}`
+      `gc ${DRY_RUN ? "dry-run" : "run"} checkpoints_removed=${removed} ` +
+        `tmp_removed=${tmpRemoved.length} tmp_dirs_removed=${dirsRemoved}`
     );
     console.log("=== Done ===");
   } finally {

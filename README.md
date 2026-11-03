@@ -68,7 +68,7 @@ Everything the engine needs to remember — four pillars cover the full memory c
 | # | Pillar | What it manages | Backend |
 |---|--------|-----------------|---------|
 | **01** | **Declarative attention** | Magic-chunk attention — the model names exactly which chunks it wants in context (`<focus magic_chunks="N">`); evicted chunks come back verbatim, not re-derived. | `--da-auto` (engine) · `focus` tool + `[[da:N]]` marker injection (server, test path) |
-| **02** | **skill.state (Σ)** | Structured execution state extracted pre-compaction, re-injected post-compaction — the agent resumes from explicit state, not a lossy prose summary. | SKILL.state hooks + per-session Σ file |
+| **02** | **skill.state (Σ)** | Structured execution state across compaction — extracted mid-session (token delta) and at the compressFast boundary (~70% → `/compress-fast` + one-shot main-LLM compensation), re-injected post-compaction — the agent resumes from explicit state, not a lossy prose summary. | SKILL.state hooks (Stop / UserPromptSubmit / PreCompact / SessionStart) + per-session Σ file |
 | **03** | **Memory management** | Durable project knowledge — semantic search, causal decision chains, code graph, task memory. Independent of the context window. | Qdrant + Meilisearch + tree-sitter AST graph |
 | **04** | **KV store** | A dumb per-session verbatim store for evicted context — the lossless-recall backend behind focus-llama's `--fm-offload`. | Per-session JSON store (`~/.qwen/tmp/focus-memory/kv-offload/`) |
 
@@ -189,7 +189,7 @@ The gate passes only when `memoryCalledEpoch === turnEpoch` — a stamp from an 
 
 ## SKILL.state — execution state across compaction
 
-Long sessions get compacted: qwen-code replaces the conversation with a lossy prose summary. SKILL.state (based on [arXiv:2608.26263]) extracts a **structured state patch (Σ)** from the pre-compaction transcript and re-injects it after compaction, so the agent resumes from explicit state instead of reconstructed history.
+Long sessions get compacted: qwen-code replaces the conversation with a lossy prose summary. SKILL.state (based on [arXiv:2608.26263]) extracts a **structured state patch (Σ)** from the transcript and re-injects it after compaction, so the agent resumes from explicit state instead of reconstructed history. Since 2026-11-03 it also drives the **compressFast boundary**: at ~70% context the Stop hook tells the user `/compress-fast` is ready, and the next prompt's UserPromptSubmit hook reconstructs the state the fast strip removed via the main LLM — so the cheap strip costs no state, and native auto-compaction (threshold 1.0) is only the safety net.
 
 **Enable:**
 ```bash
@@ -197,15 +197,23 @@ Long sessions get compacted: qwen-code replaces the conversation with a lossy pr
 FOCUSMEMORY_SKILLSTATE=on
 # optional, default 30000 (min 2000) — transcript tail size for extraction
 # FOCUSMEMORY_SKILLSTATE_MAX_CHARS=30000
+# optional, default 0.70 — context_usage ratio at which the Stop hook arms the
+# compressFast boundary (one systemMessage + final delta extraction)
+# FOCUSMEMORY_BOUNDARY_PCT=0.70
+# optional, default 20000 — token growth since the last spawn at which the
+# Stop hook runs a periodic delta extraction
+# FOCUSMEMORY_EXTRACT_DELTA_TOKENS=20000
+
+# ~/.qwen/settings.json — native auto-compaction only at the hard limit
+# "context": { "autoCompactThreshold": 1.0 }
 ```
 Off by default — with the flag unset, all hooks return immediately (25–40 ms, zero output); auto-recall and the Hard Gate are untouched.
 
-**How it works** (fail-open throughout — any failure leaves native compaction exactly as-is):
+**How it works** — three layers, fail-open throughout (any failure leaves the session exactly as-is):
 
-- **Stop (every turn)** records bookkeeping fields in a locked read-modify-write — `last_input_tokens` (context size from the `contextUsage` field qwen-code provides on `Stop`), `transcript_path` (used by the `recent_work` MCP tool to resolve the session), and `last_turn_completion_signal` (input to the UserPromptSubmit flip). No extraction, no worker spawn, no model-facing output.
-- **PreCompact** spawns the same worker as a final pass and exits in milliseconds — native compaction is never blocked. The worker reads the transcript tail (default 30k chars), calls the extraction LLM (SUMMARY_LLM → MAIN_LLM fallback) for a JSON state patch, merges it into Σ (`Σ_{t+1} = Σ_t ⊕ Δ`; null deletes a key), and saves it.
-- **UserPromptSubmit (every turn)** — mechanical maintenance only (no injection, no LLM): scrubs stale foreign refs from Σ, flips the completion signal (sets the `anchor_done_next` baseline), releases the B4 pin, and resets the current view. These keep the anchor lifecycle current so SessionStart re-injection and the ghost-gate / evict-extract gates stay correct. Mid-turn Σ re-presentation is an opt-in beta feature of focus-llama's own Σ fetch (see the kv-offload section — off by default) — the hooks no longer inject Σ into the prompt.
-- **SessionStart** (`compact` only) loads Σ and injects it as `additionalContext`, preferred over the native prose summary for "where are we" questions.
+- **Stop (every turn) — bookkeeping + boundary detection.** Records `last_input_tokens`, `context_usage`/`context_limit` (from the `contextUsage` spread qwen-code provides on `Stop`), `transcript_path` (used by the `recent_work` MCP tool to resolve the session), and `last_turn_completion_signal` (input to the UserPromptSubmit flip) in a locked read-modify-write. Then: when input tokens grew ≥ `FOCUSMEMORY_EXTRACT_DELTA_TOKENS` (default 20k) since the last spawn, it spawns the detached Σ extraction worker (`--llm summary` → gemma-4) to keep Σ fresh mid-session; when `context_usage` crosses `FOCUSMEMORY_BOUNDARY_PCT` (default 70%) it arms the boundary (sticky `boundary_armed`), spawns the final delta extraction, and emits a one-shot non-blocking `systemMessage` — the turn ends normally, the message just tells the user `/compress-fast` is ready.
+- **UserPromptSubmit (every turn) — mechanical maintenance + one-shot boundary compensation.** Steady state (no armed boundary): the four mechanical features only — foreign-ref scrub, completion-signal flip (sets the `anchor_done_next` baseline), B4 pin release, current-view reset — no LLM call, millisecond-scale. These keep the anchor lifecycle current so SessionStart re-injection and the ghost-gate / evict-extract gates stay correct. When the boundary is armed and this is the first prompt after (the `/compress-fast` strip fires NO hooks — detection lives in Stop, compensation here), the hook calls the main LLM (`MAIN_LLM` → qwen27b, 30s cap, one retry on failure) with Σ + the transcript tail to reconstruct the state the strip removed, and injects it once as `additionalContext` — the `<qwen:user-prompt-submit-context>` block survives the strip, so the model keeps the state. After 2 failed attempts it marks the boundary consumed so a down model never blocks every prompt. Mid-turn Σ re-presentation is an opt-in beta feature of focus-llama's own Σ fetch (see the kv-offload section — off by default) — the hooks no longer inject Σ into the prompt.
+- **Native compaction (safety net at the hard limit).** `autoCompactThreshold: 1.0` in `~/.qwen/settings.json`, so native auto-compaction only fires when the window is actually full. **PreCompact** spawns the same extraction worker (never blocking compaction) — the worker reads the transcript tail (default 30k chars), calls the extraction LLM (SUMMARY_LLM → MAIN_LLM fallback) for a JSON state patch, merges it into Σ (`Σ_{t+1} = Σ_t ⊕ Δ`; null deletes a key), and saves it — and **SessionStart** (`compact` only) re-injects Σ as `additionalContext`, preferred over the native prose summary for "where are we" questions.
 
 **Σ schema:**
 
@@ -218,7 +226,7 @@ Off by default — with the flag unset, all hooks return immediately (25–40 ms
 | `decisions` | union, capped at 50 |
 | `tests_status` | merge (`{ "<check>": "pass\|fail\|pending" }`) |
 
-Internal bookkeeping keys (owned by the hooks, never part of an extraction patch, excluded from the anchor): `last_input_tokens` (context size at the last Stop), `transcript_path` (session transcript, used by the `recent_work` MCP tool), `last_turn_completion_signal` (input to the UserPromptSubmit flip), `last_extraction_transcript_bytes` (worker delta baseline — Stop-era files read the delta from the old offset, new sessions full-tail), `compact_count`.
+Internal bookkeeping keys (owned by the hooks, never part of an extraction patch, excluded from the anchor): `last_input_tokens` (context size at the last Stop), `context_usage`/`context_limit` (window ratio/size at the last Stop), `transcript_path` (session transcript, used by the `recent_work` MCP tool), `last_turn_completion_signal` (input to the UserPromptSubmit flip), `last_extraction_transcript_bytes` (worker delta baseline — Stop-era files read the delta from the old offset, new sessions full-tail), `last_extraction_tokens` (token baseline for the periodic delta spawn), `boundary_armed`/`boundary_armed_tokens`/`boundary_consumed`/`boundary_retry` (compressFast boundary lifecycle — armed at the crossing, consumed by the one-shot compensation), `compact_count`.
 
 **Measured overhead:** ~9.8k input tokens (30k rendered tail) per extraction, plus the model's reasoning tokens — runs detached in parallel with native compaction, so it adds no user-facing latency. The extraction calls the chat completions API with `enable_thinking: true`: the model reasons in a separate `reasoning_content` field (discarded) and returns clean JSON in `content`. This replaced the earlier in-prompt `/no_think` token, which the 27B model intermittently ignored — leaking chain-of-thought into the JSON and breaking it (≈20% parse failures on normal tails, ≈100% on tails dominated by prompt-like content). Thinking makes the call slower (tens of seconds vs ~4s) but reliable; the detached worker absorbs the latency.
 
@@ -362,11 +370,12 @@ node FocusMemory/todoRunner.js --dry-run                   # preview the target 
 
 ## Garbage collection
 
-Most of the system is self-cleaning: session state files are swept by `cleanup-session.js` (7-day), the gate telemetry JSONL is size-bounded, and every indexer (autoIngest, buildGraph, indexCodeStructure, indexCodeChunks) drops entries for files deleted from disk. Three accumulators are unbounded by design and need time-based retention — `garbageCollect.js` (daily via `config/com.focusmemory.gc.plist`):
+Most of the system is self-cleaning: session state files are swept by `cleanup-session.js` (7-day), the gate telemetry JSONL is size-bounded, and every indexer (autoIngest, buildGraph, indexCodeStructure, indexCodeChunks) drops entries for files deleted from disk. Two accumulators are unbounded by design and need time-based retention — `garbageCollect.js` (daily via `config/com.focusmemory.gc.plist`):
+
+The todo queue is DB-based (`udanax.todo_tasks`, `lib/taskdb.js`) — the former file-archive phase (`todos/YYYY-MM-DD.md` → `GC_ARCHIVE_DIR/`) was removed with the file-based todos; DB rows have no retention.
 
 | Target | Rule | Why safe |
 |---|---|---|
-| `todos/YYYY-MM-DD.md` | older than `GC_TODOS_RETENTION_DAYS` → **moved** to `GC_ARCHIVE_DIR/YYYY-MM/` | todos/ is not under version control, so the move keeps it reversible; the archive dir is outside `TODOS_DIR` so autoIngest never re-indexes it, and its deleted-file detection drops the Meilisearch doc. todoRunner only scans the last 3 days. |
 | `work_memory` `type=state_checkpoint` | `timestamp` older than `GC_CHECKPOINT_RETENTION_DAYS` → deleted by explicit ID list | legacy drain only — the per-session double-write was removed (the Σ file on disk is the source of truth, swept at 7 days), so no new points are created; this phase retires the points written before the removal. |
 | `~/.qwen/tmp` (entire tree) | file `mtime` older than `GC_SESSION_RETENTION_DAYS` → deleted, then directories that become empty are removed (bottom-up) | qwen-code accumulates per-session artifacts here (attachments, tool-results, background-shells, logs, skill state, kv-offload, tool-calls) and never cleans them up itself. Active sessions keep rewriting their files, so mtime is the liveness signal: anything written within the window is never deleted. |
 
@@ -375,10 +384,8 @@ Most of the system is self-cleaning: session state files are swept by `cleanup-s
 ```
 # FocusMemory/.env
 GC_ENABLED=on
-GC_TODOS_RETENTION_DAYS=30
 GC_CHECKPOINT_RETENTION_DAYS=30
 GC_SESSION_RETENTION_DAYS=7
-GC_ARCHIVE_DIR={your_workspace}/todos_archive
 ```
 
 ```bash
@@ -508,10 +515,10 @@ FocusMemory/
 │   ├── check-writeback.js     # Stop: detect completion, ask to record decision
 │   ├── log-tool-call.js       # PreToolUse: track tool calls and state flags
 │   ├── reset-memory-flag.js   # UserPromptSubmit: reset turn-level flags
-│   ├── userprompt-inject-state.js    # SKILL.state: per-turn state anchor injection
-│   ├── precompact-extract-state.js   # SKILL.state: spawn detached Σ extraction worker
+│   ├── userprompt-inject-state.js    # SKILL.state: mechanical anchor maintenance + one-shot boundary compensation
+│   ├── precompact-extract-state.js   # SKILL.state: spawn detached Σ extraction worker (--llm summary|main)
 │   ├── sessionstart-inject-state.js  # SKILL.state: re-inject Σ after compaction
-│   ├── stop-checkpoint-state.js      # SKILL.state: per-Stop state-change + growth checkpoints
+│   ├── stop-checkpoint-state.js      # SKILL.state: per-Stop bookkeeping + boundary detection (delta spawn, 70% arm)
 │   ├── cleanup-session.js     # SessionEnd: per-session + 7-day sweep
 │   └── lib/                   # state.js (locking, atomic write, telemetry), skillstate.js (Σ merge, extraction)
 ├── docs/ plans/               # Project knowledge inputs (created by init.js)

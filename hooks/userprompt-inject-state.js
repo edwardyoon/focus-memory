@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// UserPromptSubmit hook — SKILL.state mechanical anchor lifecycle maintenance.
+// UserPromptSubmit hook — SKILL.state mechanical anchor lifecycle maintenance
+// + one-shot boundary compensation.
 //
-// No model-facing output. Four mechanical features run on every user prompt
-// (gated by FOCUSMEMORY_SKILLSTATE=on); they keep the anchor lifecycle
-// current so the SessionStart(compact) re-injection and the Stop gate's
-// anchor window stay correct:
+// Four mechanical features run on every user prompt (gated by
+// FOCUSMEMORY_SKILLSTATE=on); they keep the anchor lifecycle current so the
+// SessionStart(compact) re-injection and the Stop gate's anchor window stay
+// correct:
 //   1. foreign-session scrub — Σ files written before the merge-time gate (or
 //      via a leak it missed) may carry another session's state-file citation;
 //      scrub at presentation time and persist the scrub when it removed
@@ -17,6 +18,14 @@
 //   4. current-view reset — on the first user message after a completion,
 //      wipe the current-view keys (confirmed/hypothesis/next/legacy) so
 //      the finished task's view does not re-latch the model.
+//   5. boundary compensation (2026-11-03 compressFast boundary) — one-shot,
+//      the ONLY LLM call this hook makes: when the Stop hook armed the
+//      boundary (context ≥ FOCUSMEMORY_BOUNDARY_PCT, default 70%) and this is
+//      the first prompt after (the /compress-fast strip fires NO hooks),
+//      call the main LLM (qwen27b, 30s cap) to reconstruct the state the
+//      strip removed and inject it once as additionalContext — the
+//      <qwen:user-prompt-submit-context> block survives the strip. In steady
+//      state (boundary not armed) feature 5 is a flag check — milliseconds.
 //
 // The per-turn Σ injection (anchor/ctx block, offloaded instruction ledger,
 // verbatim current-user-instruction block, language directive) was removed
@@ -34,12 +43,19 @@ const fs = require('fs');
 const ss = require('./lib/skillstate.js');
 const kv = require('./lib/kvoffload.js');
 
+// Boundary compensation sizing (2026-11-03): the call runs SYNCHRONOUSLY
+// inside the UserPromptSubmit hook timeout (qwen-extension.json: 40s), so
+// the caps target a fast qwen27b round trip on the 5090 node — not the
+// detached worker's 120s envelope.
+const BOUNDARY_TAIL_CHARS = Math.max(2000, parseInt(ss.env('FOCUSMEMORY_BOUNDARY_TAIL_CHARS', '15000'), 10) || 15000);
+const BOUNDARY_TIMEOUT_MS = 30000;
+
 /**
- * UserPromptSubmit hook entry — mechanical anchor lifecycle maintenance only.
- * Emits no model-facing output.
- * @returns {void}
+ * UserPromptSubmit hook entry — mechanical anchor lifecycle maintenance +
+ * one-shot boundary compensation (feature 5, the only LLM call).
+ * @returns {Promise<void>}
  */
-function main() {
+async function main() {
   if (!ss.skillStateEnabled()) return; // gate off → zero behavior change
 
   const raw = fs.readFileSync(0, 'utf8');
@@ -181,6 +197,60 @@ function main() {
       // fail-open
     }
   }
+
+  // Boundary compensation (2026-11-03 compressFast boundary) — one-shot, the
+  // only LLM call in this hook. The Stop hook armed the boundary at the
+  // crossing; the user ran /compress-fast (the strip fires NO hooks); THIS
+  // prompt is the first one after. Reconstruct the stripped tool-result
+  // state from the current Σ (fresh — the crossing spawned a final delta
+  // extraction) + the transcript tail (consistency check against the
+  // surviving text) via the main LLM, and inject it once as additionalContext.
+  // Runs LAST so it sees the post-maintenance Σ (the flip/reset above may
+  // have rewritten the view keys).
+  if (sigma && sigma.boundary_armed === true && sigma.boundary_consumed !== true) {
+    try {
+      const fresh = ss.loadSigma(sessionId) || sigma;
+      const tail = fresh.transcript_path
+        ? ss.extractTranscriptTail(fresh.transcript_path, BOUNDARY_TAIL_CHARS, { maxChars: BOUNDARY_TAIL_CHARS })
+        : '';
+      const out = await ss.callMainLLM(ss.buildBoundaryPrompt(fresh, tail, sessionId), BOUNDARY_TIMEOUT_MS);
+      if (out && out.trim()) {
+        ss.emitHookOutput({
+          hookEventName: 'UserPromptSubmit',
+          additionalContext: out.trim(),
+        });
+        ss.mutateSigma(sessionId, (cur) => {
+          cur.boundary_consumed = true; // one-shot — no re-injection
+          return cur;
+        });
+        ss.appendTelemetry({
+          ts: Date.now(),
+          session_id: sessionId,
+          hook: 'userprompt-inject-state',
+          event: 'boundary_compensated',
+        });
+      } else {
+        // fail-open: no injection this prompt. Retry ONCE on the next prompt
+        // (design §5.2); after 2 failed attempts mark consumed so a down
+        // qwen27b never blocks every prompt for 30s.
+        const attempts = (Number(fresh.boundary_retry) || 0) + 1;
+        ss.mutateSigma(sessionId, (cur) => {
+          cur.boundary_retry = attempts;
+          if (attempts >= 2) cur.boundary_consumed = true;
+          return cur;
+        });
+        ss.appendTelemetry({
+          ts: Date.now(),
+          session_id: sessionId,
+          hook: 'userprompt-inject-state',
+          event: 'boundary_compensation_failed',
+          attempts,
+        });
+      }
+    } catch {
+      // fail-open — the turn proceeds without compensation
+    }
+  }
 }
 
-main();
+main().catch(() => {}); // fail-open — a hook error must never break the turn

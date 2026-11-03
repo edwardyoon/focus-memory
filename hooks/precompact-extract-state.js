@@ -6,10 +6,16 @@
 //   parent (default)  — spawns a detached worker, emits the summarizer nudge,
 //                       exits 0 in milliseconds. Native compaction is NEVER
 //                       blocked by the LLM call.
-//   --worker <event>  — the detached child: transcript tail → SUMMARY_LLM
-//                       state-patch extraction (JSON only, no prose) →
+//   --worker <event> [--llm summary|main] — the detached child: transcript
+//                       tail → state-patch extraction (JSON only, no prose) →
 //                       null-deletion merge into
 //                       ~/.qwen/tmp/focus-memory/state/<sid>.json.
+//                       --llm picks the extraction model (2026-11-03: the Stop
+//                       hook spawns the periodic/boundary extractions with the
+//                       lightweight SUMMARY_LLM — they are never model-facing;
+//                       the model-facing boundary COMPENSATION runs
+//                       synchronously in the UserPromptSubmit hook on the main
+//                       LLM). Default: summary.
 //
 // Why async: the transcript JSONL keeps its full raw history after
 // compaction (qwen only appends a `chat_compression` system record), so the
@@ -72,9 +78,15 @@ function scanTranscriptTopics(transcriptPath) {
  * @param {object} event - PreCompact event JSON
  * @returns {Promise<void>}
  */
-async function runWorker(event) {
+async function runWorker(event, llm) {
   const sessionId = event.session_id;
   if (!sessionId) return;
+
+  // Extraction model (2026-11-03): --llm main → the main LLM (qwen27b);
+  // default/summary → the lightweight model (gemma-4). The extraction patch
+  // is never model-facing — only the UserPromptSubmit boundary compensation
+  // is — so the lightweight model stays the default.
+  const callLLM = llm === 'main' ? ss.callMainLLM : ss.callSummaryLLM;
 
   // Delta extraction: send only the transcript content since the last
   // extraction — seconds of prefill, not the 40-60s whole-tail calls. The
@@ -122,7 +134,7 @@ async function runWorker(event) {
     if (topics.size) todoChains = await ss.fetchOpenTodoChains([...topics]);
   } catch { /* fail-open — LLM-derived next stands */ }
 
-  const rawOutput = await ss.callSummaryLLM(
+  const rawOutput = await callLLM(
     ss.buildExtractionPrompt(sigma, transcriptText, sessionId, todoChains), LLM_TIMEOUT_MS);
 
   let sizeNow = 0;
@@ -317,9 +329,13 @@ function main() {
     } catch {
       return;
     }
+    // --llm summary|main (2026-11-03): the Stop hook passes the extraction
+    // model explicitly; the PreCompact parent spawn omits it (default).
+    const llmArgIdx = process.argv.indexOf('--llm');
+    const llm = llmArgIdx >= 0 && process.argv[llmArgIdx + 1] === 'main' ? 'main' : 'summary';
     // The pending LLM fetch keeps the event loop alive until the work is done;
     // a crash must not take down anything else — log the reason for diagnosis.
-    runWorker(event).catch((err) => {
+    runWorker(event, llm).catch((err) => {
       ss.appendTelemetry({
         ts: Date.now(),
         session_id: event.session_id || '',
