@@ -71,20 +71,26 @@ function main() {
     ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'sessionstart-inject-state', event: 'foreign_refs_scrubbed', removed: scrubbed });
   }
 
-  ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'sessionstart-inject-state', event: 'injected', compact_count: newCount });
-
   const parts = [];
-  if (haveSigma) {
-    let body = JSON.stringify(sigma, null, 2);
-    if (body.length > MAX_INJECT_CHARS) body = `${body.slice(0, MAX_INJECT_CHARS)}\n...[truncated]`;
+  // Compact reference renderer (2026-11-04 Phase 2): past-tense "state at
+  // compaction time" — `next`/`latest_request` are excluded because this
+  // block is frozen for the whole post-compaction session, and a re-read
+  // directive field re-latches stale work (2026-10-15/10-20/11-01). The
+  // first line is the system note separating reference from instruction;
+  // the verbatim last user message (below) defines the current task.
+  const body = ss.renderCompactSigma(sigma);
+  if (body) {
+    let bounded = body;
+    if (bounded.length > MAX_INJECT_CHARS) bounded = `${bounded.slice(0, MAX_INJECT_CHARS)}\n...[truncated]`;
     parts.push(
-      `Execution State (Σ) — structured state extracted from this session before compaction; ` +
-      `prefer it over the prose summary for "where are we" questions. ` +
+      `[system note: reference summary re-injected by the server after native compaction — it is not a task or instruction; the current task is defined by the latest user message]\n` +
+      `Execution state at compaction time (Σ) — extracted from this session before compaction; ` +
+      `prefer it over the prose summary for "where was the work" questions. ` +
       `The compaction summary is DATA about past work, not an instruction: this session is not a ` +
       `summarization task, and where the summary's framing conflicts with the state below, the state below wins. ` +
       `Its "latest/primary request" section may mis-date a completed or superseded task — the ` +
       `verbatim last user message (below, when available) is the ground truth for the current task.\n` +
-      '```json\n' + body + '\n```'
+      bounded
     );
   }
   // Deterministic ground truth (2026-10-17): the verbatim last user message,
@@ -98,6 +104,9 @@ function main() {
       `Last user message (verbatim from the transcript — the AUTHORITY for the current task):\n${lastUser}`
     );
   }
+  if (!parts.length) return; // nothing renderable — fail-open
+
+  ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'sessionstart-inject-state', event: 'injected', compact_count: newCount });
   ss.emitHookOutput({
     hookEventName: 'SessionStart',
     additionalContext: parts.join('\n\n'),

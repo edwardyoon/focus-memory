@@ -512,6 +512,74 @@ function renderAnchor(sigma, opts = {}) {
   return parts.join(' | ');
 }
 
+/**
+ * Render the post-compaction reference block from Σ (2026-11-04 Phase 2).
+ *
+ * Unlike renderAnchor (a one-line directive "where are we"), this renders
+ * the structured state as a PAST-TENSE reference: the session was just
+ * natively compacted and the SessionStart(source=compact) hook re-injects
+ * this block once. It must let the model recover "what was being done and
+ * where" without re-latching it as the current task:
+ *   - `next` and `latest_request` are EXCLUDED — the most directive fields,
+ *     and this text persists for the whole session (the 2026-10-15 /
+ *     2026-10-20 / 2026-11-01 incidents were all re-injected state text
+ *     read as live instructions — a completed task's steps re-run, a stale
+ *     anchor resumed). The current task is defined by the latest user
+ *     message, which the hook injects verbatim right after this block.
+ *   - every label is past-tense ("at compaction time"), never "current
+ *     task" / "do next".
+ *   - protective constraints (blocked / failing tests) and the anchor
+ *     flags stay: they guard against re-attempts, they do not direct work.
+ * @param {object} sigma
+ * @returns {string} the reference body ('' when Σ has no renderable content)
+ */
+function renderCompactSigma(sigma) {
+  if (!sigma || typeof sigma !== 'object') return '';
+  const strList = (k) => (Array.isArray(sigma[k]) ? sigma[k].filter((x) => typeof x === 'string' && x.trim()) : []);
+  const lines = [];
+
+  if (sigma.anchor_revoked === true) lines.push('- original task: REVOKED by the user before compaction');
+  if (sigma.anchor_completed === true) lines.push('- original task: COMPLETED before compaction');
+
+  if (typeof sigma.task_summary === 'string' && sigma.task_summary.trim()) {
+    lines.push(`- task at compaction time: ${sigma.task_summary.trim()}`);
+  }
+
+  const confirmed = strList('confirmed');
+  if (confirmed.length) {
+    lines.push(`- verified before compaction (file:line references as recorded):\n${confirmed.slice(0, 10).map((x) => `    - ${x}`).join('\n')}`);
+  }
+
+  const hypothesis = strList('hypothesis');
+  if (hypothesis.length) {
+    lines.push(`- believed but UNVERIFIED at compaction time (re-check before acting):\n${hypothesis.slice(0, 5).map((x) => `    - ${x}`).join('\n')}`);
+  }
+
+  const blocked = strList('blocked');
+  if (blocked.length) {
+    lines.push(`- blocked (DO NOT RETRY) at compaction time:\n${blocked.slice(0, 3).map((x) => `    - ${x}`).join('\n')}`);
+  }
+
+  if (sigma.tests_status && typeof sigma.tests_status === 'object' && !Array.isArray(sigma.tests_status)) {
+    const failing = Object.entries(sigma.tests_status).filter(([, v]) => v === 'fail').map(([k]) => k);
+    if (failing.length) lines.push(`- failing tests at compaction time: ${failing.join(', ')}`);
+  }
+
+  if (Array.isArray(sigma.recall_pointers) && sigma.recall_pointers.length) {
+    const n = sigma.recall_pointers.length;
+    const last = sigma.recall_pointers[n - 1];
+    const hint = last && last.hint ? ` (most recent: ${last.hint})` : '';
+    lines.push(
+      `- offloaded: ${n} segment(s) left the context before compaction. ` +
+      `To re-read one, emit <focus magic_chunks="N"> on its own line with the chunk number ` +
+      `from the "offloaded" chunk list of the attention scaffold${hint}`
+    );
+  }
+
+  if (!lines.length) return '';
+  return lines.join('\n');
+}
+
 // ─── Σ merge (paper: Σ_{t+1} = Σ_t ⊕ Δ, null deletes a key) ─────────────
 
 // Per-key merge semantics. The content schema (2026-10-09) is three
@@ -1029,50 +1097,6 @@ ${latestUser ? `\n[Current Task — the LATEST user message, verbatim; NEWER tha
 }
 
 /**
- * Build the boundary compensation prompt (2026-11-03 compressFast boundary).
- * After /compress-fast strips all tool results + media, the UserPromptSubmit
- * hook asks the main LLM (qwen27b) to reconstruct the stripped state from the
- * current Σ (fresh — the boundary crossing spawned a final delta extraction)
- * plus the transcript tail (consistency check against the surviving text:
- * system prompt + user/assistant text are NOT stripped). The output is
- * injected once as <qwen:user-prompt-submit-context>, which survives the
- * strip. Budget: ≤2k output tokens (design §4).
- * @param {object} sigma - the current Σ
- * @param {string} transcriptTail - rendered transcript tail (may be '')
- * @param {string} sessionId
- * @returns {string}
- */
-function buildBoundaryPrompt(sigma, transcriptTail, sessionId) {
-  // Same view discipline as buildExtractionPrompt: content keys only —
-  // bookkeeping (token counts, offsets) is noise for the writer.
-  const view = {};
-  for (const k of ['confirmed', 'hypothesis', 'next', 'blocked', 'latest_request', 'anchor_revoked', 'anchor_completed']) {
-    if (sigma[k] !== undefined) view[k] = sigma[k];
-  }
-  const current = Object.keys(view).length ? JSON.stringify(view, null, 2) : '{}';
-  return `You are reconstructing the state of a coding-agent session that just ran /compress-fast: every tool result (file reads, shell output, grep results, DB queries) and all media were stripped from the conversation. The system prompt (QWEN.md/AGENTS.md) and the plain user/assistant text survived.
-Write the boundary compensation payload that lets the model continue the work with no state loss.
-
-[Current State (Σ) — the latest structured extraction]:
-${current}
-${transcriptTail ? `\n[Recent Conversation (surviving text — consistency check for Σ; tool results in it are stripped)]:\n${transcriptTail}` : ''}
-
-[Output Format] — plain text (no markdown fences, no JSON), at most ~2000 tokens, exactly these sections:
-[경계보상 — compressFast 완료]
-- objective: 세션 목표/현재 태스크 1문장
-- confirmed: 검증된 상태 — 1건 1라인, file:line 참조 그대로 유지 — 최대 10건
-- next: 다음 액션 (실행 순서) — 최대 5건
-- stripped key facts: strip된 tool result에 있던 핵심 (결정, 데이터, 읽은 파일 요약) — 1건 1라인, 최대 10건
-- 재접근: "시스템 프롬프트(QWEN.md/AGENTS.md)는 그대로. tool output만 strip됨. 필요 파일 재읽기 — 경로: confirmed/next 참조" (고정 문구)
-
-[Rules]
-- Σ is the source of truth; the surviving text is the consistency check — when the two conflict, the surviving text is NEWER: follow it and note the correction in stripped key facts.
-- Use only facts present in Σ or the conversation. No speculation. Keep every file:line reference verbatim.
-- If a section has no items, write "- (없음)".
-- Output the payload only — no commentary, no preamble.`;
-}
-
-/**
  * Call the extraction LLM (OpenAI-compatible /v1/chat/completions).
  * Model cascade: SUMMARY_LLM (the lightweight model) first — a small model
  * that does NOT contend for slots on the main llama-server serving live
@@ -1126,57 +1150,6 @@ async function callSummaryLLM(prompt, timeoutMs = 120000) {
     return typeof t === 'string' ? t : ''; // contract: string, never a Promise/object
   } catch (err) {
     console.error(`[skillstate] LLM error: ${err.name === 'AbortError' ? `timeout (${timeoutMs}ms)` : err.message}`);
-    return '';
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Call the boundary compensation LLM (OpenAI-compatible /v1/chat/completions).
- * The MAIN_LLM variant of callSummaryLLM: always MAIN_LLM (no cascade) — the
- * high-performance model (qwen27b) — because the boundary compensation
- * payload faces the live model directly (design §5.3). Same chat-completions
- * derivation from the /v1/completions base URL and the same
- * enable_thinking: true contract (reasoning routes to reasoning_content and
- * is discarded; content stays clean).
- * @param {string} prompt
- * @param {number} [timeoutMs=30000]
- * @returns {Promise<string>} the `content` string ('' on any failure)
- */
-async function callMainLLM(prompt, timeoutMs = 30000) {
-  const completionsUrl = env('MAIN_LLM', 'http://127.0.0.1:8081/v1/completions');
-  const url = /\/chat\/completions$/.test(completionsUrl)
-    ? completionsUrl
-    : completionsUrl.replace(/\/completions$/, '/chat/completions');
-  const model = env('MAIN_LLM_MODEL', 'qwen27b');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      // max_tokens 2500: the payload budget is ≤2k tokens (design §4);
-      // headroom for thinking tokens, which share the budget on these servers.
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: prompt }],
-        enable_thinking: true,
-        temperature: 0.1,
-        max_tokens: 2500,
-      }),
-      signal: controller.signal,
-    });
-    if (res.status !== 200) {
-      console.error(`[skillstate] main LLM HTTP ${res.status}`);
-      return '';
-    }
-    const data = await res.json();
-    const m = data.choices && data.choices[0] && data.choices[0].message;
-    const t = m && m.content;
-    return typeof t === 'string' ? t : ''; // contract: string, never a Promise/object
-  } catch (err) {
-    console.error(`[skillstate] main LLM error: ${err.name === 'AbortError' ? `timeout (${timeoutMs}ms)` : err.message}`);
     return '';
   } finally {
     clearTimeout(timer);
@@ -1437,13 +1410,12 @@ module.exports = {
   SCHEMA_KEYS,
   digestTranscript,
   renderAnchor,
+  renderCompactSigma,
   extractTranscriptTail,
   extractTranscriptDelta,
   extractLastUserMessage,
   buildExtractionPrompt,
-  buildBoundaryPrompt,
   callSummaryLLM,
-  callMainLLM,
   fetchOpenTodoChains,
   extractJsonPatch,
   emitHookOutput,
