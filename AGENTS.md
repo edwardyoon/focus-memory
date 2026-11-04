@@ -38,6 +38,7 @@ DA tags are NOT tool calls, read files, function calls, or API invocations. The 
 ## Placement
 - Never put a DA tag inside a tool call, JSON, a code block, or a tool-call parameter.
 - After emitting a tag, keep writing. Do not stop or wait for a response.
+- If a `tool_call` for `focus` is rejected: DA is not a tool on this host. Never retry in any form — emit the tag as plain text on its own line instead.
 
 ## Visibility
 - Never mention, explain, quote, or confirm these tags in your answer to the user.
@@ -88,6 +89,11 @@ of what left, not a task assignment.
 5. To get evicted content back, emit `<focus magic_chunks="N">` for a chunk
    number from the anchor's `recall:` line or the offloaded-chunks note.
    Never reconstruct evicted content from memory.
+
+**Hard budget (countable, no discretion):**
+1. One re-grounding pass per compaction segment: read the anchor, one `trace_decision_chain` for the active `topic_key` (if any), then act. A second "let me re-ground" preamble in the same segment is a loop — act instead.
+2. Re-reading a file the anchor already records as examined requires a stated new reason — the exact `old_string` for an upcoming edit, or a suspected change. No one-line reason, no re-read.
+3. Same file read/grepped a 3rd time since the last compaction = stop. Is the missing value in the chain or the anchor? yes → use it. no → extract it once and record it in the chain `detail`, so the next compaction cannot lose it.
 
 **Recent activity (auto-appended):** while history is offloaded, the Σ
 block may end with a `recent:` digest of the most recent tool calls and
@@ -240,6 +246,14 @@ Question received
 | SUMMARY_LLM unavailable | Results are unpruned | Not an error. Results are just longer |
 | recent_work mid-turn | "No transcript path recorded for this session yet" | Transcript is recorded at turn end. Use the Σ `recent:` digest or one fresh read. Do not retry in the same turn |
 
+## Signal-driven forced transitions (no discretion)
+
+| Signal | Forced action |
+|--------|---------------|
+| System "≥100 tool calls" warning | Stop all tool calls → persist state (plans file `[x]` + `remember_decision`) → report to the user. Resume only on the user's next message. |
+| `tool_call` for `focus` rejected | DA is not a tool on this host. Plain-text tag on its own line. Never retry. |
+| 3rd read/grep of the same file since the last compaction | Part B hard budget item 3: stop, check chain/anchor, record the missing value once. |
+
 ## Write-back (remember_decision)
 
 Call **once per completed task** when:
@@ -271,7 +285,7 @@ Multi-step work (3+ steps) is tracked as a **decision chain**, not in a plans fi
    - `search_work_memory` is only a **discovery** fallback (find the topic_key, or confirm a chain exists). It ranks every record of a topic at equal score and carries **no current marker**, so never judge "which record is latest" from it.
    - `recent_work` is a **different concern** — a live digest of this session's most recent actions, not a record of the chain's state. Do not substitute it for `trace_decision_chain` here.
 4. **Close**: when every item is `[x]`, register the final record, then write back per the Write-back rule (`decision` / `bug_resolved`).
-5. **Exception — plans file**: only when (a) the user explicitly asks for a plans file, (b) the work spans 3+ compaction segments, or (c) the planning document itself is a deliverable. Then keep the file's `[x]` current as you progress.
+5. **Exception — plans file**: only when (a) the user explicitly asks for a plans file, (b) the work spans 3+ compaction segments, or (c) the planning document itself is a deliverable. When it applies, the file is a **required second record**, not a convenience: at each step completion — before starting the next step — mark its `[x]` + verification evidence and update the status header. Batching the update at end-of-day is a violation: the state between the last sync and EOD is exactly what a compaction can erase.
 
 ## Red flags
 
@@ -279,3 +293,4 @@ Multi-step work (3+ steps) is tracked as a **decision chain**, not in a plans fi
 - Never register an update record when nothing changed (no item completed).
 - Never judge a todo chain's current state from `search_work_memory` (equal scores, no current marker) or `recent_work` (live digest, not chain state) — `trace_decision_chain` is the only authority for "which record is latest".
 - Multi-step work in flight with NO registered todo chain: the Σ `next` is then an unverified plan snapshot, not a state record. Cross-check each `next` item against `confirmed` / current state before acting, and register the chain immediately (protocol step 1) so subsequent anchors have an authoritative state to track.
+- State source priority: `trace_decision_chain` current record > Σ anchor > plans file > conversation memory. If the plans file contradicts the chain, the chain wins — and fixing the plans file is part of the work, not optional.
