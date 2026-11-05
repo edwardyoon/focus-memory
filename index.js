@@ -2788,7 +2788,8 @@ httpApp.post("/sigma/refresh", async (c) => {
   if (!Number.isFinite(cut) || cut < 0) return c.json({ error: "cut must be a non-negative number" }, 400);
 
   const existing = sigmaRefreshInFlight.get(session);
-  if (existing) {
+  if (existing && existing.cut >= cut) {
+    // In-flight refresh will absorb at least up to our cut — safe to join it.
     try {
       const result = await existing.promise;
       return c.json(result, wait ? 200 : 202);
@@ -2796,52 +2797,90 @@ httpApp.post("/sigma/refresh", async (c) => {
       return c.json({ error: "in-flight refresh failed" }, 502);
     }
   }
+  if (existing) {
+    // In-flight refresh has a SMALLER cut — it will not absorb our full cut.
+    // Serialize: wait for it to finish, then run our own refresh below so the
+    // remainder [existing.cut, cut) is actually absorbed instead of lost.
+    try { await existing.promise; } catch { /* proceed with our own refresh */ }
+  }
 
+  let absorbClaim = null;
   const work = (async () => {
+    // Item 17: cross-process claim — the PreCompact worker (a detached process)
+    // may be absorbing the same [hist_last_bytes, ...) region. A fresh claim
+    // means it is in-flight, so skip the absorption and return the current
+    // block (fail-open; the merge is a dedup-safe union and the region's facts
+    // land via the other path — the remainder rides the next refresh).
+    absorbClaim = skillState.claimHistAbsorb(session);
+    if (!absorbClaim) {
+      const current = skillState.loadSigma(session);
+      const block = skillState.renderStripSigma(current);
+      const hash = skillState.hashBlock(block);
+      log(`[sigma-refresh] session=${session} cut=${cut} wait=${wait} skipped (absorb in-flight by another process) block_chars=${block.length} hash=${hash}`);
+      return { block, hash, partial: true };
+    }
     const startedAt = Date.now();
-    const BUDGET_MS = 9000; // C++ default timeout is 10s — stay under it
+    // Item 10: the C++ client's sigma_sum_timeout_ms was raised to 300s to
+    // match the MAIN_LLM (27B, thinking) extraction — measured 15-40s per
+    // region, so the old 9s budget forced the rule fallback every time.
+    const BUDGET_MS = 300000;
     let partial = false;
 
     const tp = skillState.ensureTranscriptPath(session);
+    const cwd = skillState.cwdFromTranscriptPath(tp);
     const sigma0 = skillState.loadSigma(session);
     const fromBytes = Math.max(0, Number(sigma0.hist_last_bytes) || 0);
-    const toBytes = skillState.transcriptByteOffsetForMessageIndex(tp, cut);
+    const { toBytes, drift: cutDrift } = await skillState.resolveAbsorbTo(tp, cut, fromBytes);
+    if (cutDrift) {
+      // Item 6: post-compaction cut drift — the client message index no longer
+      // maps to a transcript position; absorbing [fromBytes, EOF) instead of
+      // the silent no-op the old guard produced.
+      log(`[sigma-refresh] session=${session} cut=${cut} drift (mapped offset <= hist_last_bytes=${fromBytes}): absorbing to EOF`);
+    }
 
     let patch = {};
     let consumed = 0;
+    // plan §5.5 rule 1 / §7: on LLM failure hold hist_last_bytes so the next
+    // refresh re-reads the region and a later LLM pass can capture its text
+    // facts (rule items are dedup-safe on re-merge).
+    let advanceBytes = false;
     if (cut > 0 && toBytes > 0 && toBytes > fromBytes) {
       const range = skillState.extractTranscriptRange(tp, fromBytes, toBytes, { maxChars: 30000 });
       consumed = range.consumed;
       if (range.text.trim()) {
-        const llmBudgetMs = Math.min(7000, BUDGET_MS - (Date.now() - startedAt) - 500);
+        const llmBudgetMs = Math.min(295000, BUDGET_MS - (Date.now() - startedAt) - 5000);
         if (llmBudgetMs >= 2000) {
           try {
             const text = await skillState.callSummaryLLM(
               skillState.buildStripExtractionPrompt(range.text, session),
-              llmBudgetMs
+              llmBudgetMs,
+              { useMainLLM: true, maxTokens: 30000 }
             );
             const parsed = skillState.extractJsonPatch(text);
             if (parsed && typeof parsed === "object") {
-              const gated = skillState.gateStripPatch(parsed, session, "");
+              const gated = skillState.gateStripPatch(parsed, session, cwd);
               if (gated.removed.length) {
                 log(`[sigma-refresh] session=${session} gated=${gated.removed.map((r) => r.reason).join(",")}`);
               }
               patch = gated.patch;
+              advanceBytes = true; // LLM captured the region's text — safe to advance
             } else {
               throw new Error("no JSON patch in LLM output");
             }
           } catch (e) {
             log(`[sigma-refresh] session=${session} llm extraction failed (${e.message}), rule fallback`);
             patch = skillState.ruleHistFromEntries(range.entries);
-            skillState.gateStripPatch(patch, session, "", { skipEvidence: true });
+            skillState.gateStripPatch(patch, session, cwd, { skipEvidence: true });
             partial = true;
           }
         } else {
           patch = skillState.ruleHistFromEntries(range.entries);
-          skillState.gateStripPatch(patch, session, "", { skipEvidence: true });
+          skillState.gateStripPatch(patch, session, cwd, { skipEvidence: true });
           partial = true;
         }
         if (consumed < toBytes) partial = true; // range capped — remainder rides the next refresh
+      } else {
+        advanceBytes = true; // no renderable text — nothing for a later LLM pass to find
       }
     } else if (cut > 0 && toBytes === 0) {
       partial = true; // boundary mapping failed — return the current Σ as-is (plan §5.5 fail-open)
@@ -2850,7 +2889,7 @@ httpApp.post("/sigma/refresh", async (c) => {
     const written = skillState.mutateSigma(session, (s) => {
       let next = s;
       if (Object.keys(patch).length) next = skillState.mergeStripPatch(next, patch);
-      if (consumed > 0 && consumed > (Number(s.hist_last_bytes) || 0)) {
+      if (advanceBytes && consumed > 0 && consumed > (Number(s.hist_last_bytes) || 0)) {
         next = { ...next, hist_last_bytes: consumed };
       }
       return next;
@@ -2863,7 +2902,10 @@ httpApp.post("/sigma/refresh", async (c) => {
     return { block, hash, partial };
   })();
 
-  const tracked = work.finally(() => sigmaRefreshInFlight.delete(session));
+  const tracked = work.finally(() => {
+    sigmaRefreshInFlight.delete(session);
+    if (absorbClaim) skillState.releaseHistAbsorb(session, absorbClaim);
+  });
   sigmaRefreshInFlight.set(session, { cut, promise: tracked });
   try {
     const result = await tracked;

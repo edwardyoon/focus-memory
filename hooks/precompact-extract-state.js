@@ -33,7 +33,10 @@ const { spawn } = require('child_process');
 const ss = require('./lib/skillstate.js');
 const kv = require('./lib/kvoffload.js');
 
-const LLM_TIMEOUT_MS = 120000; // worker is detached — no hook timeout constrains it
+// Item 10: 300s — the MAIN_LLM (27B, thinking) sigma-generation paths measure
+// 15-40s per pass; the worker is detached, so a long budget only stretches
+// compaction duration, never a user-facing request.
+const LLM_TIMEOUT_MS = 300000;
 // Transcript window for extraction (rendered chars). Local 27B prefill is
 // ~0.5ms/char; 30k keeps the worker in the ~1min range.
 const BUDGET_CHARS = Math.max(2000, parseInt(process.env.FOCUSMEMORY_SKILLSTATE_MAX_CHARS || '30000', 10) || 30000);
@@ -81,38 +84,76 @@ function scanTranscriptTopics(transcriptPath) {
  * @param {string} sessionId
  * @param {string} transcriptPath
  * @param {number} sizeAtRead - transcript size captured before any LLM call
+ * @param {string} cwd - session working directory for the ghost-ref gate (review item 9)
  * @returns {Promise<void>}
  */
-async function runHistoryAbsorb(sessionId, transcriptPath, sizeAtRead) {
+async function runHistoryAbsorb(sessionId, transcriptPath, sizeAtRead, cwd = '') {
+  // Item 17: cross-process claim — the POST /sigma/refresh route (the server
+  // process) may be absorbing the same [hist_last_bytes, ...) region. The
+  // per-process single-flight map can't coordinate the two processes, so a
+  // fresh claim by the other path makes this one skip. No data is lost (the
+  // merge is a dedup-safe union and hist_last_bytes is monotonic) — the
+  // remainder rides the next refresh/compaction.
+  const claim = ss.claimHistAbsorb(sessionId);
+  if (!claim) return; // the other path is in-flight — it will absorb
+  try {
+    await doHistoryAbsorb(sessionId, transcriptPath, sizeAtRead, cwd);
+  } finally {
+    ss.releaseHistAbsorb(sessionId, claim);
+  }
+}
+
+/**
+ * S7 (plan §4.3) — the actual history absorb (called under the item-17 claim
+ * from runHistoryAbsorb). Absorb the transcript region [hist_last_bytes,
+ * sizeAtRead) into the cumulative history layer (hist_*). Same pipeline as
+ * POST /sigma/refresh (extractTranscriptRange → LLM strip prompt →
+ * gateStripPatch → mergeStripPatch) with the rule-based fallback.
+ * @param {string} sessionId
+ * @param {string} transcriptPath
+ * @param {number} sizeAtRead - transcript size captured before any LLM call
+ * @param {string} cwd - session working directory for the ghost-ref gate (review item 9)
+ * @returns {Promise<void>}
+ */
+async function doHistoryAbsorb(sessionId, transcriptPath, sizeAtRead, cwd = '') {
   const sigma = ss.loadSigma(sessionId);
   const fromBytes = Math.max(0, Number(sigma.hist_last_bytes) || 0);
   if (sizeAtRead <= fromBytes) return; // nothing new since the last absorb
   const range = ss.extractTranscriptRange(transcriptPath, fromBytes, sizeAtRead, { maxChars: BUDGET_CHARS });
   if (range.consumed <= fromBytes) return; // unreadable region — retry next pass
   let patch = {};
+  // plan §5.5/§7: on LLM failure hold hist_last_bytes so the next compaction
+  // re-reads the region and a later LLM pass can capture its text facts.
+  let advanceBytes = false;
   if (range.text.trim()) {
     try {
-      const out = await ss.callSummaryLLM(ss.buildStripExtractionPrompt(range.text, sessionId), LLM_TIMEOUT_MS);
+      const out = await ss.callSummaryLLM(
+        ss.buildStripExtractionPrompt(range.text, sessionId),
+        LLM_TIMEOUT_MS,
+        { useMainLLM: true, maxTokens: 30000 }
+      );
       const parsed = ss.extractJsonPatch(out);
       if (!parsed || typeof parsed !== 'object') throw new Error('no JSON patch in LLM output');
-      patch = ss.gateStripPatch(parsed, sessionId, '').patch;
+      patch = ss.gateStripPatch(parsed, sessionId, cwd).patch;
+      advanceBytes = true; // LLM captured the region's text — safe to advance
     } catch (err) {
       ss.appendTelemetry({
         ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state',
         event: 'hist_absorb_llm_failed', error: String((err && err.message) || err),
       });
       patch = ss.ruleHistFromEntries(range.entries);
-      ss.gateStripPatch(patch, sessionId, '', { skipEvidence: true });
+      ss.gateStripPatch(patch, sessionId, cwd, { skipEvidence: true });
     }
   } else {
     // No renderable text (e.g. all tool-result lines) — structural facts only.
     patch = ss.ruleHistFromEntries(range.entries);
-    ss.gateStripPatch(patch, sessionId, '', { skipEvidence: true });
+    ss.gateStripPatch(patch, sessionId, cwd, { skipEvidence: true });
+    advanceBytes = true; // nothing for a later LLM pass to find
   }
   const capped = range.consumed < sizeAtRead;
   ss.mutateSigma(sessionId, (s) => {
     let next = Object.keys(patch).length ? ss.mergeStripPatch(s, patch) : { ...s };
-    if (range.consumed > (Number(s.hist_last_bytes) || 0)) next = { ...next, hist_last_bytes: range.consumed };
+    if (advanceBytes && range.consumed > (Number(s.hist_last_bytes) || 0)) next = { ...next, hist_last_bytes: range.consumed };
     return next;
   });
   ss.appendTelemetry({
@@ -136,7 +177,11 @@ async function runHistoryAbsorb(sessionId, transcriptPath, sizeAtRead) {
 async function runHistoryConsolidation(sessionId, sigma) {
   if (!ss.historyNeedsConsolidation(sigma)) return;
   try {
-    const out = await ss.callSummaryLLM(ss.buildConsolidationPrompt(sigma, sessionId), LLM_TIMEOUT_MS);
+    const out = await ss.callSummaryLLM(
+      ss.buildConsolidationPrompt(sigma, sessionId),
+      LLM_TIMEOUT_MS,
+      { useMainLLM: true, maxTokens: 30000 }
+    );
     const clean = ss.sanitizeConsolidatedPatch(ss.extractJsonPatch(out));
     if (!clean) {
       ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'hist_consolidation_rejected' });
@@ -186,7 +231,7 @@ async function runWorker(event) {
   // content about to leave via this compaction, then consolidate a near-cap
   // text key. Both fail-open — compaction never depends on them.
   try {
-    await runHistoryAbsorb(sessionId, event.transcript_path, sizeAtRead);
+    await runHistoryAbsorb(sessionId, event.transcript_path, sizeAtRead, event.cwd);
     await runHistoryConsolidation(sessionId, ss.loadSigma(sessionId));
   } catch (err) {
     ss.appendTelemetry({
@@ -231,7 +276,10 @@ async function runWorker(event) {
   } catch { /* fail-open — LLM-derived next stands */ }
 
   const rawOutput = await callLLM(
-    ss.buildExtractionPrompt(sigma, transcriptText, sessionId, todoChains), LLM_TIMEOUT_MS);
+    ss.buildExtractionPrompt(sigma, transcriptText, sessionId, todoChains),
+    LLM_TIMEOUT_MS,
+    { useMainLLM: true, maxTokens: 30000 }
+  );
 
   let sizeNow = 0;
   try { sizeNow = fs.statSync(event.transcript_path).size; } catch {}
