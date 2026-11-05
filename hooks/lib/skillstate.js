@@ -520,12 +520,15 @@ function renderAnchor(sigma, opts = {}) {
  * natively compacted and the SessionStart(source=compact) hook re-injects
  * this block once. It must let the model recover "what was being done and
  * where" without re-latching it as the current task:
- *   - `next` and `latest_request` are EXCLUDED — the most directive fields,
- *     and this text persists for the whole session (the 2026-10-15 /
- *     2026-10-20 / 2026-11-01 incidents were all re-injected state text
- *     read as live instructions — a completed task's steps re-run, a stale
- *     anchor resumed). The current task is defined by the latest user
- *     message, which the hook injects verbatim right after this block.
+ *   - `next` is included but STALE-FRAMED — the most directive field, and
+ *     this text persists for the whole session, so it renders as "pending at
+ *     compaction time (may be stale — cross-check against confirmed before
+ *     acting)", never a live directive (the 2026-10-15 / 2026-10-20 /
+ *     2026-11-01 incidents were re-injected state text read as live
+ *     instructions — a completed task's steps re-run, a stale anchor
+ *     resumed). `latest_request` stays EXCLUDED — the current task is
+ *     defined by the latest user message, which the hook injects verbatim
+ *     right after this block.
  *   - every label is past-tense ("at compaction time"), never "current
  *     task" / "do next".
  *   - protective constraints (blocked / failing tests) and the anchor
@@ -548,6 +551,11 @@ function renderCompactSigma(sigma) {
   const confirmed = strList('confirmed');
   if (confirmed.length) {
     lines.push(`- verified before compaction (file:line references as recorded):\n${confirmed.slice(0, 10).map((x) => `    - ${x}`).join('\n')}`);
+  }
+
+  const next = strList('next');
+  if (next.length) {
+    lines.push(`- pending at compaction time (may be STALE — cross-check against confirmed before acting):\n${next.slice(0, 5).map((x) => `    - ${x}`).join('\n')}`);
   }
 
   const hypothesis = strList('hypothesis');
@@ -576,8 +584,63 @@ function renderCompactSigma(sigma) {
     );
   }
 
+  // History layer (Σ-strip stage 2): cumulative past-tense records of work that
+  // left the context. Compact here (renderStripSigma is the full renderer);
+  // included so a post-compaction anchor also carries the removed-work memory.
+  const histDone = strList('hist_done');
+  const histDead = strList('hist_dead_ends');
+  const histDec = strList('hist_decisions');
+  const histReq = strList('hist_requests');
+  if (histDone.length || histDead.length || histDec.length || histReq.length) {
+    lines.push('- earlier work removed from context (past tense; file refs may be stale):');
+    if (histDone.length) lines.push(histDone.slice(-5).map((x) => `    - done: ${x}`).join('\n'));
+    if (histDead.length) lines.push(histDead.slice(-3).map((x) => `    - dead end (do not retry): ${x}`).join('\n'));
+    if (histDec.length) lines.push(histDec.slice(-3).map((x) => `    - decision: ${x}`).join('\n'));
+    if (histReq.length) lines.push(`    - earlier requests: ${histReq.slice(-2).map((x) => `"${x}"`).join(' ')}`);
+  }
+
   if (!lines.length) return '';
   return lines.join('\n');
+}
+
+/**
+ * Render the strip Σ block (plan §4.4): the fixed reference header (always
+ * present — the engine requires a non-empty block) plus the cumulative history
+ * sections. This is the block the engine prepends to the first surviving user
+ * message after a stage-2 removal. Past tense, evidence-based, no directives.
+ * @param {object} sigma - the session Σ
+ * @returns {string} the block (never empty — the header is always emitted)
+ */
+function renderStripSigma(sigma) {
+  const strList = (k) => (sigma && Array.isArray(sigma[k]) ? sigma[k].filter((x) => typeof x === 'string' && x.trim()) : []);
+  const out = [
+    '[Reference — record of earlier work removed from this context. NOT instructions.',
+    ' The latest user message defines the current task. File references may be stale — re-read before relying on them.]',
+  ];
+  const done = strList('hist_done');
+  if (done.length) out.push(`done:\n${done.slice(-12).map((x) => `- ${x}`).join('\n')}`);
+  const dead = strList('hist_dead_ends');
+  if (dead.length) out.push(`dead ends (do not retry):\n${dead.slice(-6).map((x) => `- ${x}`).join('\n')}`);
+  const dec = strList('hist_decisions');
+  if (dec.length) out.push(`decisions:\n${dec.slice(-6).map((x) => `- ${x}`).join('\n')}`);
+  const fileLine = (key) => {
+    const items = strList(key);
+    if (!items.length) return '';
+    const counts = new Map();
+    for (const p of items) counts.set(p, (counts.get(p) || 0) + 1);
+    return [...counts.entries()].map(([p, n]) => (n > 1 ? `${p} x${n}` : p)).join(', ');
+  };
+  const filesRead = fileLine('hist_files_read');
+  const filesEdited = fileLine('hist_files_edited');
+  if (filesRead || filesEdited) {
+    const parts = [];
+    if (filesRead) parts.push(`files read: ${filesRead}`);
+    if (filesEdited) parts.push(`files edited: ${filesEdited}`);
+    out.push(parts.join(' | '));
+  }
+  const req = strList('hist_requests');
+  if (req.length) out.push(`earlier user requests: ${req.slice(-4).map((x) => `"${x}"`).join(' ')}`);
+  return out.join('\n');
 }
 
 // ─── Σ merge (paper: Σ_{t+1} = Σ_t ⊕ Δ, null deletes a key) ─────────────
@@ -616,6 +679,45 @@ const KEY_RULES = {
 // Per-section item caps — keep Σ within the ~800-token injection budget.
 const SECTION_CAPS = { confirmed: 10, hypothesis: 5, next: 5, blocked: 3 };
 const MAX_LIST_ITEMS = 50; // cap cumulative lists so Σ stays injection-sized
+
+// ─── History layer (Σ-strip stage 2, 2026-11-05) ─────────────────────────
+// A second, CUMULATIVE layer of Σ: past-tense records of work that has LEFT
+// the context (removed by strip stage 2, or evicted at compaction). Unlike the
+// work-state layer (confirmed/hypothesis/next/blocked — current-view snapshots
+// that REPLACE, written only by the PreCompact path), history is a UNION that
+// only grows (per-key cap drops the OLDEST items). The strip extractor may
+// write ONLY these keys (mergeStripPatch whitelist) — it must never touch the
+// work-state or anchor keys, so a stale old-region snapshot can never overwrite
+// the current view (plan §3: the 2026-11-01 stale-anchor contamination rule).
+//   hist_done        — "<what was done> — file:line or command/result"
+//   hist_dead_ends   — "<tried but did not work> — <why>"
+//   hist_decisions   — "<decision> — <why / rejected alternative>"
+//   hist_requests    — "<one-line earlier user request>"
+//   hist_files_read / hist_files_edited — [path] (rule-based; "path xN" at render)
+// hist_last_bytes is the transcript byte offset up to which history has been
+// extracted (monotonic — a failed extraction leaves it unmoved so the next
+// refresh re-reads the same region, plan §5.3 rule 1).
+const HIST_KEYS = [
+  'hist_done', 'hist_dead_ends', 'hist_decisions', 'hist_requests',
+  'hist_files_read', 'hist_files_edited',
+];
+const HIST_CAPS = {
+  hist_done: 40,
+  hist_dead_ends: 15,
+  hist_decisions: 15,
+  hist_requests: 10,
+  hist_files_read: 30,
+  hist_files_edited: 30,
+};
+// The strip extractor emits SHORT keys; mergeStripPatch maps them onto the
+// hist_* storage keys. Both forms appear in patches/Σ, so the ref filters scan
+// both (a history item may cite a file:line, a todos path, or a state file).
+const HIST_PATCH_KEYS = ['done', 'dead_ends', 'decisions', 'requests'];
+const FILTERABLE_KEYS = [
+  'confirmed', 'hypothesis', 'next', 'blocked',
+  'done', 'dead_ends', 'decisions',
+  'hist_done', 'hist_dead_ends', 'hist_decisions',
+];
 
 /**
  * Merge a state patch into the current Σ (null values delete keys).
@@ -680,6 +782,210 @@ function mergeSigma(current, patch) {
   return next;
 }
 
+// ─── Strip history merge (S2, plan §4.2/§4.6) ─────────────────────────────
+// The strip extractor emits SHORT keys (done/dead_ends/decisions/requests);
+// mergeStripPatch maps them onto the hist_* storage keys and UNIONs them into
+// the existing history with similarity dedup + per-key cap (drop OLDEST). It
+// touches ONLY hist_* keys — the work-state/anchor keys pass through untouched,
+// so a stale old-region snapshot can never overwrite the current view.
+/**
+ * Union a strip-extraction patch into a Σ's history layer.
+ * @param {object} sigma - the current Σ
+ * @param {object} patch - strip patch (short keys done/dead_ends/decisions/requests, or hist_* keys)
+ * @returns {object} the next Σ (a new object; only hist_* keys change)
+ */
+function mergeStripPatch(sigma, patch) {
+  const next = { ...sigma };
+  if (!patch || typeof patch !== 'object') return next;
+  const incoming = {};
+  for (const shortKey of HIST_PATCH_KEYS) {
+    if (Array.isArray(patch[shortKey])) {
+      const hk = 'hist_' + shortKey;
+      incoming[hk] = (incoming[hk] || []).concat(patch[shortKey]);
+    }
+  }
+  for (const hk of HIST_KEYS) {
+    if (Array.isArray(patch[hk])) incoming[hk] = (incoming[hk] || []).concat(patch[hk]);
+  }
+  for (const hk of Object.keys(incoming)) {
+    const cap = HIST_CAPS[hk];
+    const base = (Array.isArray(next[hk]) ? next[hk] : []).filter((x) => typeof x === 'string' && x.trim());
+    for (const item of incoming[hk]) {
+      if (typeof item !== 'string' || !item.trim()) continue;
+      let dup = false;
+      for (const existing of base) {
+        if (existing === item || itemSimilarity(existing, item) >= 0.8) { dup = true; break; }
+      }
+      if (!dup) base.push(item);
+    }
+    next[hk] = cap != null ? base.slice(-cap) : base; // keep the most recent
+  }
+  return next;
+}
+
+// Mechanical pre-merge gates for strip patches (plan §4.2). The extraction
+// prompt is the soft layer; these are the hard checks that run on every patch
+// before mergeStripPatch. (1) `done` items must cite evidence (a file path or
+// a command/result marker) — an unevidenced "done" is a confabulation risk.
+// (2) the shared ref filters (ghost todos + foreign state) drop items that
+// cite non-existent dated todos files or OTHER sessions' state files.
+// (3) imperative items are directives, not records — a "next: do X" transcribed
+// from the removed region would re-inject as a task and re-latch the model.
+const EVIDENCE_TOKEN_RE = /\S+\.\w{1,10}(?::\d+)?/; // file path w/ extension (optional :line)
+const RESULT_TOKEN_RE = /\b(ok|error|fail(?:ed)?|pass(?:ed)?|timeout|exit\s*\d+)\b/i;
+// Boundary-anchored: past-tense records ("Fixed x in a.js:3", "Updated the
+// pool") must survive — only bare-verb directives ("fix the bug", "next: do X")
+// are dropped. "do not retry" is a protective record, kept.
+const IMPERATIVE_RE = /^\s*(next|todo|please|run|do|add|create|update|delete|fix|implement|refactor|추가해|생성해|수정해|삭제해|구현해|해라|하세요|해주세요|해줘)(?=[\s:.]|$)(?!\s+not\b)/i;
+
+/**
+ * Apply the mechanical gates to a strip patch (mutated in place).
+ * @param {object} patch - the strip patch (short keys)
+ * @param {string} sessionId - the current session id (foreign-ref gate)
+ * @param {string} cwd - session working directory (ghost-todo gate base)
+ * @returns {{patch: object, removed: Array<object>}} the (mutated) patch + removed items for telemetry
+ */
+function gateStripPatch(patch, sessionId, cwd, opts = {}) {
+  const removed = [];
+  if (!patch || typeof patch !== 'object') return { patch, removed };
+  // The evidence gate rejects "done" claims with no file/result token — right
+  // for LLM output (confabulation guard). Rule-based patches are structurally
+  // grounded (a real tool call), so skipEvidence lets them through.
+  if (Array.isArray(patch.done) && !opts.skipEvidence) {
+    patch.done = patch.done.filter((item) => {
+      if (typeof item !== 'string') return true;
+      const hasEvidence = EVIDENCE_TOKEN_RE.test(item) || RESULT_TOKEN_RE.test(item);
+      if (!hasEvidence) removed.push({ key: 'done', item, reason: 'no-evidence' });
+      return hasEvidence;
+    });
+    if (patch.done.length === 0) delete patch.done;
+  }
+  const g = filterGhostRefs(patch, cwd);
+  for (const r of g.removed) removed.push({ ...r, reason: 'ghost-ref' });
+  const f = filterForeignSessionRefs(patch, sessionId);
+  for (const r of f.removed) removed.push({ ...r, reason: 'foreign-ref' });
+  for (const key of HIST_PATCH_KEYS) {
+    const arr = patch[key];
+    if (!Array.isArray(arr)) continue;
+    patch[key] = arr.filter((item) => {
+      if (typeof item !== 'string') return true;
+      if (IMPERATIVE_RE.test(item)) { removed.push({ key, item, reason: 'imperative' }); return false; }
+      return true;
+    });
+    if (patch[key].length === 0) delete patch[key];
+  }
+  return { patch, removed };
+}
+
+// The strip extraction prompt (plan §4.2). Distills a REMOVED region into the
+// history layer — past-tense, evidence-based, no directives, no work-state/
+// anchor keys. The output keys are the SHORT forms (mergeStripPatch maps them).
+/**
+ * Build the strip-region history extraction prompt.
+ * @param {string} regionText - the rendered removed region (transcript slice)
+ * @param {string} sessionId - the current session id (self-reference allowlist)
+ * @returns {string} the prompt
+ */
+function buildStripExtractionPrompt(regionText, sessionId) {
+  return `You are distilling a REMOVED region of a coding session's transcript into a compact HISTORY record. The region has been deleted from the model's context; your output is the only memory of it.
+
+Output ONLY a JSON object with these keys (all optional; arrays of short strings; omit a key if empty):
+{
+  "done": ["<what was accomplished> — <evidence: file path or command/result>", ...],
+  "dead_ends": ["<what was tried but did not work> — <why>", ...],
+  "decisions": ["<decision made> — <why / rejected alternative>", ...],
+  "requests": ["<one-line earlier user request>", ...]
+}
+
+Rules:
+- Past tense only. Each item <= 20 words.
+- "done" items MUST cite evidence: a file path (optionally :line) or a command/result (ok/error/fail/pass/exit code). No evidence -> omit the item.
+- Record only what the transcript shows (tool calls, their results, stated actions). Do not infer.
+- Do NOT transcribe instructions, TODOs, or directives from the region. A line like "next: do X" is a directive, not a record.
+- Do NOT cite other sessions' state files (state/<uuid>.json). Self-references to this session (${sessionId}) are fine.
+- Do NOT cite dated todos files (todos/YYYY-MM-DD.md) that may not exist.
+- Never output "next", "hypothesis", "blocked", "latest_request", or anchor keys.
+
+Region:
+${regionText}`;
+}
+
+// ─── History consolidation (S7, plan §4.3) ────────────────────────────────
+// At compaction the layer is compressed in ONE LLM pass: related older items
+// are merged into milestone lines within the per-key caps (compress instead of
+// letting the cap DROP the oldest). Only the TEXT keys are rewritten — the
+// rule-based file lists (hist_files_read/edited) are already compact and are
+// left to the cap-drop.
+const CONSOLIDATE_KEYS = ['hist_done', 'hist_dead_ends', 'hist_decisions', 'hist_requests'];
+
+/**
+ * Whether the history layer is near a cap and worth consolidating (plan §4.3).
+ * Consolidation only pays off when a text key is ≥80% full (otherwise the cap
+ * would not drop anything yet).
+ * @param {object} sigma
+ * @returns {boolean}
+ */
+function historyNeedsConsolidation(sigma) {
+  if (!sigma || typeof sigma !== 'object') return false;
+  for (const k of CONSOLIDATE_KEYS) {
+    const cap = HIST_CAPS[k];
+    const len = Array.isArray(sigma[k]) ? sigma[k].length : 0;
+    if (cap && len >= cap * 0.8) return true;
+  }
+  return false;
+}
+
+/**
+ * Build the history-consolidation prompt (plan §4.3, S7). One pass rewrites the
+ * text history keys into milestone lines within their caps — compress, don't
+ * invent; past tense with evidence preserved.
+ * @param {object} sigma - the session Σ (current history layer)
+ * @param {string} sessionId - the current session id
+ * @returns {string} the prompt
+ */
+function buildConsolidationPrompt(sigma, sessionId) {
+  const list = (k) => (Array.isArray(sigma[k]) ? sigma[k].filter((x) => typeof x === 'string' && x.trim()) : []);
+  const caps = CONSOLIDATE_KEYS.map((k) => `${k} (cap ${HIST_CAPS[k]})`).join(', ');
+  return `You are consolidating the cumulative HISTORY layer of a coding session's state (Σ). A text key has grown near its cap; merge related OLDER items into a few milestone lines and keep the most important recent facts distinct. Restate and compress ONLY what is listed — do not invent new facts. Every item stays past-tense and keeps its evidence (file:line or command/result).
+
+session: ${sessionId}
+
+Current layer:
+done:
+${list('hist_done').map((x) => `- ${x}`).join('\n')}
+dead ends:
+${list('hist_dead_ends').map((x) => `- ${x}`).join('\n')}
+decisions:
+${list('hist_decisions').map((x) => `- ${x}`).join('\n')}
+earlier requests:
+${list('hist_requests').map((x) => `- ${x}`).join('\n')}
+
+Output ONLY a JSON object with exactly these keys (arrays of short strings, each item <= 20 words):
+{"hist_done": [...], "hist_dead_ends": [...], "hist_decisions": [...], "hist_requests": [...]}
+Target caps: ${caps}. Never output any other key (no file lists, no hist_last_bytes, no work-state/anchor keys).`;
+}
+
+/**
+ * Validate a consolidation LLM output: it must contain ONLY the text hist_*
+ * keys (string arrays), each within its cap. Any foreign key (file lists,
+ * hist_last_bytes, work-state, anchor) or non-string item → reject (null) so a
+ * bad output can never clobber the layer. Empty/omitted keys are skipped (the
+ * existing value is kept — conservative).
+ * @param {object} parsed - the LLM JSON
+ * @returns {object|null} the clean {hist_key: string[]} (capped) or null
+ */
+function sanitizeConsolidatedPatch(parsed) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (Object.keys(parsed).some((k) => !CONSOLIDATE_KEYS.includes(k))) return null; // safety
+  const clean = {};
+  for (const k of CONSOLIDATE_KEYS) {
+    if (!Array.isArray(parsed[k])) continue;
+    const items = parsed[k].filter((x) => typeof x === 'string' && x.trim());
+    if (items.length) clean[k] = items.slice(-HIST_CAPS[k]);
+  }
+  return Object.keys(clean).length ? clean : null;
+}
+
 // Ghost-reference filter (2026-09-26 context-confusion incident): the
 // extractor LLM can transcribe a confabulated file citation straight out of
 // an assistant message (the incident: a turn that cited todos/2026-07-06.md
@@ -701,7 +1007,7 @@ const GHOST_TODO_REF_RE = /((?:\/?[A-Za-z0-9._-]+\/)*todos\/\d{4}-\d{2}-\d{2}\.m
 function filterGhostRefs(patch, cwd) {
   const removed = [];
   if (!patch || typeof patch !== 'object' || !cwd) return { patch, removed };
-  for (const key of ['confirmed', 'hypothesis', 'next', 'blocked']) {
+  for (const key of FILTERABLE_KEYS) {
     const arr = patch[key];
     if (!Array.isArray(arr)) continue;
     patch[key] = arr.filter((item) => {
@@ -766,7 +1072,7 @@ function foreignSessionRefs(item, sessionId) {
 function filterForeignSessionRefs(patch, sessionId) {
   const removed = [];
   if (!patch || typeof patch !== 'object' || !sessionId) return { patch, removed };
-  for (const key of ['confirmed', 'hypothesis', 'next', 'blocked']) {
+  for (const key of FILTERABLE_KEYS) {
     const arr = patch[key];
     if (!Array.isArray(arr)) continue;
     patch[key] = arr.filter((item) => {
@@ -791,7 +1097,7 @@ function filterForeignSessionRefs(patch, sessionId) {
 function scrubSigmaForeignRefs(sigma, sessionId) {
   const removed = [];
   if (!sigma || typeof sigma !== 'object' || !sessionId) return removed;
-  for (const key of ['confirmed', 'hypothesis', 'next', 'blocked']) {
+  for (const key of FILTERABLE_KEYS) {
     const arr = sigma[key];
     if (!Array.isArray(arr)) continue;
     const kept = arr.filter((item) => {
@@ -972,6 +1278,190 @@ function extractTranscriptDelta(transcriptPath, fromBytes, opts = {}) {
   } finally {
     fs.closeSync(fd);
   }
+}
+
+/**
+ * Read a BYTE RANGE of the transcript JSONL from the FRONT (plan §4.6, S5).
+ * Unlike extractTranscriptDelta (which keeps the TAIL when capped — right for
+ * "what's most recent"), the strip region is removed from the BEGINNING, so a
+ * capped read must keep the HEAD and let the caller advance hist_last_bytes
+ * chunk by chunk. The trailing partial line is dropped at a LINE boundary in
+ * BYTES (multi-byte/UTF-8 safe), so `consumed` is a byte offset the caller can
+ * store in hist_last_bytes and re-read from on the next chunk.
+ * @param {string} transcriptPath
+ * @param {number} fromBytes - start offset (Σ.hist_last_bytes)
+ * @param {number} toBytes - end offset (the cut boundary); <=0 means "to EOF"
+ * @param {object} [opts]
+ * @param {number} [opts.maxChars=30000] - cap; when the range is larger, the HEAD is kept
+ * @returns {{text: string, entries: object[], consumed: number}} rendered text (for the LLM prompt), parsed entries (for the rule fallback), and bytes of complete lines consumed
+ */
+function extractTranscriptRange(transcriptPath, fromBytes, toBytes, opts = {}) {
+  const empty = { text: '', entries: [], consumed: 0 };
+  if (!transcriptPath) return empty;
+  const maxChars = Math.max(1, Number(opts.maxChars) || 30000);
+  let fd;
+  try {
+    fd = fs.openSync(transcriptPath, 'r');
+  } catch {
+    return empty;
+  }
+  try {
+    const size = fs.fstatSync(fd).size;
+    const from = Math.max(0, Math.min(Number(fromBytes) || 0, size));
+    const to = toBytes > 0 ? Math.min(Number(toBytes), size) : size;
+    let end = to;
+    let capped = false;
+    if (end - from > maxChars) {
+      end = from + maxChars;
+      capped = true;
+    }
+    const len = end - from;
+    if (len <= 0) return empty;
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, from);
+    // Find the last line boundary in BYTES (a JS string index would be wrong
+    // for multi-byte text). Keep only complete lines; the partial tail rides
+    // the next chunk.
+    let lastNl = -1;
+    for (let i = len - 1; i >= 0; i--) {
+      if (buf[i] === 0x0a) { lastNl = i; break; }
+    }
+    if (lastNl < 0) {
+      // No complete line fits in the cap (a single line exceeds it): advance
+      // to the cap boundary so the chunker always makes progress. The
+      // oversized line is skipped — its fragment fails JSON.parse on the next
+      // read; the route marks the refresh partial.
+      return { text: '', entries: [], consumed: from + len };
+    }
+    const endByte = lastNl + 1;
+    const text = buf.toString('utf8', 0, endByte);
+    const entries = [];
+    const rendered = [];
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      entries.push(entry);
+      const t = entryToText(entry);
+      if (t) rendered.push(t);
+    }
+    // consumed is an ABSOLUTE file offset — the route persists it as
+    // hist_last_bytes and passes it back as fromBytes.
+    return { text: rendered.join('\n'), entries, consumed: from + endByte };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Rule-based history for a removed region (plan §4.5, S6) — the deterministic
+ * fallback when LLM extraction fails or times out, so the Σ lineage never
+ * breaks. Extracts ONLY what the transcript structurally shows (no inference,
+ * no tool-result bodies): files read/edited, shell commands (first 60 chars),
+ * and past user requests (first 100 chars, prefixed "asked:" so they survive
+ * the imperative gate). Returns a strip patch (short keys + hist_files_*)
+ * ready for gateStripPatch({skipEvidence:true}) + mergeStripPatch.
+ * @param {object[]} entries - parsed transcript entries for the region
+ * @returns {object} the strip patch
+ */
+function ruleHistFromEntries(entries) {
+  const patch = {};
+  if (!Array.isArray(entries)) return patch;
+  const read = new Set();
+  const edited = new Set();
+  const done = [];
+  const requests = [];
+  const EDIT_TOOLS = new Set(['edit', 'write_file', 'notebook_edit']);
+  for (const entry of entries) {
+    if (!entry || !entry.message || !Array.isArray(entry.message.parts)) continue;
+    for (const part of entry.message.parts) {
+      if (!part) continue;
+      if (part.functionCall) {
+        const name = part.functionCall.name || '';
+        const args = part.functionCall.args || {};
+        if (name === 'read_file' && typeof args.file_path === 'string') read.add(args.file_path);
+        else if (EDIT_TOOLS.has(name) && typeof args.file_path === 'string') edited.add(args.file_path);
+        else if (name === 'run_shell_command' && typeof args.command === 'string') {
+          const cmd = args.command.replace(/\s+/g, ' ').trim().slice(0, 60);
+          if (cmd) done.push(`ran: ${cmd}`);
+        }
+      } else if (part.functionResponse) {
+        // Result status only (ok/error) — never the result body.
+        const r = part.functionResponse.response;
+        const s = typeof r === 'string' ? r : (r && typeof r.error === 'string' ? r.error : '');
+        if (s && /\b(error|fail(?:ed)?|exception|timeout)\b/i.test(s) && done[done.length - 1] && done[done.length - 1].startsWith('ran:')) {
+          done[done.length - 1] += ' (error)';
+        }
+      } else if (entry.type === 'user' && typeof part.text === 'string' && part.text.trim()) {
+        const t = `asked: ${part.text.trim().replace(/\s+/g, ' ').slice(0, 100)}`;
+        if (!requests.includes(t)) requests.push(t);
+      }
+    }
+  }
+  if (read.size) patch.hist_files_read = [...read];
+  if (edited.size) patch.hist_files_edited = [...edited];
+  if (done.length) patch.done = done.slice(-20);
+  if (requests.length) patch.requests = requests.slice(-10);
+  return patch;
+}
+
+/**
+ * Best-effort mapping of a C++ message index (cut = K_sum) to a transcript
+ * byte offset (plan §5.5). The robust mapping (tool_call_id / boundary-text
+ * search) is the follow-up after 실측; this uses the 1:1 entry-count
+ * assumption — count parsed JSONL entries from the front and return the byte
+ * offset just after entry #cut (0-based). Returns 0 when it cannot be
+ * determined (fail-open — the caller then does not advance and returns the
+ * current Σ as partial).
+ * @param {string} transcriptPath
+ * @param {number} cut - the message index to map
+ * @returns {number} byte offset, or 0
+ */
+function transcriptByteOffsetForMessageIndex(transcriptPath, cut) {
+  if (!transcriptPath || !(cut > 0)) return 0;
+  let raw;
+  try {
+    raw = fs.readFileSync(transcriptPath, 'utf8');
+  } catch {
+    return 0;
+  }
+  let offset = 0;
+  let count = 0;
+  for (const line of raw.split('\n')) {
+    if (!line) continue;
+    try {
+      JSON.parse(line);
+    } catch {
+      continue; // only count real entries
+    }
+    if (count === cut) return offset;
+    count++;
+    offset += Buffer.byteLength(line, 'utf8') + 1; // +1 for the \n
+  }
+  // Reaching the end means the scan never hit count === cut — cut is at or
+  // past the last entry, so the removed region extends to EOF.
+  return offset;
+}
+
+/**
+ * Cheap stable fingerprint of a Σ block (FNV-1a, 8-hex) — for the C++ to
+ * detect a frozen/stale snapshot across requests (plan §5.3). Self-contained
+ * (no crypto import needed).
+ * @param {string} s
+ * @returns {string} 8-hex-char fingerprint
+ */
+function hashBlock(s) {
+  let h = 0x811c9dc5;
+  const str = typeof s === 'string' ? s : '';
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
 }
 
 /**
@@ -1231,7 +1721,7 @@ function completionSignal(message) {
   return COMPLETION_SIGNAL_PATTERNS.some((p) => p.test(message));
 }
 
-const SCHEMA_KEYS = ['confirmed', 'hypothesis', 'next', 'blocked', 'anchor_revoked', 'anchor_completed', 'latest_request'];
+const SCHEMA_KEYS = ['confirmed', 'hypothesis', 'next', 'blocked', 'anchor_revoked', 'anchor_completed', 'latest_request', 'done', 'dead_ends', 'decisions', 'requests'];
 
 /**
  * Unwrap a {"state_patch": {...}} envelope if present.
@@ -1411,8 +1901,19 @@ module.exports = {
   digestTranscript,
   renderAnchor,
   renderCompactSigma,
+  renderStripSigma,
+  mergeStripPatch,
+  gateStripPatch,
+  buildStripExtractionPrompt,
+  buildConsolidationPrompt,
+  sanitizeConsolidatedPatch,
+  historyNeedsConsolidation,
   extractTranscriptTail,
   extractTranscriptDelta,
+  extractTranscriptRange,
+  ruleHistFromEntries,
+  transcriptByteOffsetForMessageIndex,
+  hashBlock,
   extractLastUserMessage,
   buildExtractionPrompt,
   callSummaryLLM,

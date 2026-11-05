@@ -2759,6 +2759,121 @@ httpApp.get("/v1/kv-offload/session/sigma", async (c) => {
   return c.json({ ok: true, session_id: sessionId, anchor: block });
 });
 
+// ─── Sigma strip refresh (plan §6, step 4) ───
+// POST /sigma/refresh {session, cut, wait} — the focus-llama stage-2 fetch
+// (sigma-strip.cpp sigma_refresh_fetch): absorbs the removed region
+// [hist_last_bytes, cut) into the session's Σ history layer and answers with
+// the rendered wire block. Single-flight per session (plan §5.3 rule 5) — a
+// second request for the same session joins the in-flight refresh; any
+// remainder is picked up by the next refresh via hist_last_bytes. The C++
+// parses the body on BOTH wait values, so the result object is always returned
+// (200 for wait:true, 202 for wait:false). renderStripSigma never returns an
+// empty block (fixed header), so the C++ "empty block" failure cannot fire.
+const sigmaRefreshInFlight = new Map(); // session -> { cut, promise }
+
+httpApp.post("/sigma/refresh", async (c) => {
+  const denied = kvAuth(c);
+  if (denied) return denied;
+  if (!skillState.skillStateEnabled()) return c.json({ error: "skillstate disabled" }, 404);
+  let body;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "body must be a JSON object" }, 400);
+  }
+  const session = typeof body.session === "string" ? body.session.trim() : "";
+  const cut = Number(body.cut);
+  const wait = body.wait !== false;
+  if (!session) return c.json({ error: "session required" }, 400);
+  if (!Number.isFinite(cut) || cut < 0) return c.json({ error: "cut must be a non-negative number" }, 400);
+
+  const existing = sigmaRefreshInFlight.get(session);
+  if (existing) {
+    try {
+      const result = await existing.promise;
+      return c.json(result, wait ? 200 : 202);
+    } catch {
+      return c.json({ error: "in-flight refresh failed" }, 502);
+    }
+  }
+
+  const work = (async () => {
+    const startedAt = Date.now();
+    const BUDGET_MS = 9000; // C++ default timeout is 10s — stay under it
+    let partial = false;
+
+    const tp = skillState.ensureTranscriptPath(session);
+    const sigma0 = skillState.loadSigma(session);
+    const fromBytes = Math.max(0, Number(sigma0.hist_last_bytes) || 0);
+    const toBytes = skillState.transcriptByteOffsetForMessageIndex(tp, cut);
+
+    let patch = {};
+    let consumed = 0;
+    if (cut > 0 && toBytes > 0 && toBytes > fromBytes) {
+      const range = skillState.extractTranscriptRange(tp, fromBytes, toBytes, { maxChars: 30000 });
+      consumed = range.consumed;
+      if (range.text.trim()) {
+        const llmBudgetMs = Math.min(7000, BUDGET_MS - (Date.now() - startedAt) - 500);
+        if (llmBudgetMs >= 2000) {
+          try {
+            const text = await skillState.callSummaryLLM(
+              skillState.buildStripExtractionPrompt(range.text, session),
+              llmBudgetMs
+            );
+            const parsed = skillState.extractJsonPatch(text);
+            if (parsed && typeof parsed === "object") {
+              const gated = skillState.gateStripPatch(parsed, session, "");
+              if (gated.removed.length) {
+                log(`[sigma-refresh] session=${session} gated=${gated.removed.map((r) => r.reason).join(",")}`);
+              }
+              patch = gated.patch;
+            } else {
+              throw new Error("no JSON patch in LLM output");
+            }
+          } catch (e) {
+            log(`[sigma-refresh] session=${session} llm extraction failed (${e.message}), rule fallback`);
+            patch = skillState.ruleHistFromEntries(range.entries);
+            skillState.gateStripPatch(patch, session, "", { skipEvidence: true });
+            partial = true;
+          }
+        } else {
+          patch = skillState.ruleHistFromEntries(range.entries);
+          skillState.gateStripPatch(patch, session, "", { skipEvidence: true });
+          partial = true;
+        }
+        if (consumed < toBytes) partial = true; // range capped — remainder rides the next refresh
+      }
+    } else if (cut > 0 && toBytes === 0) {
+      partial = true; // boundary mapping failed — return the current Σ as-is (plan §5.5 fail-open)
+    }
+
+    const written = skillState.mutateSigma(session, (s) => {
+      let next = s;
+      if (Object.keys(patch).length) next = skillState.mergeStripPatch(next, patch);
+      if (consumed > 0 && consumed > (Number(s.hist_last_bytes) || 0)) {
+        next = { ...next, hist_last_bytes: consumed };
+      }
+      return next;
+    });
+    const block = skillState.renderStripSigma(written || sigma0);
+    const hash = skillState.hashBlock(block);
+    log(
+      `[sigma-refresh] session=${session} cut=${cut} wait=${wait} from=${fromBytes} to=${toBytes} consumed=${consumed} partial=${partial} block_chars=${block.length} hash=${hash} ms=${Date.now() - startedAt}`
+    );
+    return { block, hash, partial };
+  })();
+
+  const tracked = work.finally(() => sigmaRefreshInFlight.delete(session));
+  sigmaRefreshInFlight.set(session, { cut, promise: tracked });
+  try {
+    const result = await tracked;
+    return c.json(result, wait ? 200 : 202);
+  } catch (e) {
+    log(`[sigma-refresh] session=${session} refresh failed: ${e.message}`);
+    return c.json({ error: "refresh failed" }, 502);
+  }
+});
+
 httpApp.delete("/v1/kv-offload/session", async (c) => {
   const denied = kvAuth(c);
   if (denied) return denied;

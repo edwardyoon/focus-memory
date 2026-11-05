@@ -73,11 +73,13 @@ function main() {
 
   const parts = [];
   // Compact reference renderer (2026-11-04 Phase 2): past-tense "state at
-  // compaction time" — `next`/`latest_request` are excluded because this
-  // block is frozen for the whole post-compaction session, and a re-read
-  // directive field re-latches stale work (2026-10-15/10-20/11-01). The
-  // first line is the system note separating reference from instruction;
-  // the verbatim last user message (below) defines the current task.
+  // compaction time" — `next` is included stale-framed ("may be STALE —
+  // cross-check against confirmed before acting") because the block is
+  // frozen for the whole post-compaction session and a plain directive
+  // field re-latches stale work (2026-10-15/10-20/11-01); `latest_request`
+  // stays excluded. The first line is the system note separating reference
+  // from instruction; the verbatim last user message (below) defines the
+  // current task.
   const body = ss.renderCompactSigma(sigma);
   if (body) {
     let bounded = body;

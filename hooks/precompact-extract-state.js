@@ -70,6 +70,93 @@ function scanTranscriptTopics(transcriptPath) {
 }
 
 /**
+ * S7 (plan §4.3) — history Δ at compaction. Absorb the transcript region
+ * [hist_last_bytes, sizeAtRead) — the content that leaves the model's
+ * context via this compaction — into the cumulative history layer (hist_*).
+ * Same pipeline as POST /sigma/refresh (extractTranscriptRange → LLM strip
+ * prompt → gateStripPatch → mergeStripPatch) with the rule-based fallback,
+ * so the Σ lineage never breaks when the LLM is down. hist_last_bytes
+ * advances only on a read chunk; a capped region rides the next
+ * refresh/compaction.
+ * @param {string} sessionId
+ * @param {string} transcriptPath
+ * @param {number} sizeAtRead - transcript size captured before any LLM call
+ * @returns {Promise<void>}
+ */
+async function runHistoryAbsorb(sessionId, transcriptPath, sizeAtRead) {
+  const sigma = ss.loadSigma(sessionId);
+  const fromBytes = Math.max(0, Number(sigma.hist_last_bytes) || 0);
+  if (sizeAtRead <= fromBytes) return; // nothing new since the last absorb
+  const range = ss.extractTranscriptRange(transcriptPath, fromBytes, sizeAtRead, { maxChars: BUDGET_CHARS });
+  if (range.consumed <= fromBytes) return; // unreadable region — retry next pass
+  let patch = {};
+  if (range.text.trim()) {
+    try {
+      const out = await ss.callSummaryLLM(ss.buildStripExtractionPrompt(range.text, sessionId), LLM_TIMEOUT_MS);
+      const parsed = ss.extractJsonPatch(out);
+      if (!parsed || typeof parsed !== 'object') throw new Error('no JSON patch in LLM output');
+      patch = ss.gateStripPatch(parsed, sessionId, '').patch;
+    } catch (err) {
+      ss.appendTelemetry({
+        ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state',
+        event: 'hist_absorb_llm_failed', error: String((err && err.message) || err),
+      });
+      patch = ss.ruleHistFromEntries(range.entries);
+      ss.gateStripPatch(patch, sessionId, '', { skipEvidence: true });
+    }
+  } else {
+    // No renderable text (e.g. all tool-result lines) — structural facts only.
+    patch = ss.ruleHistFromEntries(range.entries);
+    ss.gateStripPatch(patch, sessionId, '', { skipEvidence: true });
+  }
+  const capped = range.consumed < sizeAtRead;
+  ss.mutateSigma(sessionId, (s) => {
+    let next = Object.keys(patch).length ? ss.mergeStripPatch(s, patch) : { ...s };
+    if (range.consumed > (Number(s.hist_last_bytes) || 0)) next = { ...next, hist_last_bytes: range.consumed };
+    return next;
+  });
+  ss.appendTelemetry({
+    ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state',
+    event: 'hist_absorbed', from: fromBytes, to: sizeAtRead, consumed: range.consumed,
+    keys: Object.keys(patch), ...(capped ? { capped: true } : {}),
+  });
+}
+
+/**
+ * S7 (plan §4.3) — one consolidation pass. When a text history key is near
+ * its cap, a single LLM call rewrites the text keys into milestone lines
+ * within the caps (compress, don't drop). Replaces only the keys present in
+ * the sanitized output; a foreign key or non-string item rejects the whole
+ * output (null → layer untouched). Any failure leaves the layer as-is — the
+ * cap-drop in mergeStripPatch is the fallback.
+ * @param {string} sessionId
+ * @param {object} sigma - the freshly written Σ (post history-absorb)
+ * @returns {Promise<void>}
+ */
+async function runHistoryConsolidation(sessionId, sigma) {
+  if (!ss.historyNeedsConsolidation(sigma)) return;
+  try {
+    const out = await ss.callSummaryLLM(ss.buildConsolidationPrompt(sigma, sessionId), LLM_TIMEOUT_MS);
+    const clean = ss.sanitizeConsolidatedPatch(ss.extractJsonPatch(out));
+    if (!clean) {
+      ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'hist_consolidation_rejected' });
+      return;
+    }
+    ss.mutateSigma(sessionId, (s) => {
+      const next = { ...s };
+      for (const k of Object.keys(clean)) next[k] = clean[k]; // replace, not union — a rewrite
+      return next;
+    });
+    ss.appendTelemetry({ ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state', event: 'hist_consolidated', keys: Object.keys(clean) });
+  } catch (err) {
+    ss.appendTelemetry({
+      ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state',
+      event: 'hist_consolidation_failed', error: String((err && err.message) || err),
+    });
+  }
+}
+
+/**
  * Worker mode — the actual extraction (runs detached, no hook timeout).
  * @param {object} event - PreCompact event JSON
  * @returns {Promise<void>}
@@ -93,6 +180,20 @@ async function runWorker(event) {
   const sizeAtRead = (() => {
     try { return fs.statSync(event.transcript_path).size; } catch { return 0; }
   })();
+  // S7 (plan §4.3): history-layer maintenance — runs on EVERY worker pass,
+  // before the work-state early returns (hist_last_bytes and
+  // last_extraction_transcript_bytes track different regions): absorb the
+  // content about to leave via this compaction, then consolidate a near-cap
+  // text key. Both fail-open — compaction never depends on them.
+  try {
+    await runHistoryAbsorb(sessionId, event.transcript_path, sizeAtRead);
+    await runHistoryConsolidation(sessionId, ss.loadSigma(sessionId));
+  } catch (err) {
+    ss.appendTelemetry({
+      ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state',
+      event: 'hist_maintenance_error', error: String((err && err.message) || err),
+    });
+  }
   const transcriptText = fromBytes > 0
     ? ss.extractTranscriptDelta(event.transcript_path, fromBytes, { maxChars: BUDGET_CHARS })
     : ss.extractTranscriptTail(event.transcript_path, BUDGET_CHARS, { maxChars: TAIL_MAX_CHARS, minUserEntries: TAIL_MIN_USER });
