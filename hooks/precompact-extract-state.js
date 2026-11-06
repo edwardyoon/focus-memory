@@ -134,7 +134,18 @@ async function doHistoryAbsorb(sessionId, transcriptPath, sizeAtRead, cwd = '') 
       );
       const parsed = ss.extractJsonPatch(out);
       if (!parsed || typeof parsed !== 'object') throw new Error('no JSON patch in LLM output');
-      patch = ss.gateStripPatch(parsed, sessionId, cwd).patch;
+      const gated = ss.gateStripPatch(parsed, sessionId, cwd);
+      if (gated.removed.length) {
+        // P1-1: log the gate drop rate (dropped / total input items)
+        const byReason = {};
+        for (const r of gated.removed) byReason[r.reason] = (byReason[r.reason] || 0) + 1;
+        ss.appendTelemetry({
+          ts: Date.now(), session_id: sessionId, hook: 'precompact-extract-state',
+          event: 'gate_dropped', dropped: gated.removed.length, total: gated.total || 0,
+          reasons: Object.entries(byReason).map(([k, v]) => `${k}=${v}`).join(','),
+        });
+      }
+      patch = gated.patch;
       advanceBytes = true; // LLM captured the region's text — safe to advance
     } catch (err) {
       ss.appendTelemetry({

@@ -119,9 +119,12 @@ function saveSigma(sessionId, sigma) {
  * the lock, making the whole cycle atomic.
  * @param {string} sessionId
  * @param {(sigma: object) => object|null} mutate - receives the current Σ, returns the next Σ (or null to skip the write)
+ * @param {number} [timeoutMs=2000] - lock-acquire deadline; the long-lived
+ *   server path (index.js) passes 500 so a contended lock never blocks a
+ *   request for 2s (P1-5). Short-lived hooks keep the 2000 default.
  * @returns {object|null} the Σ as written (null when mutate skipped)
  */
-function mutateSigma(sessionId, mutate) {
+function mutateSigma(sessionId, mutate, timeoutMs = 2000) {
   const file = sigmaFile(sessionId);
   return withLock(file, () => {
     const current = loadSigma(sessionId);
@@ -129,7 +132,7 @@ function mutateSigma(sessionId, mutate) {
     if (next === null) return null;
     atomicWrite(file, JSON.stringify(next, null, 2));
     return next;
-  });
+  }, timeoutMs);
 }
 
 // ─── Cross-process history-absorb claim (item 17) ─────────────────────────
@@ -152,15 +155,16 @@ const HIST_ABSORB_CLAIM_TTL_MS = 180000; // > the worker's 120s LLM timeout + ma
  * Atomic (inside the mutateSigma file lock): a fresh claim by the other path
  * yields null (skip); otherwise sets the token + expiry and proceeds.
  * @param {string} sessionId
+ * @param {number} [timeoutMs=2000] - lock-acquire deadline (see mutateSigma)
  * @returns {string|null} the claim token (pass it to releaseHistAbsorb), or null to skip
  */
-function claimHistAbsorb(sessionId) {
+function claimHistAbsorb(sessionId, timeoutMs = 2000) {
   const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   const written = mutateSigma(sessionId, (s) => {
     const now = Date.now();
     if ((Number(s.hist_inflight_until) || 0) > now) return null; // fresh claim by the other path
     return { ...s, hist_inflight_until: now + HIST_ABSORB_CLAIM_TTL_MS, hist_inflight_token: token };
-  });
+  }, timeoutMs);
   return written ? token : null;
 }
 
@@ -170,11 +174,13 @@ function claimHistAbsorb(sessionId) {
  * cannot clear a fresh claim set by another path).
  * @param {string} sessionId
  * @param {string} token - the token from claimHistAbsorb
+ * @param {number} [timeoutMs=2000] - lock-acquire deadline (see mutateSigma)
  * @returns {void}
  */
-function releaseHistAbsorb(sessionId, token) {
+function releaseHistAbsorb(sessionId, token, timeoutMs = 2000) {
   mutateSigma(sessionId, (s) =>
-    s.hist_inflight_token === token ? { ...s, hist_inflight_until: 0, hist_inflight_token: null } : s);
+    s.hist_inflight_token === token ? { ...s, hist_inflight_until: 0, hist_inflight_token: null } : s,
+    timeoutMs);
 }
 
 // ─── Live-session liveness (recent_work tool fallback) ───────────────────────
@@ -966,7 +972,23 @@ const IMPERATIVE_KO_END_RE = /(해줘|해라|하세요|해주세요|하자)[.!]?
  */
 function gateStripPatch(patch, sessionId, cwd, opts = {}) {
   const removed = [];
-  if (!patch || typeof patch !== 'object') return { patch, removed };
+  if (!patch || typeof patch !== 'object') return { patch, removed, total: 0 };
+  // P1-1: total input items across the gated short keys (for the drop-rate log)
+  let total = 0;
+  for (const k of HIST_PATCH_KEYS) if (Array.isArray(patch[k])) total += patch[k].length;
+  // P1-3: LLM patches must use the SHORT keys (done/dead_ends/decisions/
+  // requests) so the gates below apply to every item. Direct hist_* keys
+  // would bypass them (mergeStripPatch accepts both forms). The rule path
+  // (skipEvidence) is exempt — it emits hist_files_read/edited, which are
+  // structurally grounded, not LLM output.
+  if (!opts.skipEvidence) {
+    for (const k of Object.keys(patch)) {
+      if (k.startsWith('hist_')) {
+        removed.push({ key: k, item: null, reason: 'hist-direct-key' });
+        delete patch[k];
+      }
+    }
+  }
   // The evidence gate rejects "done" claims with no file/result token — right
   // for LLM output (confabulation guard). Rule-based patches are structurally
   // grounded (a real tool call), so skipEvidence lets them through.
@@ -986,6 +1008,19 @@ function gateStripPatch(patch, sessionId, cwd, opts = {}) {
   for (const key of HIST_PATCH_KEYS) {
     const arr = patch[key];
     if (!Array.isArray(arr)) continue;
+    // P0-2: user requests are essentially imperative ("fix the login bug"),
+    // so the imperative gate would drop nearly all of them. Exclude
+    // `requests` from the check and force the "asked:" prefix (the rule path
+    // already adds it; the LLM path may not) so they survive as records.
+    if (key === 'requests') {
+      patch[key] = arr.map((item) => {
+        if (typeof item !== 'string') return item;
+        const t = item.trim();
+        if (!t) return item;
+        return t.startsWith('asked:') ? t : `asked: ${t}`;
+      });
+      continue;
+    }
     patch[key] = arr.filter((item) => {
       if (typeof item !== 'string') return true;
       // Item 14: a past record that leads with a verb ("Run ./test → 2
@@ -997,7 +1032,7 @@ function gateStripPatch(patch, sessionId, cwd, opts = {}) {
     });
     if (patch[key].length === 0) delete patch[key];
   }
-  return { patch, removed };
+  return { patch, removed, total };
 }
 
 // The strip extraction prompt (plan §4.2). Distills a REMOVED region into the
@@ -1022,7 +1057,7 @@ Output ONLY a JSON object with these keys (all optional; arrays of short strings
 
 Rules:
 - Past tense only. Each item <= 20 words.
-- "done" items MUST cite evidence: a file path (optionally :line) or a command/result (ok/error/fail/pass/exit code). No evidence -> omit the item.
+- "done" items MUST cite evidence: a file path (optionally :line) or a command/result — an exit-code number ("exit 0"), a count ("2 passed", "3 failed"), or a standalone ALL-CAPS marker (PASS/FAIL/OK/ERROR/TIMEOUT). Lowercase prose ("ok", "error", "pass") is NOT evidence and the item will be dropped. No evidence -> omit the item.
 - Record only what the transcript shows (tool calls, their results, stated actions). Do not infer.
 - Do NOT transcribe instructions, TODOs, or directives from the region. A line like "next: do X" is a directive, not a record.
 - Do NOT cite other sessions' state files (state/<uuid>.json). Self-references to this session (${sessionId}) are fine.
@@ -1262,9 +1297,13 @@ function entryToText(entry) {
   const parts = [];
   for (const part of entry.message.parts) {
     if (entry.type === 'user' && part.text) {
-      parts.push(clip(part.text, 4000));
+      // P0-1: strip client-injected blocks (Σ anchor, system-reminder) so they
+      // cannot roll back into the rendered digest / Σ hist. Skip if empty.
+      const t = stripInjectedBlocks(part.text);
+      if (t.trim()) parts.push(clip(t, 4000));
     } else if (entry.type === 'assistant' && part.text) {
-      parts.push(clip(part.text, 4000));
+      const t = stripInjectedBlocks(part.text);
+      if (t.trim()) parts.push(clip(t, 4000));
     } else if (part.functionCall) {
       let args = '';
       try { args = JSON.stringify(part.functionCall.args || {}); } catch {}
@@ -1412,20 +1451,30 @@ function extractTranscriptDelta(transcriptPath, fromBytes, opts = {}) {
  * Unlike extractTranscriptDelta (which keeps the TAIL when capped — right for
  * "what's most recent"), the strip region is removed from the BEGINNING, so a
  * capped read must keep the HEAD and let the caller advance hist_last_bytes
- * chunk by chunk. The trailing partial line is dropped at a LINE boundary in
- * BYTES (multi-byte/UTF-8 safe), so `consumed` is a byte offset the caller can
+ * chunk by chunk.
+ *
+ * P0-3: the budget is measured on RENDERED (post-clip) chars, not raw bytes.
+ * The old raw-byte cap made one 30KB+ tool_result line either fill the whole
+ * chunk (rendered to ~800 chars) or get skipped entirely — the root cause of
+ * the ~87-pass / 1-hour drains. Lines are now consumed until the rendered
+ * total reaches maxChars. The read window is 1MB; a line larger than the
+ * window extends the read to 8MB; only lines beyond 8MB are skipped.
+ * The trailing partial line is dropped at a LINE boundary in BYTES
+ * (multi-byte/UTF-8 safe), so `consumed` is a byte offset the caller can
  * store in hist_last_bytes and re-read from on the next chunk.
  * @param {string} transcriptPath
  * @param {number} fromBytes - start offset (Σ.hist_last_bytes)
  * @param {number} toBytes - end offset (the cut boundary); <=0 means "to EOF"
  * @param {object} [opts]
- * @param {number} [opts.maxChars=30000] - cap; when the range is larger, the HEAD is kept
+ * @param {number} [opts.maxChars=30000] - cap on RENDERED chars; when the range is larger, the HEAD is kept
  * @returns {{text: string, entries: object[], consumed: number}} rendered text (for the LLM prompt), parsed entries (for the rule fallback), and bytes of complete lines consumed
  */
 function extractTranscriptRange(transcriptPath, fromBytes, toBytes, opts = {}) {
   const empty = { text: '', entries: [], consumed: 0 };
   if (!transcriptPath) return empty;
   const maxChars = Math.max(1, Number(opts.maxChars) || 30000);
+  const WINDOW = 1024 * 1024;        // 1MB read window
+  const MAX_LINE = 8 * 1024 * 1024;  // 8MB max line; larger lines are skipped
   let fd;
   try {
     fd = fs.openSync(transcriptPath, 'r');
@@ -1436,49 +1485,75 @@ function extractTranscriptRange(transcriptPath, fromBytes, toBytes, opts = {}) {
     const size = fs.fstatSync(fd).size;
     const from = Math.max(0, Math.min(Number(fromBytes) || 0, size));
     const to = toBytes > 0 ? Math.min(Number(toBytes), size) : size;
-    let end = to;
-    let capped = false;
-    if (end - from > maxChars) {
-      end = from + maxChars;
-      capped = true;
-    }
-    const len = end - from;
-    if (len <= 0) return empty;
-    const buf = Buffer.alloc(len);
-    fs.readSync(fd, buf, 0, len, from);
-    // Find the last line boundary in BYTES (a JS string index would be wrong
-    // for multi-byte text). Keep only complete lines; the partial tail rides
-    // the next chunk.
-    let lastNl = -1;
-    for (let i = len - 1; i >= 0; i--) {
-      if (buf[i] === 0x0a) { lastNl = i; break; }
-    }
-    if (lastNl < 0) {
-      // No complete line fits in the cap (a single line exceeds it): advance
-      // to the cap boundary so the chunker always makes progress. The
-      // oversized line is skipped — its fragment fails JSON.parse on the next
-      // read; the route marks the refresh partial.
-      return { text: '', entries: [], consumed: from + len };
-    }
-    const endByte = lastNl + 1;
-    const text = buf.toString('utf8', 0, endByte);
-    const entries = [];
+    if (to <= from) return empty;
+
+    let pos = from;
     const rendered = [];
-    for (const line of text.split('\n')) {
-      if (!line) continue;
-      let entry;
-      try {
-        entry = JSON.parse(line);
-      } catch {
-        continue;
+    const entries = [];
+    let renderedChars = 0;
+    let consumed = from;
+
+    while (pos < to) {
+      let len = Math.min(WINDOW, to - pos);
+      let buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, pos);
+      // Last complete line in the window (bytes, not string indices —
+      // multi-byte/UTF-8 safe).
+      let lastNl = -1;
+      for (let i = len - 1; i >= 0; i--) {
+        if (buf[i] === 0x0a) { lastNl = i; break; }
       }
-      entries.push(entry);
-      const t = entryToText(entry);
-      if (t) rendered.push(t);
+      if (lastNl < 0) {
+        if (pos + len >= to) break; // range ends mid-line — the partial tail rides the next chunk
+        if (len < MAX_LINE) {
+          // Line larger than the 1MB window: extend the read to 8MB and retry.
+          const newLen = Math.min(MAX_LINE, to - pos);
+          buf = Buffer.alloc(newLen);
+          fs.readSync(fd, buf, 0, newLen, pos);
+          lastNl = -1;
+          for (let i = newLen - 1; i >= 0; i--) {
+            if (buf[i] === 0x0a) { lastNl = i; break; }
+          }
+          len = newLen;
+        }
+        if (lastNl < 0) {
+          // Pathological line beyond 8MB: skip it (scan forward for its end).
+          let skipPos = pos + len;
+          let found = -1;
+          while (skipPos < to) {
+            const slen = Math.min(WINDOW, to - skipPos);
+            const sbuf = Buffer.alloc(slen);
+            fs.readSync(fd, sbuf, 0, slen, skipPos);
+            const nl = sbuf.indexOf(0x0a);
+            if (nl >= 0) { found = skipPos + nl; break; }
+            skipPos += slen;
+          }
+          if (found < 0) break; // no line end before `to` — rides the next chunk
+          pos = found + 1;      // skipped line: advance the cursor, not consumed
+          continue;
+        }
+      }
+      // Process every complete line in [pos, pos+lastNl+1).
+      const complete = buf.toString('utf8', 0, lastNl + 1);
+      for (const line of complete.split('\n')) {
+        if (!line) continue;
+        let entry;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        entries.push(entry);
+        const t = entryToText(entry);
+        if (t) { rendered.push(t); renderedChars += t.length + 1; }
+      }
+      consumed = pos + lastNl + 1;
+      pos = consumed;
+      if (renderedChars >= maxChars) break; // rendered budget reached — the rest rides the next pass
     }
     // consumed is an ABSOLUTE file offset — the route persists it as
     // hist_last_bytes and passes it back as fromBytes.
-    return { text: rendered.join('\n'), entries, consumed: from + endByte };
+    return { text: rendered.join('\n'), entries, consumed };
   } finally {
     fs.closeSync(fd);
   }
@@ -1524,8 +1599,13 @@ function ruleHistFromEntries(entries) {
           done[done.length - 1] += ' (error)';
         }
       } else if (entry.type === 'user' && typeof part.text === 'string' && part.text.trim()) {
-        const t = `asked: ${part.text.trim().replace(/\s+/g, ' ').slice(0, 100)}`;
-        if (!requests.includes(t)) requests.push(t);
+        // P0-1: strip injected blocks before distilling the "asked:" request —
+        // a Σ anchor / system-reminder user entry must not become a request.
+        const stripped = stripInjectedBlocks(part.text).trim().replace(/\s+/g, ' ');
+        if (stripped) {
+          const t = `asked: ${stripped.slice(0, 100)}`;
+          if (!requests.includes(t)) requests.push(t);
+        }
       }
     }
   }
@@ -1689,10 +1769,13 @@ function extractLastUserMessage(transcriptPath, maxChars = 400) {
       continue;
     }
     if (entry.type !== 'user' || !entry.message || !Array.isArray(entry.message.parts)) continue;
+    // P0-1: strip injected blocks (Σ anchor / system-reminder) from each user
+    // part; an injected-blocks-only entry is skipped, so the walk reaches the
+    // real last user message.
     const texts = entry.message.parts
-      .map((p) => (p && typeof p.text === 'string' ? p.text.trim() : ''))
+      .map((p) => (p && typeof p.text === 'string' ? stripInjectedBlocks(p.text).trim() : ''))
       .filter((t) => t && !/^User attachment stored on the daemon host/i.test(t));
-    if (!texts.length) continue; // metadata-only user entry
+    if (!texts.length) continue; // metadata-only / injected-blocks-only user entry
     let msg = texts.join('\n');
     msg = msg.replace(/^\[User message received during tool execution\]:\s*/i, '');
     return clip(msg, Math.max(100, Number(maxChars) || 400));

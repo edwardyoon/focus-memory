@@ -2477,7 +2477,7 @@ httpApp.put("/v1/kv-offload/chunk", async (c) => {
       if (digest) {
         skillState.mutateSigma(sessionId, (s) => {
           s.recent_digest = { text: digest, ts: new Date().toISOString() };
-        });
+        }, 500); // P1-5: 500ms lock deadline (server path)
       }
     }
   } catch {}
@@ -2815,7 +2815,8 @@ httpApp.post("/sigma/refresh", async (c) => {
     // means it is in-flight, so skip the absorption and return the current
     // block (fail-open; the merge is a dedup-safe union and the region's facts
     // land via the other path — the remainder rides the next refresh).
-    absorbClaim = skillState.claimHistAbsorb(session);
+    // P1-5: the server path uses a 500ms lock deadline (not the 2s hook default).
+    absorbClaim = skillState.claimHistAbsorb(session, 500);
     if (!absorbClaim) {
       const current = skillState.loadSigma(session);
       const block = skillState.renderStripSigma(current);
@@ -2864,7 +2865,10 @@ httpApp.post("/sigma/refresh", async (c) => {
             if (parsed && typeof parsed === "object") {
               const gated = skillState.gateStripPatch(parsed, session, cwd);
               if (gated.removed.length) {
-                log(`[sigma-refresh] session=${session} gated=${gated.removed.map((r) => r.reason).join(",")}`);
+                // P1-1: log the gate drop rate (dropped / total input items)
+                const byReason = {};
+                for (const r of gated.removed) byReason[r.reason] = (byReason[r.reason] || 0) + 1;
+                log(`[sigma-refresh] session=${session} gate dropped ${gated.removed.length}/${gated.total || 0} (${Object.entries(byReason).map(([k, v]) => `${k}=${v}`).join(",")})`);
               }
               patch = gated.patch;
               advanceBytes = true; // LLM captured the region's text — safe to advance
@@ -2897,7 +2901,7 @@ httpApp.post("/sigma/refresh", async (c) => {
         next = { ...next, hist_last_bytes: consumed };
       }
       return next;
-    });
+    }, 500); // P1-5: 500ms lock deadline (server path)
     const block = skillState.renderStripSigma(written || sigma0);
     const hash = skillState.hashBlock(block);
     log(
@@ -2908,7 +2912,7 @@ httpApp.post("/sigma/refresh", async (c) => {
 
   const tracked = work.finally(() => {
     sigmaRefreshInFlight.delete(session);
-    if (absorbClaim) skillState.releaseHistAbsorb(session, absorbClaim);
+    if (absorbClaim) skillState.releaseHistAbsorb(session, absorbClaim, 500); // P1-5
   });
   sigmaRefreshInFlight.set(session, { cut, promise: tracked });
   try {

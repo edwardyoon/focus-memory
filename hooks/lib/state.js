@@ -66,14 +66,18 @@ function atomicWrite(file, content) {
   }
 }
 
+// P1-5: yield the thread (Atomics.wait) instead of CPU-spinning — a spin-wait
+// on the lock deadline burns a core for the whole wait; the MCP server is a
+// long-lived process that must not hog a core while polling the lockfile.
+const _SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
 /**
- * Synchronous sleep — hooks are short-lived processes; the spin is
- * millisecond-scale and bounded by the lock deadline.
+ * Synchronous sleep — yields the thread via Atomics.wait (no CPU spin).
+ * May return early if woken (we never signal, so this is rare); callers
+ * re-check their deadline in a loop, so an early return is safe.
  * @param {number} ms
  */
 function sleepMs(ms) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {}
+  Atomics.wait(_SLEEP_BUF, 0, 0, Math.max(1, ms));
 }
 
 /**
