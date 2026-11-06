@@ -2760,7 +2760,7 @@ httpApp.get("/v1/kv-offload/session/sigma", async (c) => {
 });
 
 // ─── Sigma strip refresh (plan §6, step 4) ───
-// POST /sigma/refresh {session, cut, wait} — the focus-llama stage-2 fetch
+// POST /sigma/refresh {session, cut, wait, llm?} — the focus-llama stage-2 fetch
 // (sigma-strip.cpp sigma_refresh_fetch): absorbs the removed region
 // [hist_last_bytes, cut) into the session's Σ history layer and answers with
 // the rendered wire block. Single-flight per session (plan §5.3 rule 5) — a
@@ -2784,6 +2784,10 @@ httpApp.post("/sigma/refresh", async (c) => {
   const session = typeof body.session === "string" ? body.session.trim() : "";
   const cut = Number(body.cut);
   const wait = body.wait !== false;
+  // llm: "summary" routes the region extraction to the SUMMARY_LLM cascade
+  // (the background drain's fast path); anything else (default) keeps the
+  // current MAIN_LLM (27B thinking) extraction.
+  const llm = typeof body.llm === "string" ? body.llm.trim() : "";
   if (!session) return c.json({ error: "session required" }, 400);
   if (!Number.isFinite(cut) || cut < 0) return c.json({ error: "cut must be a non-negative number" }, 400);
 
@@ -2816,7 +2820,7 @@ httpApp.post("/sigma/refresh", async (c) => {
       const current = skillState.loadSigma(session);
       const block = skillState.renderStripSigma(current);
       const hash = skillState.hashBlock(block);
-      log(`[sigma-refresh] session=${session} cut=${cut} wait=${wait} skipped (absorb in-flight by another process) block_chars=${block.length} hash=${hash}`);
+      log(`[sigma-refresh] session=${session} cut=${cut} wait=${wait} llm=${llm || "main"} skipped (absorb in-flight by another process) block_chars=${block.length} hash=${hash}`);
       return { block, hash, partial: true };
     }
     const startedAt = Date.now();
@@ -2854,7 +2858,7 @@ httpApp.post("/sigma/refresh", async (c) => {
             const text = await skillState.callSummaryLLM(
               skillState.buildStripExtractionPrompt(range.text, session),
               llmBudgetMs,
-              { useMainLLM: true, maxTokens: 30000 }
+              { useMainLLM: llm !== "summary", maxTokens: llm === "summary" ? 4096 : 30000 }
             );
             const parsed = skillState.extractJsonPatch(text);
             if (parsed && typeof parsed === "object") {
@@ -2897,7 +2901,7 @@ httpApp.post("/sigma/refresh", async (c) => {
     const block = skillState.renderStripSigma(written || sigma0);
     const hash = skillState.hashBlock(block);
     log(
-      `[sigma-refresh] session=${session} cut=${cut} wait=${wait} from=${fromBytes} to=${toBytes} consumed=${consumed} partial=${partial} block_chars=${block.length} hash=${hash} ms=${Date.now() - startedAt}`
+      `[sigma-refresh] session=${session} cut=${cut} wait=${wait} llm=${llm || "main"} from=${fromBytes} to=${toBytes} consumed=${consumed} partial=${partial} block_chars=${block.length} hash=${hash} ms=${Date.now() - startedAt}`
     );
     return { block, hash, partial };
   })();
