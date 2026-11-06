@@ -1703,9 +1703,19 @@ async function transcriptByteOffsetForMessageIndex(transcriptPath, cut) {
  * @param {string} transcriptPath
  * @param {number} cut - the C++ message index
  * @param {number} fromBytes - hist_last_bytes (the "from" offset)
- * @returns {Promise<{toBytes: number, drift: boolean}>}
+ * @param {{text: string, ordinal?: number}|null} [anchor] - P0-4: the C++
+ *   fingerprint of the cut's user message (see anchorNorm / findAnchorOffset)
+ * @returns {Promise<{toBytes: number, drift: boolean, map: 'anchor'|'count'|'fail', ordDelta?: number|null}>}
  */
-async function resolveAbsorbTo(transcriptPath, cut, fromBytes) {
+async function resolveAbsorbTo(transcriptPath, cut, fromBytes, anchor) {
+  // 1) Anchor first (P0-4): the C++ fingerprint of messages[cut]. An anchor
+  // hit is trusted even when off <= fromBytes — that is "already absorbed"
+  // (a no-op for the caller), not drift.
+  const hit = await findAnchorOffset(transcriptPath, anchor).catch(() => null);
+  if (hit) {
+    return { toBytes: hit.off, drift: false, map: 'anchor', ordDelta: hit.delta };
+  }
+  // 2) Legacy entry-counting + drift fallback (unchanged).
   let toBytes = await transcriptByteOffsetForMessageIndex(transcriptPath, cut);
   let drift = false;
   if (cut > 0 && toBytes > 0 && toBytes <= fromBytes) {
@@ -1714,7 +1724,128 @@ async function resolveAbsorbTo(transcriptPath, cut, fromBytes) {
       if (size > fromBytes) { toBytes = size; drift = true; }
     } catch { /* unreadable — keep the mapped offset (fail-open) */ }
   }
-  return { toBytes, drift };
+  return { toBytes, drift, map: toBytes > 0 ? 'count' : 'fail' };
+}
+
+// ─── P0-4: anchor mapping (C++ fingerprint → transcript byte offset) ─────
+
+// P0-4: identical rules to C++ sigma_anchor_text (strip injected blocks,
+// drop the mid-execution prefix, remove ALL ascii whitespace, first 60 code
+// points). The C++ sends the fingerprint of messages[K_sum] (the first
+// surviving user message); the JS matches it against user-entry fingerprints
+// indexed from the transcript instead of counting entries — counting breaks
+// when parallel tool calls pack several C++ messages into one transcript
+// entry (one assistant entry with N functionCall parts, one tool_result
+// entry with N functionResponse parts).
+function anchorNorm(text) {
+  let t = stripInjectedBlocks(String(text || ''));
+  t = t.replace(/^\s*\[User message received during tool execution\]:/i, '');
+  t = t.replace(/[ \t\r\n]+/g, '');
+  return Array.from(t).slice(0, 60).join('');
+}
+
+// Incremental user-entry index: path -> { scanned, entries: [{off, n}] }.
+// The transcript is append-only, so a cached index only re-reads the new
+// suffix. A shrunken file (size < scanned) restarts the scan.
+const USER_IDX_CACHE = new Map();
+const USER_IDX_BUSY = new Map(); // path -> Promise (serialize concurrent scans)
+const USER_IDX_MAX_PATHS = 8;
+
+/**
+ * Index one transcript line if it is a user entry with real user text.
+ * @param {{scanned: number, entries: Array<{off: number, n: string}>}} c
+ * @param {Buffer} lineBuf - the line without its trailing newline
+ * @param {number} off - absolute byte offset where the line starts
+ * @returns {void}
+ */
+function indexUserLine(c, lineBuf, off) {
+  const s = lineBuf.toString('utf8');
+  if (!s.includes('"type":"user"')) return; // measured format: no space (A-1)
+  let e;
+  try { e = JSON.parse(s); } catch { return; }
+  if (e.type !== 'user' || !e.message || !Array.isArray(e.message.parts)) return;
+  const texts = e.message.parts
+    .map((p) => (p && typeof p.text === 'string' ? p.text : ''))
+    .filter((t) => t && !/^User attachment stored on the daemon host/i.test(t.trim()));
+  if (!texts.length) return;
+  const n = anchorNorm(texts.join(''));
+  if (n) c.entries.push({ off, n }); // off = absolute byte offset of the line start
+}
+
+/**
+ * Scan the transcript for user entries, incrementally from the cached
+ * position. Chunked reads (8MB) keep large transcripts bounded; a partial
+ * trailing line (no newline yet) is left for the next scan.
+ * @param {string} p - transcript path
+ * @returns {Promise<{scanned: number, entries: Array<{off: number, n: string}>}>}
+ */
+async function scanUserIndex(p) {
+  const st = await fs.promises.stat(p);
+  let c = USER_IDX_CACHE.get(p);
+  if (!c || st.size < c.scanned) c = { scanned: 0, entries: [] }; // shrunken → rescan
+  if (st.size > c.scanned) {
+    const fh = await fs.promises.open(p, 'r');
+    try {
+      const CHUNK = 8 * 1024 * 1024;
+      let pos = c.scanned; // file position of the first unread byte
+      let base = c.scanned; // absolute start of the carry (partial line)
+      let carry = Buffer.alloc(0);
+      while (pos < st.size) {
+        const len = Math.min(CHUNK, st.size - pos);
+        const buf = Buffer.alloc(len);
+        await fh.read(buf, 0, len, pos);
+        pos += len;
+        const data = carry.length ? Buffer.concat([carry, buf]) : buf;
+        let ls = 0, nl;
+        while ((nl = data.indexOf(0x0a, ls)) >= 0) {
+          indexUserLine(c, data.subarray(ls, nl), base + ls);
+          ls = nl + 1;
+        }
+        base += ls;
+        carry = Buffer.from(data.subarray(ls)); // tail without newline → re-read
+        c.scanned = base; // only complete lines count as scanned
+      }
+    } finally { await fh.close(); }
+  }
+  USER_IDX_CACHE.delete(p); USER_IDX_CACHE.set(p, c); // LRU: most recent last
+  while (USER_IDX_CACHE.size > USER_IDX_MAX_PATHS) USER_IDX_CACHE.delete(USER_IDX_CACHE.keys().next().value);
+  return c;
+}
+
+/**
+ * Serialize concurrent scans of the same file: a caller joins the in-flight
+ * scan instead of racing it (both would read the same suffix).
+ * @param {string} p - transcript path
+ * @returns {Promise<{scanned: number, entries: Array<{off: number, n: string}>}>}
+ */
+async function getUserIndex(p) {
+  const prev = USER_IDX_BUSY.get(p) || Promise.resolve();
+  const next = prev.catch(() => {}).then(() => scanUserIndex(p));
+  USER_IDX_BUSY.set(p, next);
+  try { return await next; } finally { if (USER_IDX_BUSY.get(p) === next) USER_IDX_BUSY.delete(p); }
+}
+
+/**
+ * Map an anchor fingerprint to a transcript byte offset (P0-4). Exact
+ * fingerprint match against the user-entry index; the ordinal hint breaks
+ * ties (closest entry wins, ties → the later one).
+ * @param {string} transcriptPath
+ * @param {{text: string, ordinal?: number}|null} anchor
+ * @returns {Promise<{off: number, delta: number|null}|null>} null = no match
+ */
+async function findAnchorOffset(transcriptPath, anchor) {
+  if (!transcriptPath || !anchor || typeof anchor.text !== 'string' || !anchor.text) return null;
+  const want = Array.from(anchor.text).slice(0, 60).join('');
+  const c = await getUserIndex(transcriptPath);
+  const hits = [];
+  for (let i = 0; i < c.entries.length; i++) if (c.entries[i].n === want) hits.push(i);
+  if (!hits.length) return null;
+  const ord = Number.isInteger(anchor.ordinal) ? anchor.ordinal : -1;
+  let best = hits[hits.length - 1]; // no ordinal hint → most recent match
+  if (ord >= 0) {
+    best = hits.reduce((a, b) => (Math.abs(b - ord) <= Math.abs(a - ord) ? b : a));
+  }
+  return { off: c.entries[best].off, delta: ord >= 0 ? best - ord : null };
 }
 
 /**
@@ -2205,6 +2336,8 @@ module.exports = {
   ruleHistFromEntries,
   transcriptByteOffsetForMessageIndex,
   resolveAbsorbTo,
+  anchorNorm,
+  findAnchorOffset,
   hashBlock,
   extractLastUserMessage,
   buildExtractionPrompt,
