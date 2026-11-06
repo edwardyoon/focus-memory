@@ -2788,6 +2788,13 @@ httpApp.post("/sigma/refresh", async (c) => {
   // (the background drain's fast path); anything else (default) keeps the
   // current MAIN_LLM (27B thinking) extraction.
   const llm = typeof body.llm === "string" ? body.llm.trim() : "";
+  // P0-4/P1-2: the C++ sends the cut's user-message fingerprint (anchor) for
+  // exact transcript mapping and the block render budget. Both optional — an
+  // old client omits them and gets the legacy behavior (fail-open).
+  const anchor = (body.anchor && typeof body.anchor.text === "string" && body.anchor.text.length <= 400)
+    ? { text: body.anchor.text, ordinal: Number.isInteger(body.anchor.ordinal) ? body.anchor.ordinal : -1 }
+    : null;
+  const maxTokens = Math.min(6000, Math.max(300, Number(body.max_tokens) || 1500));
   if (!session) return c.json({ error: "session required" }, 400);
   if (!Number.isFinite(cut) || cut < 0) return c.json({ error: "cut must be a non-negative number" }, 400);
 
@@ -2819,10 +2826,13 @@ httpApp.post("/sigma/refresh", async (c) => {
     absorbClaim = skillState.claimHistAbsorb(session, 500);
     if (!absorbClaim) {
       const current = skillState.loadSigma(session);
-      const block = skillState.renderStripSigma(current);
+      const block = skillState.renderStripSigma(current, { maxTokens });
       const hash = skillState.hashBlock(block);
-      log(`[sigma-refresh] session=${session} cut=${cut} wait=${wait} llm=${llm || "main"} skipped (absorb in-flight by another process) block_chars=${block.length} hash=${hash}`);
-      return { block, hash, partial: true };
+      // P0-5: progress fields on every path — no mapping was attempted here
+      // (the other process owns the absorption), so to_bytes=0/map=fail.
+      const claimHistLast = Math.max(0, Number(current.hist_last_bytes) || 0);
+      log(`[sigma-refresh] session=${session} cut=${cut} wait=${wait} llm=${llm || "main"} map=fail to=0 hist_last=${claimHistLast} ordDelta=- skipped (absorb in-flight by another process) block_chars=${block.length} hash=${hash}`);
+      return { block, hash, partial: true, hist_last_bytes: claimHistLast, to_bytes: 0, map: "fail" };
     }
     const startedAt = Date.now();
     // Item 10: the C++ client's sigma_sum_timeout_ms was raised to 300s to
@@ -2835,7 +2845,9 @@ httpApp.post("/sigma/refresh", async (c) => {
     const cwd = skillState.cwdFromTranscriptPath(tp);
     const sigma0 = skillState.loadSigma(session);
     const fromBytes = Math.max(0, Number(sigma0.hist_last_bytes) || 0);
-    const { toBytes, drift: cutDrift } = await skillState.resolveAbsorbTo(tp, cut, fromBytes);
+    // P0-4: the anchor (C++ fingerprint of the cut's user message) is tried
+    // first; resolveAbsorbTo falls back to the legacy entry count on a miss.
+    const { toBytes, drift: cutDrift, map: mapKind, ordDelta } = await skillState.resolveAbsorbTo(tp, cut, fromBytes, anchor);
     if (cutDrift) {
       // Item 6: post-compaction cut drift — the client message index no longer
       // maps to a transcript position; absorbing [fromBytes, EOF) instead of
@@ -2902,12 +2914,17 @@ httpApp.post("/sigma/refresh", async (c) => {
       }
       return next;
     }, 500); // P1-5: 500ms lock deadline (server path)
-    const block = skillState.renderStripSigma(written || sigma0);
+    const after = written || sigma0;
+    // P0-5: hist_last_bytes is the POST-processing value (advanced when this
+    // call absorbed, otherwise the prior value) — the C++ drain's no-progress
+    // detection keys off it across passes.
+    const histLast = Math.max(0, Number(after.hist_last_bytes) || 0);
+    const block = skillState.renderStripSigma(after, { maxTokens });
     const hash = skillState.hashBlock(block);
     log(
-      `[sigma-refresh] session=${session} cut=${cut} wait=${wait} llm=${llm || "main"} from=${fromBytes} to=${toBytes} consumed=${consumed} partial=${partial} block_chars=${block.length} hash=${hash} ms=${Date.now() - startedAt}`
+      `[sigma-refresh] session=${session} cut=${cut} wait=${wait} llm=${llm || "main"} map=${mapKind} from=${fromBytes} to=${toBytes} hist_last=${histLast} ordDelta=${ordDelta ?? "-"} consumed=${consumed} partial=${partial} block_chars=${block.length} hash=${hash} ms=${Date.now() - startedAt}`
     );
-    return { block, hash, partial };
+    return { block, hash, partial, hist_last_bytes: histLast, to_bytes: toBytes > 0 ? toBytes : 0, map: mapKind };
   })();
 
   const tracked = work.finally(() => {

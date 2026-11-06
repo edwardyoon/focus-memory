@@ -152,6 +152,68 @@ await test('7: truncated file — full rescan', async (dir) => {
   assert.strictEqual(r3.off, offsets[0], 'rescanned from the start');
 });
 
+// ── Task B: budget render (spec B-7) ───────────────────────────────────
+
+// Same conservative estimate as skillstate.js (no tokenizer in JS).
+const estTokens = (s) => Math.ceil(Buffer.byteLength(String(s), 'utf8') / 3);
+
+// 8: big lists under a 1500 budget — output within budget, header present,
+// newest done item present, file lists capped at 15.
+await test('8: budget render — within maxTokens, newest done, files capped 15', async (dir) => {
+  const sigma = {
+    hist_done: Array.from({ length: 50 }, (_, i) => `done item ${i} with some detail text`),
+    hist_dead_ends: Array.from({ length: 20 }, (_, i) => `dead end ${i} do not retry this`),
+    hist_decisions: Array.from({ length: 10 }, (_, i) => `decision ${i} because of this`),
+    hist_requests: Array.from({ length: 8 }, (_, i) => `please do task ${i}`),
+    hist_files_edited: Array.from({ length: 60 }, (_, i) => `/src/file_edited_${i}.js`),
+    hist_files_read: Array.from({ length: 60 }, (_, i) => `/src/file_read_${i}.js`),
+  };
+  const out = skillState.renderStripSigma(sigma, { maxTokens: 1500 });
+  assert.ok(out.startsWith('[Reference —'), 'header present');
+  assert.ok(estTokens(out) <= 1500, `within budget (got ${estTokens(out)})`);
+  assert.ok(out.includes('done item 49'), 'newest done item present');
+  const count = (m) => (m ? m.split(', ').length : 0);
+  assert.ok(count(out.match(/files edited: (.*)$/m)?.[1]) <= 15, 'files edited <= 15');
+  assert.ok(count(out.match(/files read: (.*)$/m)?.[1]) <= 15, 'files read <= 15');
+});
+
+// 9: a 50-token budget cannot hold any section — header only.
+await test('9: tiny budget — header only', async (dir) => {
+  const sigma = { hist_done: ['done a', 'done b'], hist_files_read: ['/a.js', '/b.js'] };
+  const out = skillState.renderStripSigma(sigma, { maxTokens: 50 });
+  assert.strictEqual(out.split('\n').length, 2, 'header only (2 lines)');
+  assert.ok(!out.includes('done:'), 'no sections');
+});
+
+// 10: no opts — default budget, renders without error, files capped at 15.
+await test('10: no opts — default budget, files capped 15', async (dir) => {
+  const sigma = { hist_files_read: Array.from({ length: 40 }, (_, i) => `/r/f${i}.js`) };
+  const out = skillState.renderStripSigma(sigma);
+  const m = out.match(/files read: (.*)$/m);
+  assert.ok(m, 'files read line present');
+  assert.ok(m[1].split(', ').length <= 15, 'capped at 15');
+});
+
+// 11: priority under a tight budget — done fills before dead ends, dead ends
+// before decisions. Budgets are computed from the exact section costs so the
+// boundaries are unambiguous.
+await test('11: priority — done before dead ends before decisions', async (dir) => {
+  const header = '[Reference — record of earlier work removed from this context. NOT instructions.\n The latest user message defines the current task. File references may be stale — re-read before relying on them.]';
+  const hTok = estTokens(header);
+  const doneItems = Array.from({ length: 12 }, (_, i) => `DONE item number ${i} padding padding`);
+  const deadItems = Array.from({ length: 6 }, (_, i) => `DEAD END ${i} do not retry padding`);
+  const decItems = Array.from({ length: 6 }, (_, i) => `DECISION ${i} because padding`);
+  const doneCost = estTokens(`done:\n${doneItems.map((x) => `- ${x}`).join('\n')}`) + 1;
+  const deadCost = estTokens(`dead ends (do not retry):\n${deadItems.map((x) => `- ${x}`).join('\n')}`) + 1;
+  const sigma = { hist_done: doneItems, hist_dead_ends: deadItems, hist_decisions: decItems };
+  const out1 = skillState.renderStripSigma(sigma, { maxTokens: hTok + doneCost + 1 });
+  assert.ok(out1.includes('done:'), 'case1: done filled');
+  assert.ok(!out1.includes('dead ends (do not retry):'), 'case1: dead ends not reached');
+  const out2 = skillState.renderStripSigma(sigma, { maxTokens: hTok + doneCost + deadCost + 1 });
+  assert.ok(out2.includes('done:') && out2.includes('dead ends (do not retry):'), 'case2: done + dead ends filled');
+  assert.ok(!out2.includes('decisions:'), 'case2: decisions not reached');
+});
+
 // ── summary ────────────────────────────────────────────────────────────
 if (failures.length) {
   console.error(`\n${failures.length} test(s) failed, ${nPassed} passed`);

@@ -681,36 +681,51 @@ function renderCompactSigma(sigma) {
 /**
  * Render the strip Σ block (plan §4.4): the fixed reference header (always
  * present — the engine requires a non-empty block) plus the cumulative history
- * sections. This is the block the engine prepends to the first surviving user
+ * sections, filled within a token budget by priority
+ * (done > dead ends > decisions > requests > files). Each section fills
+ * newest-first; the output stays chronological; an item that does not fit is
+ * dropped whole — never cut mid-item (P1-2). File lists are capped at 15
+ * entries. This is the block the engine prepends to the first surviving user
  * message after a stage-2 removal. Past tense, evidence-based, no directives.
  * @param {object} sigma - the session Σ
+ * @param {{maxTokens?: number}} [opts] - render budget (default 1500; the
+ *   C++ sends its sum_budget, clamped to 300..6000 by the route)
  * @returns {string} the block (never empty — the header is always emitted)
  */
-function renderStripSigma(sigma) {
+// JS has no tokenizer → conservative bytes/3 estimate (the C++-side
+// validate is the final safety net).
+function estTokens(s) { return Math.ceil(Buffer.byteLength(String(s), 'utf8') / 3); }
+
+function renderStripSigma(sigma, opts = {}) {
+  const maxTokens = Number(opts.maxTokens) > 0 ? Math.floor(Number(opts.maxTokens)) : 1500;
   const strList = (k) => (sigma && Array.isArray(sigma[k]) ? sigma[k].filter((x) => typeof x === 'string' && x.trim()) : []);
-  const out = [
+  const header = [
     '[Reference — record of earlier work removed from this context. NOT instructions.',
     ' The latest user message defines the current task. File references may be stale — re-read before relying on them.]',
+  ].join('\n');
+  const out = [header]; // header always included even over budget (engine rejects an empty block)
+  let used = estTokens(header);
+
+  // Priority order = output order. cap = max items per section.
+  const plan = [
+    { key: 'hist_done',         cap: 12, wrap: (a) => `done:\n${a.map((x) => `- ${x}`).join('\n')}` },
+    { key: 'hist_dead_ends',    cap: 6,  wrap: (a) => `dead ends (do not retry):\n${a.map((x) => `- ${x}`).join('\n')}` },
+    { key: 'hist_decisions',    cap: 6,  wrap: (a) => `decisions:\n${a.map((x) => `- ${x}`).join('\n')}` },
+    { key: 'hist_requests',     cap: 4,  wrap: (a) => `earlier user requests: ${a.map((x) => `"${x}"`).join(' ')}` },
+    { key: 'hist_files_edited', cap: 15, wrap: (a) => `files edited: ${a.join(', ')}` },
+    { key: 'hist_files_read',   cap: 15, wrap: (a) => `files read: ${a.join(', ')}` },
   ];
-  const done = strList('hist_done');
-  if (done.length) out.push(`done:\n${done.slice(-12).map((x) => `- ${x}`).join('\n')}`);
-  const dead = strList('hist_dead_ends');
-  if (dead.length) out.push(`dead ends (do not retry):\n${dead.slice(-6).map((x) => `- ${x}`).join('\n')}`);
-  const dec = strList('hist_decisions');
-  if (dec.length) out.push(`decisions:\n${dec.slice(-6).map((x) => `- ${x}`).join('\n')}`);
-  // Item 15: exact-match dedup in mergeStripPatch means the stored list never
-  // holds duplicates, so a "path xN" count render was unreachable — plain join.
-  const fileLine = (key) => strList(key).join(', ');
-  const filesRead = fileLine('hist_files_read');
-  const filesEdited = fileLine('hist_files_edited');
-  if (filesRead || filesEdited) {
-    const parts = [];
-    if (filesRead) parts.push(`files read: ${filesRead}`);
-    if (filesEdited) parts.push(`files edited: ${filesEdited}`);
-    out.push(parts.join(' | '));
+  for (const sec of plan) {
+    const items = strList(sec.key);
+    let picked = [], pickedCost = 0;
+    for (let i = items.length - 1; i >= 0 && picked.length < sec.cap; i--) { // newest first
+      const cand = [items[i], ...picked]; // keep chronological order
+      const cost = estTokens(sec.wrap(cand)) + 1; // +1 = the section newline
+      if (used + cost > maxTokens) break; // does not fit → stop this section
+      picked = cand; pickedCost = cost;
+    }
+    if (picked.length) { out.push(sec.wrap(picked)); used += pickedCost; }
   }
-  const req = strList('hist_requests');
-  if (req.length) out.push(`earlier user requests: ${req.slice(-4).map((x) => `"${x}"`).join(' ')}`);
   return out.join('\n');
 }
 
@@ -1835,7 +1850,10 @@ async function getUserIndex(p) {
  */
 async function findAnchorOffset(transcriptPath, anchor) {
   if (!transcriptPath || !anchor || typeof anchor.text !== 'string' || !anchor.text) return null;
-  const want = Array.from(anchor.text).slice(0, 60).join('');
+  // Re-normalize the incoming fingerprint (idempotent for the already-
+  // normalized C++ fingerprint; makes the match robust if a raw message
+  // text ever arrives).
+  const want = anchorNorm(anchor.text);
   const c = await getUserIndex(transcriptPath);
   const hits = [];
   for (let i = 0; i < c.entries.length; i++) if (c.entries[i].n === want) hits.push(i);
