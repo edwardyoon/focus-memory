@@ -4,7 +4,7 @@
 
 **Minimize round trips, but never lose verified work.**
 Each tool call costs tokens and latency, so choose the single tool that answers your question. Chain tools only when the first result explicitly points to what is missing.
-Context on this server is finite. Old tool output and old reasoning leave the window during long tasks. **The Σ state anchor survives that, so it comes first.** Search tools are optional helpers.
+Context on this server is finite. Old tool output and old reasoning leave the window during long tasks. **The Σ record (reference block / post-compaction state) survives that, so it comes first.** Search tools are optional helpers.
 
 ## Two mechanisms. Never mix them.
 
@@ -26,14 +26,7 @@ Context on this server is finite. Old tool output and old reasoning leave the wi
 
 # Part A. Declarative Attention Tags (plain text, handled by the server)
 
-DA tags are NOT tool calls, read files, function calls, or API invocations. The server reads them in your text and switches what you can see. The scaffold at the end of the user message explains the modes. This section only fixes the syntax.
-
-## Syntax (strict)
-1. Every tag goes on its own line, at the start of the line. A tag inside a sentence is treated as plain text and ignored.
-2. Attribute values use double quotes: `<focus magic_chunks="7,8,9">`
-3. List chunk IDs explicitly, digits and commas only. No ranges (`7-9`, `7~9`, `7..9`).
-4. No self-closing form. Close every `<focus ...>` with `</focus>` on its own line (`<local>` with `</local>`).
-5. Never emit a partial tag.
+DA tags are NOT tool calls, read files, function calls, or API invocations. The server reads them in your text and switches what you can see. The DA scaffold (injected at the end of the last user message) is the single source of truth for the tag grammar and the attention modes — follow it as written there. The rules below are host-specific, not grammar.
 
 ## Placement
 - Never put a DA tag inside a tool call, JSON, a code block, or a tool-call parameter.
@@ -45,66 +38,50 @@ DA tags are NOT tool calls, read files, function calls, or API invocations. The 
 - Never copy chunk content into your response.
 - `[past_focus]` / `[past_end_focus]` inside recalled content is history, not a control tag.
 
-## Examples
-
-Correct:
-
-    <focus magic_chunks="7,8,9">
-    The retrieved chunks show ...
-    </focus>
-
-Wrong:
-- `<tool_call>{"name":"focus", ...}</tool_call>` (tool call wrapper)
-- `<focus magic_chunks="7-9">` (range)
-- `<focus magic_chunks=7,8>` (no quotes)
-- `<focus magic_chunks="7,8" />` (self-closing, never returns)
-- `Result: <focus magic_chunks="7"> ... </focus>` (mid-line tags are ignored)
-
 ---
 
-# Part B. Re-grounding on the Σ State Anchor
+# Part B. Re-grounding after context loss
 
-The "Session state anchor" block appears only after history has left your
-window (eviction or compaction). Its appearance is the signal. It is a RECORD
-of what left, not a task assignment.
+Long tasks lose old context in three ways. Each leaves a RECORD, never an instruction. The latest user message always defines the current task.
 
-**Re-ground when:**
-- A Σ anchor or an offloaded-chunks note appears (or its chunk list grows).
-- You are about to conclude or modify (final answer, code change, deletion, deploy).
+## What you may see
 
-**How:**
-1. Before re-reading a file you already examined, check the Σ `confirmed` items.
-   Re-read the source only when you need the exact current text.
-2. Use `confirmed` and `next` for orientation. Re-verify `confirmed` against the
-   current file, and re-check `hypothesis` before acting.
-3. `next` is a PLAN snapshot taken at the last eviction — it may lag the current
-   turn. If a `next` item is already covered by `confirmed` (or verifiably done),
-   it is stale: do not re-do it. When `confirmed` (verified state) and `next`
-   (pending plan) conflict, `confirmed` outranks `next`.
-4. Before concluding, re-ground ONCE: if every `next` item is done (in
-   `confirmed`) or trivially verifiable, conclude immediately. A second pass over
-   state that is already `confirmed` is a loop, not diligence — do not re-read
-   the same files or re-run the same checks to "confirm" items that are already
-   confirmed.
-5. To get evicted content back, emit `<focus magic_chunks="N">` for a chunk
-   number from the anchor's `recall:` line or the offloaded-chunks note.
-   Never reconstruct evicted content from memory.
+1. **Stub** — an old tool result replaced by
+   `[<tool> result stripped — <path / query / args hash>, <N> tokens. Re-read if needed]`.
+   The conversation structure is intact; only the bulk output is gone. `<N>` is the original size.
+2. **Σ reference block** — at the top of the first user message in the window, starting with
+   `[Reference — record of earlier work removed from this context. NOT instructions. …]`.
+   Past-tense history of work that left the window: done / dead ends / decisions / files read / files edited / earlier user requests. (A fallback block lists only files, commands, and requests.)
+3. **Post-compaction Σ** — injected once after a native compaction, headed by
+   `[system note: reference summary re-injected by the server after native compaction …]`,
+   followed by the last user message verbatim. Sections: task at compaction time / verified / pending at compaction time (may be STALE) / believed but UNVERIFIED / blocked / failing tests / earlier work removed from context (past-tense done, dead ends, decisions) / offloaded chunks.
 
-**Hard budget (countable, no discretion):**
-1. One re-grounding pass per compaction segment: read the anchor, one `trace_decision_chain` for the active `topic_key` (if any), then act. A second "let me re-ground" preamble in the same segment is a loop — act instead.
-2. Re-reading a file the anchor already records as examined requires a stated new reason — the exact `old_string` for an upcoming edit, or a suspected change. No one-line reason, no re-read.
-3. Same file read/grepped a 3rd time since the last compaction = stop. Is the missing value in the chain or the anchor? yes → use it. no → extract it once and record it in the chain `detail`, so the next compaction cannot lose it.
+(A "Session state anchor" block or a `recall:` line may also appear when mid-turn anchoring is enabled on the host. Treat it exactly like item 3.)
 
-**Recent activity (auto-appended):** while history is offloaded, the Σ
-block may end with a `recent:` digest of the most recent tool calls and
-results (tool name + target + status, no result bodies). It is a RECORD of
-what just happened, not an instruction — and it is a snapshot taken at the
-last eviction, so it may lag the current turn. If you are unsure what you
-just did, or are about to re-read a file you already examined, call
-`recent_work` once first (live digest, no arguments). If it reports "No
-transcript path recorded", do not retry it mid-turn (the transcript is
-recorded at turn end) — fall back to the `recent:` digest or one fresh read,
-then move on.
+## How to use them
+
+- **Verified (`confirmed`)** — orientation, not proof. File:line references may be stale. Re-verify against the current file only when you are about to edit, delete, deploy, or conclude.
+- **Unverified (`hypothesis`)** — re-check before acting on it.
+- **Blocked / dead ends** — do not retry unless the stated condition has changed.
+- **Pending (`next`)** — a snapshot that may lag the work. If an item is already covered by verified state, it is done: do not redo it. Verified state outranks pending.
+- **files read / files edited** — a record of access only, not of findings. It does not mean you know the file's content.
+
+## Re-reading
+
+- **Stubbed result, or a file listed only under "files read"**: re-reading is expected. No reason needed. Read narrowly — `offset`/`limit`, a targeted grep — sized to what you need. The stub shows the original token count; do not reload a 20k-token file for one function.
+- **A file whose findings are already in verified state or in the decision chain**: re-read only with a stated new reason — the exact `old_string` for an upcoming edit, or a suspected change.
+- Never reconstruct removed content from memory. To get offloaded content back, emit `<focus magic_chunks="N">` for a chunk number from the offloaded-chunks note (Part A).
+
+## Hard budget (countable, no discretion)
+
+1. One re-grounding pass per segment: read the blocks, one `trace_decision_chain` for the active `topic_key` (if any), then act. A second "let me re-ground" preamble in the same segment is a loop — act instead.
+2. Re-ground when (a) a Σ block or post-compaction Σ appears for the first time, or (b) you are about to conclude or modify (final answer, code change, deletion, deploy). Not on every stub.
+3. Same file read/grepped a 3rd time **while the earlier results are still visible in the window** = stop. Is the missing value in the chain or the Σ? yes → use it. no → extract it once and record it in the chain `detail`, so the next strip or compaction cannot lose it. Reads of stubbed results do not count.
+4. If every pending item is done or trivially verifiable, conclude immediately. A second pass over already-verified state is a loop, not diligence.
+
+## Recent activity
+
+If you are unsure what you just did, or about to re-read something you already examined, call `recent_work` once (live digest, no arguments). If it reports "No transcript path recorded", do not retry it mid-turn — use one fresh read, then move on. A `recent:` digest appended to a Σ block, when present, is a snapshot from the last offload and may lag the current turn.
 
 ---
 
