@@ -1334,10 +1334,110 @@ function entryToText(entry) {
   return `${prefix} ${parts.join(' | ')}`;
 }
 
+// ─── Bounded transcript I/O (task #17) ─────────────────────────────────────
+// Transcripts grow to hundreds of MB; the hooks that read them are
+// short-lived processes whose heap must stay small. extractTranscriptTail
+// and extractLastUserMessage stream from EOF in 64KB chunks (walking back
+// only as far as their stop condition needs), and
+// transcriptByteOffsetForMessageIndex streams forward in 8MB chunks.
+// Memory is O(longest line + rendered output), never O(file size).
+
+const TAIL_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * Walk a transcript JSONL's complete lines from the end (EOF) in 64KB
+ * chunks, invoking fn(line) on each line newest-first. fn returns truthy
+ * to stop the walk early; otherwise the walk runs to the start of the file.
+ *
+ * Chunk boundaries fall mid-line, so the oldest line of each window stays
+ * a raw byte head (Buffer) and is re-joined with the previous chunk before
+ * decoding — a UTF-8 sequence straddling the boundary decodes intact
+ * (decoding per chunk would corrupt it to U+FFFD and break the line's
+ * JSON.parse). The newest end of a window is always the true file end, so
+ * every line after the first '\n' is complete. A line longer than a chunk
+ * buffers across as many chunks as it spans (bounded by the line length,
+ * not the file size); a file with no '\n' at all yields its content as one
+ * line. Empty lines are skipped (the old full-read's filter(Boolean)).
+ *
+ * Sync (openSync/readSync): the callers are short-lived hook processes
+ * that already do sync I/O, and the walk stops at their budget — the read
+ * cost is bounded by the walk, not the file size. Fail-open: false on any
+ * error.
+ * @param {string} filePath
+ * @param {(line: string) => any} fn - truthy return stops the walk
+ * @returns {boolean} true when fn stopped the walk, false when the start
+ *   of the file was reached (or the file was unreadable)
+ */
+function walkTranscriptLinesFromEnd(filePath, fn) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+  } catch {
+    return false;
+  }
+  let size = 0;
+  try {
+    size = fs.fstatSync(fd).size;
+  } catch {
+    size = 0;
+  }
+  let pos = size; // the next chunk reads [max(0, pos - TAIL_CHUNK_BYTES), pos)
+  let head = Buffer.alloc(0); // oldest line of the window, raw bytes (possibly truncated)
+  let stopped = false;
+  const emit = (line) => {
+    if (stopped) return;
+    if (fn(line)) stopped = true;
+  };
+  try {
+    for (;;) {
+      if (pos > 0) {
+        const len = Math.min(TAIL_CHUNK_BYTES, pos);
+        const buf = Buffer.alloc(len);
+        const got = fs.readSync(fd, buf, 0, len, pos - len);
+        if (got <= 0) break; // unexpected short read — fail open
+        pos -= got;
+        head = Buffer.concat([buf.subarray(0, got), head]);
+      }
+      const nl = head.indexOf(0x0a);
+      if (nl < 0) {
+        if (pos <= 0) {
+          // No '\n' anywhere in the file — the whole content is one line.
+          if (head.length) emit(head.toString('utf8'));
+          break;
+        }
+        continue; // the oldest line starts before `pos` — read the previous chunk
+      }
+      // Everything after the first '\n' is complete lines (the window's
+      // newest end is always the true file end).
+      const rest = head.subarray(nl + 1).toString('utf8');
+      head = Buffer.from(head.subarray(0, nl)); // re-copy: release the old buffer
+      const lines = rest.split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (!lines[i]) continue;
+        emit(lines[i]);
+        if (stopped) break;
+      }
+      if (stopped) break;
+      if (pos <= 0) {
+        // `head` is the file's first line (complete — not truncated).
+        if (head.length) emit(head.toString('utf8'));
+        break;
+      }
+    }
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {}
+  }
+  return stopped;
+}
+
 /**
  * Read the tail of a transcript JSONL within a character budget and render
  * it as compact text. Tail-based: the most recent work is what the next
  * post-compaction turn needs; earlier state is already accumulated in Σ.
+ * Streamed from EOF in 64KB chunks (task #17) — memory is bounded by the
+ * longest line + the rendered window, not the file size.
  * The budget is measured on RENDERED (post-clip) length, so one giant
  * tool_result line costs its clipped size (~800 chars), not its raw size.
  *
@@ -1358,34 +1458,31 @@ function entryToText(entry) {
  */
 function extractTranscriptTail(transcriptPath, budgetChars = 30000, opts = {}) {
   if (!transcriptPath) return '';
-  let raw;
-  try {
-    raw = fs.readFileSync(transcriptPath, 'utf8');
-  } catch {
-    return '';
-  }
-  const lines = raw.split('\n').filter(Boolean);
   const maxChars = Math.max(budgetChars, opts.maxChars || budgetChars * 3);
   const minUserEntries = Math.max(1, opts.minUserEntries || 2);
   const rendered = [];
   let used = 0;
   let userEntries = 0;
-  for (let i = lines.length - 1; i >= 0 && used < maxChars; i--) {
+  // Streamed from EOF in 64KB chunks (task #17): the old readFileSync +
+  // split allocated O(file) for a walk that stops at the budget.
+  walkTranscriptLinesFromEnd(transcriptPath, (line) => {
+    if (used >= maxChars) return true; // old loop-head check
     let text = null;
     let isUser = false;
     try {
-      const entry = JSON.parse(lines[i]);
+      const entry = JSON.parse(line);
       text = entryToText(entry);
       isUser = entry.type === 'user';
     } catch {}
-    if (!text) continue;
+    if (!text) return false;
     rendered.unshift(text);
     used += text.length + 1;
     if (isUser) userEntries++;
     // Stop early only once BOTH the budget and the user-message guarantee
     // hold; otherwise keep walking back (bounded by maxChars).
-    if (used >= budgetChars && userEntries >= minUserEntries) break;
-  }
+    if (used >= budgetChars && userEntries >= minUserEntries) return true;
+    return false;
+  });
   return rendered.join('\n');
 }
 
@@ -1656,42 +1753,82 @@ function ruleHistFromEntries(entries) {
  */
 async function transcriptByteOffsetForMessageIndex(transcriptPath, cut) {
   if (!transcriptPath || !(cut > 0)) return 0;
-  let raw;
+  let fh;
   try {
-    raw = await fs.promises.readFile(transcriptPath, 'utf8');
+    fh = await fs.promises.open(transcriptPath, 'r');
   } catch {
     return 0;
   }
-  const lines = raw.split('\n');
-  let offset = 0;
+  let size = 0;
+  try {
+    size = (await fh.stat()).size;
+  } catch {
+    try { await fh.close(); } catch {}
+    return 0;
+  }
+  // Streamed forward in 8MB chunks (task #17): the old promises.readFile
+  // held the whole file (O(file)) while counting lines. The partial
+  // trailing line is carried across chunk boundaries as raw bytes (a
+  // UTF-8 sequence straddling a boundary decodes intact), and the final
+  // unterminated line is counted like the old split('\n') did. Every
+  // complete line is \n-terminated, so its byte cost is line+1 — the
+  // offset stays byte-aligned across empty lines (item 7).
+  const CHUNK = 8 * 1024 * 1024;
+  let pos = 0; // file position of the first unread byte
+  let base = 0; // absolute offset where the current data/carry starts
+  let carry = Buffer.alloc(0); // tail without newline → next chunk
   let count = 0; // chat-message entries seen so far
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    // Every line except the last is terminated by \n (1 byte). The last
-    // element is '' when the file ends with \n (0 bytes past it); a file with
-    // no trailing \n has real content as the last element (no \n after it).
-    // Counting empty lines' \n keeps the offset byte-aligned (item 7: the old
-    // `if (!line) continue` skipped them, drifting 1 byte per empty line).
-    const lineBytes = Buffer.byteLength(line, 'utf8') + (i === lines.length - 1 ? 0 : 1);
+  /**
+   * Count one line: return its absolute start offset when it is the
+   * (cut-1)-th chat-message entry, else null (advancing `count`).
+   * @param {Buffer} lineBuf - the line without its trailing newline
+   * @param {number} absOff - absolute byte offset where the line starts
+   * @returns {number|null}
+   */
+  const targetOffset = (lineBuf, absOff) => {
     let entry;
     try {
-      entry = line ? JSON.parse(line) : null;
+      entry = lineBuf.length ? JSON.parse(lineBuf.toString('utf8')) : null;
     } catch {
       entry = null;
     }
     // Same test as entryToText / ruleHistFromEntries: a chat-message entry
     // carries message.parts. Meta entries (type=system, no message) fail it.
     const isChatMsg = !!(entry && entry.message && Array.isArray(entry.message.parts));
-    if (isChatMsg) {
-      // C++[cut] = chat entry (cut-1); return the offset where it begins.
-      if (count === cut - 1) return offset;
-      count++;
+    if (!isChatMsg) return null;
+    // C++[cut] = chat entry (cut-1); return the offset where it begins.
+    if (count === cut - 1) return absOff;
+    count++;
+    return null;
+  };
+  try {
+    while (pos < size) {
+      const len = Math.min(CHUNK, size - pos);
+      const buf = Buffer.alloc(len);
+      const res = await fh.read(buf, 0, len, pos);
+      // Node >= 24 resolves {bytesRead, buffer}; older versions a number.
+      const got = typeof res === 'number' ? res : res.bytesRead;
+      if (got <= 0) return 0; // short read — unreadable, fail-open
+      pos += got;
+      const data = carry.length ? Buffer.concat([carry, buf.subarray(0, got)]) : buf.subarray(0, got);
+      let ls = 0, nl;
+      while ((nl = data.indexOf(0x0a, ls)) >= 0) {
+        const hit = targetOffset(data.subarray(ls, nl), base + ls);
+        if (hit !== null) return hit;
+        ls = nl + 1;
+      }
+      base += ls;
+      carry = Buffer.from(data.subarray(ls));
     }
-    offset += lineBytes;
+    if (carry.length && targetOffset(carry, base) !== null) return base; // final unterminated line
+    // Reaching the end means cut is at or past the last chat message — the
+    // removed region extends to EOF.
+    return base + carry.length;
+  } catch {
+    return 0;
+  } finally {
+    try { await fh.close(); } catch {}
   }
-  // Reaching the end means cut is at or past the last chat message — the
-  // removed region extends to EOF.
-  return offset;
 }
 
 /**
@@ -1892,44 +2029,42 @@ function hashBlock(s) {
  * Two client-side wrappers are stripped so the result is the user's actual
  * words: the `[User message received during tool execution]:` prefix
  * (mid-execution sends) and attachment metadata parts ("User attachment
- * stored on the daemon host..."). The full file is read, not a tail window:
- * the message this hook recovers is the one before the compaction, which can
- * sit hundreds of KB back after a long tool-only stretch — and the hook runs
- * once per compaction, off the per-turn hot path. Fail-open: '' when the
- * transcript has no user entry or is unreadable.
+ * stored on the daemon host..."). The walk streams from EOF (task #17) and
+ * extends back as far as needed — the message this hook recovers is the one
+ * before the compaction, which can sit hundreds of KB back after a long
+ * tool-only stretch — while memory stays bounded (the old full readFileSync
+ * allocated O(file)); the hook runs once per compaction, off the per-turn
+ * hot path. Fail-open: '' when the transcript has no user entry or is
+ * unreadable.
  * @param {string} transcriptPath
  * @param {number} [maxChars=400] - max chars of the returned message
  * @returns {string} verbatim user message (clipped)
  */
 function extractLastUserMessage(transcriptPath, maxChars = 400) {
   if (!transcriptPath) return '';
-  let raw;
-  try {
-    raw = fs.readFileSync(transcriptPath, 'utf8');
-  } catch {
-    return '';
-  }
-  const lines = raw.split('\n').filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i--) {
+  // Streamed from EOF in 64KB chunks (task #17): the last user message is
+  // usually within the first chunk; a long tool-only stretch costs extra
+  // chunks, but the heap stays bounded (the old readFileSync allocated O(file)).
+  let msg = '';
+  walkTranscriptLinesFromEnd(transcriptPath, (line) => {
     let entry;
     try {
-      entry = JSON.parse(lines[i]);
+      entry = JSON.parse(line);
     } catch {
-      continue;
+      return false;
     }
-    if (entry.type !== 'user' || !entry.message || !Array.isArray(entry.message.parts)) continue;
+    if (entry.type !== 'user' || !entry.message || !Array.isArray(entry.message.parts)) return false;
     // P0-1: strip injected blocks (Σ anchor / system-reminder) from each user
     // part; an injected-blocks-only entry is skipped, so the walk reaches the
     // real last user message.
     const texts = entry.message.parts
       .map((p) => (p && typeof p.text === 'string' ? stripInjectedBlocks(p.text).trim() : ''))
       .filter((t) => t && !/^User attachment stored on the daemon host/i.test(t));
-    if (!texts.length) continue; // metadata-only / injected-blocks-only user entry
-    let msg = texts.join('\n');
-    msg = msg.replace(/^\[User message received during tool execution\]:\s*/i, '');
-    return clip(msg, Math.max(100, Number(maxChars) || 400));
-  }
-  return '';
+    if (!texts.length) return false; // metadata-only / injected-blocks-only user entry
+    msg = texts.join('\n').replace(/^\[User message received during tool execution\]:\s*/i, '');
+    return true;
+  });
+  return msg ? clip(msg, Math.max(100, Number(maxChars) || 400)) : '';
 }
 
 // ─── SUMMARY_LLM extraction ───────────────────────────────────────────────
