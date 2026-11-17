@@ -371,7 +371,7 @@ The todo queue is DB-based (`udanax.todo_tasks`, `lib/taskdb.js`) — the former
 | Target | Rule | Why safe |
 |---|---|---|
 | `work_memory` `type=state_checkpoint` | `timestamp` older than `GC_CHECKPOINT_RETENTION_DAYS` → deleted by explicit ID list | legacy drain only — the per-session double-write was removed (the Σ file on disk is the source of truth, swept at 7 days), so no new points are created; this phase retires the points written before the removal. |
-| `~/.qwen/tmp` (entire tree) | file `mtime` older than `GC_SESSION_RETENTION_DAYS` → deleted, then directories that become empty are removed (bottom-up) | qwen-code accumulates per-session artifacts here (attachments, tool-results, background-shells, logs, skill state, kv-offload, tool-calls) and never cleans them up itself. Active sessions keep rewriting their files, so mtime is the liveness signal: anything written within the window is never deleted. |
+| every `.qwen/tmp` tree (home `~/.qwen/tmp` + project-level `<workspace>/.qwen/tmp`, `<workspace>/*/.qwen/tmp`) | file `mtime` older than `GC_SESSION_RETENTION_DAYS` → deleted, then directories that become empty are removed (bottom-up) | qwen-code accumulates per-session artifacts here (attachments, tool-results, background-shells, logs, skill state, kv-offload, tool-calls) and never cleans them up itself — in the home tree AND in each working directory's project-level tree. Active sessions keep rewriting their files, so mtime is the liveness signal: anything written within the window is never deleted. |
 
 **Whitelist by construction — never age-pruned:** `decision`/`bug_resolved`/`todo` points and `decision_chains` (causal-chain integrity; `trace_decision_chain` walks `supersedes`/`superseded_by` links, so dropping a node severs the chain — recency decay in reranking already downranks old decisions), and the code index (freshness is managed by file-existence sync, not age).
 
@@ -379,7 +379,7 @@ The todo queue is DB-based (`udanax.todo_tasks`, `lib/taskdb.js`) — the former
 # FocusMemory/.env
 GC_ENABLED=on
 GC_CHECKPOINT_RETENTION_DAYS=30
-GC_SESSION_RETENTION_DAYS=7
+GC_SESSION_RETENTION_DAYS=3
 ```
 
 ```bash

@@ -11,14 +11,16 @@
 //   Phase A — work_memory points with type=state_checkpoint and
 //             timestamp < cutoff are deleted by explicit ID list (narrow
 //             filter + ID delete; no broad filter delete against work_memory).
-//   Phase B — the ENTIRE ~/.qwen/tmp tree: files with mtime older than
-//             GC_SESSION_RETENTION_DAYS are deleted, then directories that
-//             become empty are removed (bottom-up). qwen-code never cleans
-//             this tree itself (per-session attachments, tool-results,
-//             background-shells, logs, scheduled_tasks), so without this it
-//             grows unbounded. Active sessions keep rewriting their files, so
-//             mtime is the liveness signal — anything written within the
-//             window is never deleted.
+//   Phase B — every .qwen/tmp tree: the home ~/.qwen/tmp tree plus
+//             project-level trees under the workspace (this repo's parent
+//             dir, e.g. www/.qwen/tmp and www/<project>/.qwen/tmp). Files
+//             with mtime older than GC_SESSION_RETENTION_DAYS are deleted,
+//             then directories that become empty are removed (bottom-up).
+//             qwen-code never cleans these trees itself (per-session
+//             attachments, tool-results, background-shells, logs,
+//             scheduled_tasks), so without this they grow unbounded. Active
+//             sessions keep rewriting their files, so mtime is the liveness
+//             signal — anything written within the window is never deleted.
 //
 // Usage:
 //   node garbageCollect.js            # live run (requires GC_ENABLED=on)
@@ -41,9 +43,12 @@ dotenv.config({
 const QDRANT_URL = process.env.QDRANT_URL || "http://127.0.0.1:6333";
 const GC_LOG_FILE = "/tmp/focus-memory/gc.log";
 
-// Phase B — sweep root (see header): the whole tree under this dir is
+// Phase B — sweep roots (see header): the whole tree under each root is
 // age-pruned by file mtime.
-const QWEN_TMP = path.join(os.homedir(), ".qwen", "tmp");
+const HOME_QWEN_TMP = path.join(os.homedir(), ".qwen", "tmp");
+// The workspace this repo lives in (…/www) — qwen-code creates a per-working-
+// directory .qwen/tmp there too (www/.qwen/tmp, www/<project>/.qwen/tmp).
+const WORKSPACE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const LOCK_FILE = "/tmp/focusmemory-gc.lock";
 const LOCK_STALE_MS = 30 * 60 * 1000; // 30 min
@@ -152,17 +157,47 @@ async function gcCheckpoints(qdrant, retentionDays) {
 }
 
 /**
- * Phase B — sweep the entire ~/.qwen/tmp tree: delete files whose mtime is
- * older than the retention window, then remove directories that become empty
+ * Collect the Phase B sweep roots: the home ~/.qwen/tmp tree plus any
+ * project-level .qwen/tmp trees under the workspace root (the root's own
+ * .qwen/tmp and each top-level project dir's .qwen/tmp). Only roots that
+ * exist on disk are returned; node_modules and hidden dirs are skipped.
+ * @returns {Promise<string[]>} existing sweep root paths (home tree first)
+ */
+async function collectSweepRoots() {
+  const candidates = [HOME_QWEN_TMP, path.join(WORKSPACE_ROOT, ".qwen", "tmp")];
+  try {
+    const entries = await fs.readdir(WORKSPACE_ROOT, { withFileTypes: true });
+    for (const e of entries) {
+      if (!e.isDirectory() || e.name.startsWith(".") || e.name === "node_modules") continue;
+      candidates.push(path.join(WORKSPACE_ROOT, e.name, ".qwen", "tmp"));
+    }
+  } catch {
+    // workspace root unreadable — home tree only
+  }
+  const existing = [];
+  for (const root of candidates) {
+    try {
+      if ((await fs.stat(root)).isDirectory()) existing.push(root);
+    } catch {
+      // absent — skip
+    }
+  }
+  return existing;
+}
+
+/**
+ * Phase B — sweep every .qwen/tmp tree: delete files whose mtime is older
+ * than the retention window, then remove directories that become empty
  * (bottom-up). A file written within the window (an active session) is never
  * deleted; mtime is the liveness signal. Symlinks and special entries are
  * left untouched.
+ * @param {string[]} roots sweep root paths (home + project-level trees)
  * @param {number} retentionDays
  * @returns {Promise<{removed: string[], dirsRemoved: number}>} full paths of
  *   the files removed (in dry-run: the files that would be removed) and the
  *   number of directories removed (in dry-run: that would be removed)
  */
-async function gcQwenTmp(retentionDays) {
+async function gcQwenTmp(roots, retentionDays) {
   const cutoff = Date.now() - retentionDays * 86400000;
   const removed = [];
   const gone = new Set();
@@ -213,7 +248,9 @@ async function gcQwenTmp(retentionDays) {
     }
   }
 
-  await sweep(QWEN_TMP);
+  for (const root of roots) {
+    await sweep(root);
+  }
   return { removed, dirsRemoved };
 }
 
@@ -234,7 +271,7 @@ async function main() {
 
   await acquireLock();
   const checkpointDays = daysToNumber(process.env.GC_CHECKPOINT_RETENTION_DAYS, 30);
-  const sessionDays = daysToNumber(process.env.GC_SESSION_RETENTION_DAYS, 7);
+  const sessionDays = daysToNumber(process.env.GC_SESSION_RETENTION_DAYS, 3);
   console.log(
     `[config] checkpoint retention ${checkpointDays}d, ` +
       `qwen-tmp retention ${sessionDays}d`
@@ -252,11 +289,13 @@ async function main() {
     }
     console.log(`  ${DRY_RUN ? "would delete" : "deleted"} ${removed} state_checkpoint point(s)`);
 
-    // ── Phase B: ~/.qwen/tmp tree retention ──────────────────────
-    console.log(`--- Phase B: ~/.qwen/tmp tree retention (${sessionDays}d) ---`);
-    const { removed: tmpRemoved, dirsRemoved } = await gcQwenTmp(sessionDays);
+    // ── Phase B: .qwen/tmp tree retention ────────────────────────
+    const roots = await collectSweepRoots();
+    console.log(`--- Phase B: .qwen/tmp tree retention (${sessionDays}d) — ${roots.length} root(s) ---`);
+    for (const r of roots) console.log(`  [root] ${r}`);
+    const { removed: tmpRemoved, dirsRemoved } = await gcQwenTmp(roots, sessionDays);
     console.log(
-      `  ${DRY_RUN ? "would delete" : "deleted"} ${tmpRemoved.length} file(s) + ${dirsRemoved} emptied dir(s) under ~/.qwen/tmp`
+      `  ${DRY_RUN ? "would delete" : "deleted"} ${tmpRemoved.length} file(s) + ${dirsRemoved} emptied dir(s) under the .qwen/tmp trees`
     );
     for (const p of tmpRemoved) {
       console.log(`  [qwen-tmp] ${p}`);
